@@ -131,6 +131,8 @@ export interface ChainMeta {
   spot: number
   prevClose: number
   atm: number
+  ceAtm: number // CE-side ATM = floor(spot/step)*step
+  peAtm: number // PE-side ATM = ceil(spot/step)*step
   step: number
   lotSize: number
   expiry: string
@@ -151,6 +153,8 @@ export interface OptionQuoteCell {
 export interface ChainStrikeRow {
   strike: number
   offset: number
+  offsetCe: number // steps vs CE-side ATM
+  offsetPe: number // steps vs PE-side ATM
   ce: OptionQuoteCell
   pe: OptionQuoteCell
 }
@@ -240,7 +244,7 @@ export const api = {
     fetch('/api/options/underlyings').then(r => j<{ underlyings: OptionUnderlyingRow[] }>(r)),
   optionChain: (underlying: string, expiry: string | null, strikes: number[]) =>
     fetch(`/api/options/chain?underlying=${encodeURIComponent(underlying)}&expiry=${expiry ? encodeURIComponent(expiry) : ''}&strikes=${strikes.join(',')}`)
-      .then(r => j<{ meta: ChainMeta; rows: ChainStrikeRow[]; atmRow: ChainStrikeRow | null }>(r)),
+      .then(r => j<{ meta: ChainMeta; rows: ChainStrikeRow[]; atmRow: ChainStrikeRow | null; atmCe: (OptionQuoteCell & { strike: number }) | null; atmPe: (OptionQuoteCell & { strike: number }) | null }>(r)),
   ensureStrike: (underlying: string, strike: number, expiry: string | null) =>
     fetch('/api/options/ensure-strike', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ underlying, strike, expiry }) })
       .then(r => j<{ ok: boolean; created: number; symbols: string[] }>(r)),

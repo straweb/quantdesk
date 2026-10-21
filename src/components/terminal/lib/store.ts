@@ -17,8 +17,50 @@ export interface StrikeRowCfg {
 export interface StrikesCfg {
   underlying: string | null
   expiry: string | null // null = nearest
-  allocPct: number // default per new strike rows
   rows: StrikeRowCfg[]
+}
+
+// ---- multi-pane chart layouts ----
+export type WsLayout = 'single' | 'spot-atm' | 'grid4'
+
+export interface PaneCfg {
+  key: 'ce' | 'pe' | 'extra'
+  strike: number | null // null = follow live ATM (CE/PE panes)
+  type: 'CE' | 'PE' | null // only used by the 'extra' scratch pane
+}
+
+export function wsLayout(ws: WorkspaceCfg): WsLayout {
+  return ws.layout ?? (ws.showOptionMinis ? 'spot-atm' : 'single')
+}
+
+export function defaultPanes(): PaneCfg[] {
+  return [
+    { key: 'ce', strike: null, type: 'CE' },
+    { key: 'pe', strike: null, type: 'PE' },
+    { key: 'extra', strike: null, type: null },
+  ]
+}
+
+export function wsPanes(ws: WorkspaceCfg): PaneCfg[] {
+  const base = ws.panes ?? defaultPanes()
+  // repair panes missing from older persisted workspaces
+  return defaultPanes().map(d => base.find(p => p.key === d.key) ?? d)
+}
+
+/** Pin a strike into its side pane (CE row -> CE pane, PE row -> PE pane);
+ *  the extra scratch pane always mirrors the most recent click. */
+export function pinStrikePanes(ws: WorkspaceCfg, strike: number, type: 'CE' | 'PE'): Partial<WorkspaceCfg> {
+  return {
+    panes: wsPanes(ws).map(p => {
+      if (p.key === type.toLowerCase()) return { ...p, strike }
+      if (p.key === 'extra') return { ...p, strike, type }
+      return p
+    }),
+  }
+}
+
+export function unpinPane(ws: WorkspaceCfg, key: PaneCfg['key']): Partial<WorkspaceCfg> {
+  return { panes: wsPanes(ws).map(p => (p.key === key ? { ...p, strike: null, type: p.key === 'extra' ? null : p.type } : p)) }
 }
 
 export interface WorkspaceCfg {
@@ -30,12 +72,14 @@ export interface WorkspaceCfg {
   showVolume: boolean
   showSMA20: boolean
   showSMA50: boolean
-  showOptionMinis: boolean
+  showOptionMinis?: boolean // legacy (pre-layout) — kept for persisted-state migration
+  layout?: WsLayout
+  panes?: PaneCfg[]
   strikes?: StrikesCfg
 }
 
 export function defaultStrikes(): StrikesCfg {
-  return { underlying: null, expiry: null, allocPct: 10, rows: [] }
+  return { underlying: null, expiry: null, rows: [] }
 }
 
 interface TerminalState {
@@ -69,7 +113,7 @@ interface TerminalState {
 
 const mkWs = (id: string, name: string, symbol: string): WorkspaceCfg => ({
   id, name, symbol, tf: '5m', chartType: 'candles', showVolume: true, showSMA20: false, showSMA50: false,
-  showOptionMinis: true, strikes: defaultStrikes(),
+  showOptionMinis: true, layout: 'spot-atm', panes: defaultPanes(), strikes: defaultStrikes(),
 })
 
 export const useTerminal = create<TerminalState>()(

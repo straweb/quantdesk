@@ -61,7 +61,9 @@ export interface ChainMeta {
   exchange: string // spot exchange (NSE)
   spot: number
   prevClose: number
-  atm: number
+  atm: number // nearest round strike
+  ceAtm: number // CE-side ATM = floor(spot/step)*step  (e.g. spot 23020 -> 23000)
+  peAtm: number // PE-side ATM = ceil(spot/step)*step   (e.g. spot 23020 -> 23050)
   step: number
   lotSize: number
   expiry: string
@@ -94,6 +96,10 @@ export async function getChainMeta(underlying: string, expiry?: string | null): 
   const spot = spotQ[underlying]?.ltp ?? strikes[Math.floor(strikes.length / 2)]
   const prevClose = spotQ[underlying]?.prevClose ?? spot
   const atm = Math.round(spot / step) * step
+  // Hedge-desk convention: the two strikes bracketing spot —
+  // CE buys the lower (floor), PE buys the higher (ceil).
+  const ceAtm = Math.floor(spot / step) * step
+  const peAtm = Math.ceil(spot / step) * step
 
   return {
     underlying,
@@ -101,6 +107,8 @@ export async function getChainMeta(underlying: string, expiry?: string | null): 
     spot,
     prevClose,
     atm,
+    ceAtm,
+    peAtm,
     step,
     lotSize: inExpiry[0]?.lotSize ?? 1,
     expiry: activeExpiry,
@@ -121,7 +129,9 @@ export interface OptionQuoteCell {
 
 export interface ChainStrikeRow {
   strike: number
-  offset: number // in steps vs ATM (0 = ATM)
+  offset: number // in steps vs nearest ATM (0 = ATM)
+  offsetCe: number // in steps vs CE-side ATM (floor convention)
+  offsetPe: number // in steps vs PE-side ATM (ceil convention)
   ce: OptionQuoteCell
   pe: OptionQuoteCell
 }
@@ -136,6 +146,8 @@ export async function getChainQuotes(
   strikes: number[],
   atm: number,
   step: number,
+  ceAtm?: number,
+  peAtm?: number,
 ): Promise<ChainStrikeRow[]> {
   if (strikes.length === 0) return []
   const contracts = await db.symbolMaster.findMany({
@@ -176,9 +188,13 @@ export async function getChainQuotes(
         changePct: Math.round(chg * 100) / 100,
       }
     }
+    const refCe = ceAtm ?? atm
+    const refPe = peAtm ?? atm
     return {
       strike,
       offset: step > 0 ? Math.round((strike - atm) / step) : 0,
+      offsetCe: step > 0 ? Math.round((strike - refCe) / step) : 0,
+      offsetPe: step > 0 ? Math.round((strike - refPe) / step) : 0,
       ce: mk(ceSym, 'CE'),
       pe: mk(peSym, 'PE'),
     }

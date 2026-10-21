@@ -9,8 +9,8 @@ import { Watchlist, MarketDepth } from './panels/watchlist'
 import { OrderPad, QuickButtons } from './panels/order-pad'
 import { BottomPanel } from './panels/bottom-panel'
 import { StrikesPanel } from './panels/strikes-panel'
-import { OptionMiniCharts } from './panels/option-mini-charts'
-import { useTerminal } from './lib/store'
+import { WorkspacePanes } from './panels/option-panes'
+import { useTerminal, wsLayout, type WsLayout } from './lib/store'
 import { api } from './lib/client-api'
 import { TIMEFRAMES } from '@/lib/types'
 import type { Timeframe } from '@/lib/types'
@@ -31,6 +31,7 @@ export function TerminalView() {
     queryFn: () => api.optionUnderlyings(),
     staleTime: 5 * 60_000,
   })
+  const layout = ws ? wsLayout(ws) : 'single'
   const isFnOUnderlying = useMemo(
     () => !!ws && (undData?.underlyings ?? []).some(u => u.underlying === ws.symbol),
     [ws, undData],
@@ -76,11 +77,20 @@ export function TerminalView() {
             onClick={() => patchWs(ws.id, { showVolume: !ws.showVolume })}
             className={`px-1.5 py-0.5 rounded ${ws.showVolume ? 'bg-accent text-foreground' : 'bg-secondary text-muted-foreground'}`}
           >Vol</button>
-          <button
-            onClick={() => patchWs(ws.id, { showOptionMinis: !ws.showOptionMinis })}
-            className={`px-1.5 py-0.5 rounded text-[10px] ${ws.showOptionMinis && isFnOUnderlying ? 'bg-accent text-foreground' : 'bg-secondary text-muted-foreground'}`}
-            title="ATM CE/PE mini charts under the spot chart (F&O underlyings)"
-          >ATM</button>
+          <span className="w-px h-4 bg-border mx-0.5" />
+          {([
+            ['single', '1', 'Single chart pane'],
+            ['spot-atm', 'S+2', 'Spot top · ATM CE / PE panes below'],
+            ['grid4', '2×2', 'Spot + CE + PE + scratch pane'],
+          ] as [WsLayout, string, string][]).map(([l, label, tip]) => (
+            <button
+              key={l}
+              onClick={() => patchWs(ws.id, { layout: l, showOptionMinis: l !== 'single' })}
+              title={tip}
+              className={`px-1.5 py-0.5 rounded text-[10px] tabular ${layout === l ? 'bg-primary text-primary-foreground' : 'bg-secondary text-muted-foreground hover:text-foreground'}`}
+            >{label}</button>
+          ))}
+          <span className="w-px h-4 bg-border mx-0.5" />
           <button
             onClick={() => patchWs(ws.id, { showSMA20: !ws.showSMA20 })}
             className={`px-1.5 py-0.5 rounded text-[#4dd0e1] ${ws.showSMA20 ? 'bg-accent' : 'bg-secondary/60'}`}
@@ -109,27 +119,27 @@ export function TerminalView() {
             </div>
           </Panel>
           <Handle />
-          {/* center: spot chart (+ ATM option minis for F&O) + bottom */}
-          <Panel defaultSize={60} minSize={30}>
+          {/* center: multi-pane charts (spot + CE/PE per layout) + bottom */}
+          <Panel defaultSize={65} minSize={30}>
             <PanelGroup direction="vertical">
               <Panel defaultSize={isFnOUnderlying ? 56 : 68} minSize={25}>
-                <div className="h-full flex flex-col">
-                  <div className="flex-1 min-h-0">
-                    <CanvasChart
-                      symbol={ws.symbol}
-                      tf={ws.tf}
-                      chartType={ws.chartType}
-                      showVolume={ws.showVolume}
-                      showSMA20={ws.showSMA20}
-                      showSMA50={ws.showSMA50}
-                      markers={markers}
-                      onPriceClick={p => { setLimitPrice(p); setOrderType('LIMIT') }}
-                      height="h-full"
-                    />
-                  </div>
-                  {isFnOUnderlying && ws.showOptionMinis && (
-                    <OptionMiniCharts underlying={ws.symbol} />
-                  )}
+                <div className="h-full min-h-0">
+                  <WorkspacePanes
+                    ws={ws}
+                    spot={
+                      <CanvasChart
+                        symbol={ws.symbol}
+                        tf={ws.tf}
+                        chartType={ws.chartType}
+                        showVolume={ws.showVolume}
+                        showSMA20={ws.showSMA20}
+                        showSMA50={ws.showSMA50}
+                        markers={markers}
+                        onPriceClick={p => { setLimitPrice(p); setOrderType('LIMIT') }}
+                        height="h-full"
+                      />
+                    }
+                  />
                 </div>
               </Panel>
               <Handle vertical />
@@ -139,8 +149,8 @@ export function TerminalView() {
             </PanelGroup>
           </Panel>
           <Handle />
-          {/* right: strikes panel / order pad + quick buttons */}
-          <Panel defaultSize={23} minSize={16} maxSize={34}>
+          {/* right: strikes panel / order pad + quick buttons (compact) */}
+          <Panel defaultSize={18} minSize={13} maxSize={34}>
             <RightDock ws={ws} />
           </Panel>
         </PanelGroup>

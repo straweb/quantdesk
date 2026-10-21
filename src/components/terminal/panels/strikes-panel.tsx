@@ -3,25 +3,50 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { Pencil, Plus, Power, Trash2, X } from 'lucide-react'
+import { LineChart, Pencil, Plus, Power, Trash2 } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { api, fmtMoney } from '../lib/client-api'
 import type { ChainStrikeRow, OptionQuoteCell } from '../lib/client-api'
-import { useTerminal, defaultStrikes, type StrikesCfg, type StrikeRowCfg, type WorkspaceCfg } from '../lib/store'
+import {
+  useTerminal, defaultStrikes, pinStrikePanes,
+  type StrikesCfg, type StrikeRowCfg, type WorkspaceCfg,
+} from '../lib/store'
 
 // ============================================================
-// F&O Strikes panel (right side panel tab).
-// - Dynamic strike add: CE/PE ATM +/- 1..5 one-click buttons +
-//   specific-strike input (auto-creates missing contracts)
-// - Strike rows: enabled toggle, alloc %, ATM offset, LTP,
-//   day high/low, Buy / Sell / Exit, edit open position
-// - Quick deploy bar: Deploy CE, Deploy PE, Cancel CE, PE Swap
-//   (orders sized as % of each account's usable capital —
-//   house capital rules apply per leg via the order router)
+// F&O Strikes panel (right dock tab) — compact build.
+// - Quick-add: [ATM] + [+/-] toggle + [1..5] offset buttons.
+//   Hedge-desk ATM convention: CE ATM = floor(spot/step)*step,
+//   PE ATM = ceil(spot/step)*step (spot 23020 -> CE 23000 / PE 23050).
+// - Per-strike alloc % — CE-side enabled strikes auto-normalize
+//   to 100%, PE-side likewise (independent per side).
+// - Strike rows: enable, alloc%, strike (click -> load into the
+//   CE/PE chart pane), side offset, LTP, day H/L, B/S/X, edit.
+// - Quick deploy: Deploy CE / Deploy PE / Cancel CE / PE Swap.
 // ============================================================
 
-const OFFSETS = [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5] as const
+const OFFSETS = [1, 2, 3, 4, 5] as const
+
+/** Re-scale one side's enabled rows so they always sum to 100%. */
+function normalizeSide(rows: StrikeRowCfg[], type: 'CE' | 'PE'): StrikeRowCfg[] {
+  const side = rows.filter(r => r.type === type && r.enabled)
+  if (side.length === 0) return rows
+  const list = side.map(r => ({ ...r }))
+  const n = list.length
+  // zero/unset allocs enter with an equal-share weight, then everything
+  // is proportionally scaled so the side sums to exactly 100
+  for (const r of list) if (!(r.allocPct > 0)) r.allocPct = 100 / n
+  const total = list.reduce((s, r) => s + r.allocPct, 0)
+  for (const r of list) r.allocPct = Math.round((r.allocPct / total) * 1000) / 10
+  // dump rounding drift on the largest allocation
+  const drift = Math.round((100 - list.reduce((s, r) => s + r.allocPct, 0)) * 10) / 10
+  if (drift !== 0) {
+    const big = list.reduce((a, b) => (b.allocPct > a.allocPct ? b : a))
+    big.allocPct = Math.round(Math.max(0, big.allocPct + drift) * 10) / 10
+  }
+  const fixed = new Map(list.map(r => [r.id, r] as const))
+  return rows.map(r => fixed.get(r.id) ?? r)
+}
 
 export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
   const patchWs = useTerminal(s => s.patchWs)
@@ -65,20 +90,18 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
   }, [posData])
 
   const [specific, setSpecific] = useState('')
+  const [sign, setSign] = useState<1 | -1>(1)
   const [busy, setBusy] = useState(false)
   const [expanded, setExpanded] = useState<string | null>(null)
 
   const setStrikes = (next: Partial<StrikesCfg>) => patchWs(ws.id, { strikes: { ...st, ...next } })
-  const setRow = (id: string, patch: Partial<StrikeRowCfg>) =>
-    setStrikes({ rows: st.rows.map(r => (r.id === id ? { ...r, ...patch } : r)) })
-  const removeRow = (id: string) => setStrikes({ rows: st.rows.filter(r => r.id !== id) })
 
   const addStrike = async (strike: number, type: 'CE' | 'PE') => {
     if (!underlying) { toast.error('Pick an F&O underlying first'); return }
     const id = `${strike}:${type}`
-    // read fresh store state (consecutive adds must not clobber each other)
-    const cur = useTerminal.getState().workspaces.find(w => w.id === ws.id)?.strikes ?? st
-    if (cur.rows.some(r => r.id === id)) { toast.info(`${strike} ${type} already in list`); return }
+    // read fresh store state (consecutive/parallel adds must not clobber each other)
+    const before = useTerminal.getState().workspaces.find(w => w.id === ws.id)?.strikes ?? st
+    if (before.rows.some(r => r.id === id)) { toast.info(`${strike} ${type} already in list`); return }
     try {
       const r = await api.ensureStrike(underlying, strike, st.expiry)
       if (r.created > 0) toast.success(`Contracts ready — ${r.symbols.join(', ')}`)
@@ -86,8 +109,27 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
       toast.error(e instanceof Error ? e.message : 'Failed to create contracts')
       return
     }
-    patchWs(ws.id, { strikes: { ...cur, rows: [...cur.rows, { id, strike, type, enabled: true, allocPct: st.allocPct }] } })
+    // re-read AFTER the await so an interleaved add is not overwritten
+    const cur = useTerminal.getState().workspaces.find(w => w.id === ws.id)?.strikes ?? before
+    if (cur.rows.some(r => r.id === id)) { return }
+    const rows = normalizeSide([...cur.rows, { id, strike, type, enabled: true, allocPct: 0 }], type)
+    patchWs(ws.id, { strikes: { ...cur, rows } })
     setTimeout(() => refetchChain(), 150)
+  }
+
+  /** ATM -> CE@ceAtm + PE@peAtm · offset n -> CE/PE n steps from their side ATM.
+   *  Sequential (not Promise.all) — parallel adds would race on the store. */
+  const addOffset = async (n: number) => {
+    if (!meta) { toast.error('Chain not loaded yet'); return }
+    if (n === 0) {
+      await addStrike(meta.ceAtm, 'CE')
+      await addStrike(meta.peAtm, 'PE')
+      return
+    }
+    const ce = meta.ceAtm + sign * n * meta.step
+    const pe = meta.peAtm + sign * n * meta.step
+    await addStrike(ce, 'CE')
+    await addStrike(pe, 'PE')
   }
 
   const addSpecific = async () => {
@@ -97,7 +139,30 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
     const snapped = Math.round(raw / step) * step
     if (snapped !== raw) toast.info(`Snapped ${raw} → ${snapped} (step ${step})`)
     setSpecific('')
-    await Promise.all([addStrike(snapped, 'CE'), addStrike(snapped, 'PE')])
+    await addStrike(snapped, 'CE')
+    await addStrike(snapped, 'PE')
+  }
+
+  const toggleRow = (row: StrikeRowCfg) => {
+    const rows = st.rows.map(r => (r.id === row.id ? { ...r, enabled: !r.enabled } : r))
+    setStrikes({ rows: normalizeSide(rows, row.type) })
+  }
+
+  const setAlloc = (row: StrikeRowCfg, v: number) => {
+    const clamped = Math.max(0, Math.min(100, Number.isFinite(v) ? v : 0))
+    const rows = st.rows.map(r => (r.id === row.id ? { ...r, allocPct: clamped } : r))
+    setStrikes({ rows: normalizeSide(rows, row.type) })
+  }
+
+  const removeRow = (row: StrikeRowCfg) => {
+    const rows = st.rows.filter(r => r.id !== row.id)
+    setStrikes({ rows: normalizeSide(rows, row.type) })
+    setExpanded(null)
+  }
+
+  const pinToPane = (row: StrikeRowCfg) => {
+    const cur = useTerminal.getState().workspaces.find(w => w.id === ws.id) ?? ws
+    patchWs(ws.id, pinStrikePanes(cur, row.strike, row.type))
   }
 
   // --- order helpers ---
@@ -116,7 +181,7 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
     let filled = 0, failed = 0
     for (const row of rows) {
       const cell = cellFor(row)
-      if (!cell?.exists) { failed++; continue }
+      if (!cell?.exists || !(row.allocPct > 0)) { failed++; continue }
       try {
         const res = await api.placeOrder({
           symbol: cell.symbol, exchange: 'NFO', side: 'BUY', qty: 0,
@@ -150,11 +215,11 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
         const so = await api.squareOffAll(false, ceSyms)
         toast.success(`CE squared off — ${so.filledLegs} legs`)
       }
-      // flip on: deploy PE on enabled PE rows (auto-add ATM PE if none listed)
+      // flip on: deploy PE on enabled PE rows (auto-add PE ATM if none listed)
       let peRows = rowsFor('PE')
       if (peRows.length === 0) {
         if (meta) {
-          await addStrike(meta.atm, 'PE')
+          await addStrike(meta.peAtm, 'PE')
           await new Promise(r => setTimeout(r, 500))
           const ws2 = useTerminal.getState().workspaces.find(w => w.id === ws.id)
           peRows = (ws2?.strikes?.rows ?? []).filter(r => r.type === 'PE' && r.enabled)
@@ -225,19 +290,140 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
     } catch (e) { toast.error(e instanceof Error ? e.message : 'Exit failed') }
   }
 
-  const sortedRows = useMemo(() => [...st.rows].sort((a, b) => a.strike - b.strike || (a.type === 'CE' ? -1 : 1)), [st.rows])
+  const ceRows = useMemo(() => st.rows.filter(r => r.type === 'CE').sort((a, b) => a.strike - b.strike), [st.rows])
+  const peRows = useMemo(() => st.rows.filter(r => r.type === 'PE').sort((a, b) => a.strike - b.strike), [st.rows])
+  const sideSum = (type: 'CE' | 'PE') =>
+    Math.round(st.rows.filter(r => r.type === type && r.enabled).reduce((s, r) => s + r.allocPct, 0) * 10) / 10
+
+  const offsetFor = (row: StrikeRowCfg): number | null => {
+    const chainRow = rowByStrike.get(row.strike)
+    if (!chainRow) return null
+    return row.type === 'CE' ? chainRow.offsetCe : chainRow.offsetPe
+  }
+
+  const renderRow = (row: StrikeRowCfg) => {
+    const cell = cellFor(row)
+    const offset = offsetFor(row)
+    const pos = cell?.exists ? posBySymbol.get(cell.symbol) : undefined
+    const lots = pos ? Math.abs(pos.netQty) / (meta?.lotSize || 1) : 0
+    const pinned = (row.type === 'CE' ? ws.panes?.find(p => p.key === 'ce') : ws.panes?.find(p => p.key === 'pe'))?.strike === row.strike
+    return (
+      <div key={row.id} className={expanded === row.id ? 'bg-accent/40' : ''}>
+        <div className="flex items-center gap-1 px-1.5 py-1">
+          <button
+            onClick={() => toggleRow(row)}
+            title={row.enabled ? 'Enabled for deploy — click to disable' : 'Disabled — click to enable'}
+            className={`h-3.5 w-3.5 rounded-sm border flex items-center justify-center shrink-0 ${
+              row.enabled ? 'bg-primary border-primary' : 'border-muted-foreground/40'
+            }`}
+          >
+            {row.enabled && <Power className="h-2.5 w-2.5 text-primary-foreground" />}
+          </button>
+          <AllocInput value={row.allocPct} enabled={row.enabled} onCommit={v => setAlloc(row, v)} />
+          <button
+            onClick={() => pinToPane(row)}
+            title={`Load ${row.strike} ${row.type} into the ${row.type} chart pane`}
+            className={`w-[52px] shrink-0 text-left leading-tight hover:bg-accent/70 rounded px-0.5 -mx-0.5 ${pinned ? 'ring-1 ring-primary/60 rounded' : ''}`}
+          >
+            <span className="block tabular font-semibold text-[11px]">{row.strike}</span>
+            <span className={`block text-[8px] font-bold ${row.type === 'CE' ? 'text-[#00c896]' : 'text-[#ff4d5e]'}`}>
+              {row.type}{offset == null ? '' : offset === 0 ? ' ·ATM' : offset > 0 ? ` +${offset}` : ` ${offset}`}
+            </span>
+          </button>
+          <div className="flex-1 min-w-0 text-right pr-1">
+            <div className={`tabular ${cell && cell.ltp >= cell.prevClose ? 'term-up' : 'term-down'}`}>
+              {cell?.exists ? fmtMoney(cell.ltp) : '—'}
+            </div>
+            <div className="tabular text-[9px] text-muted-foreground">
+              {cell?.exists ? `${fmtMoney(cell.high, 1)}/${fmtMoney(cell.low, 1)}` : 'H/L —'}
+            </div>
+          </div>
+          {lots > 0 && (
+            <span className={`text-[8px] px-1 rounded ${pos && pos.netQty > 0 ? 'bg-up text-[#00c896]' : 'bg-down text-[#ff4d5e]'}`} title={`${lots} lots @ ${fmtMoney(pos!.avgPrice)}`}>
+              {pos && pos.netQty > 0 ? 'L' : 'S'}{lots}
+            </span>
+          )}
+          <div className="flex gap-0.5 shrink-0">
+            <button onClick={() => rowBuy(row)} className="px-1 py-0.5 rounded bg-up text-[#00c896] hover:brightness-125 text-[9px] font-bold">B</button>
+            <button onClick={() => rowSell(row)} className="px-1 py-0.5 rounded bg-down text-[#ff4d5e] hover:brightness-125 text-[9px] font-bold">S</button>
+            <button onClick={() => rowExit(row)} className="px-1 py-0.5 rounded bg-secondary text-muted-foreground hover:text-foreground text-[9px] font-bold">X</button>
+            <button
+              onClick={() => setExpanded(expanded === row.id ? null : row.id)}
+              className={`p-0.5 rounded ${expanded === row.id ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+              title="Edit open position"
+            >
+              <Pencil className="h-2.5 w-2.5" />
+            </button>
+          </div>
+        </div>
+
+        {expanded === row.id && (
+          <StrikeRowEditor
+            row={row}
+            cell={cell}
+            lots={lots}
+            pos={pos ?? null}
+            lotSize={meta?.lotSize ?? 1}
+            onApply={async (deltaLots) => {
+              const cell2 = cellFor(row)
+              if (!cell2?.exists) return
+              if (deltaLots > 0) {
+                const res = await api.placeOrder({
+                  symbol: cell2.symbol, exchange: 'NFO', side: 'BUY', qty: deltaLots,
+                  orderType: 'MARKET', productType: 'MIS', source: 'MANUAL',
+                })
+                res.status === 'FAILED' ? toast.error(`Add failed — ${res.message}`) : toast.success(`+${deltaLots} lot(s)/leg — ${res.legs.filter(l => l.status === 'FILLED').length} legs`)
+              } else if (deltaLots < 0) {
+                await api.placeOrder({
+                  symbol: cell2.symbol, exchange: 'NFO', side: 'SELL', qty: Math.abs(deltaLots),
+                  orderType: 'MARKET', productType: 'MIS', source: 'MANUAL', reduceOnly: true,
+                })
+                toast.success(`${deltaLots} lot(s)/leg exited`)
+              }
+            }}
+            onExit={async () => {
+              const cell2 = cellFor(row)
+              if (!cell2) return
+              const so = await api.squareOffAll(false, [cell2.symbol])
+              toast.success(`Exited — ${so.filledLegs} legs`)
+            }}
+            onRemove={() => removeRow(row)}
+          />
+        )}
+      </div>
+    )
+  }
+
+  const sideHeader = (type: 'CE' | 'PE') => {
+    const sum = sideSum(type)
+    const n = st.rows.filter(r => r.type === type && r.enabled).length
+    const tint = type === 'CE' ? 'text-[#00c896]' : 'text-[#ff4d5e]'
+    return (
+      <div className="flex items-center gap-1.5 px-1.5 py-0.5 bg-secondary/40 border-b border-border/60 sticky top-0 z-10">
+        <span className={`text-[9px] font-bold ${tint}`}>{type}</span>
+        <span className="text-[8px] text-muted-foreground">
+          {type === 'CE' && meta ? `ATM ${meta.ceAtm}` : meta ? `ATM ${meta.peAtm}` : ''}
+        </span>
+        <div className="flex-1" />
+        <span className={`text-[8px] tabular px-1 rounded ${sum === 100 ? 'bg-up/60 text-[#00c896]' : 'bg-amber-500/15 text-amber-400'}`} title="Enabled strikes alloc sum (auto-normalized to 100%)">
+          Σ {sum}%
+        </span>
+        <span className="text-[8px] text-muted-foreground">{n} on</span>
+      </div>
+    )
+  }
 
   return (
     <div className="flex h-full flex-col text-[11px]">
       {/* underlying + expiry selectors */}
-      <div className="p-2 space-y-1.5 border-b border-border">
+      <div className="p-1.5 space-y-1 border-b border-border">
         <div className="flex gap-1">
           <select
             value={underlying ?? ''}
             onChange={e => setStrikes({ underlying: e.target.value || null })}
-            className="h-7 flex-1 rounded bg-secondary/60 px-1.5 text-[11px] outline-none"
+            className="h-6 flex-1 min-w-0 rounded bg-secondary/60 px-1 text-[10px] outline-none"
           >
-            <option value="">Select F&O underlying…</option>
+            <option value="">F&O underlying…</option>
             {underlyings.map(u => (
               <option key={u.underlying} value={u.underlying}>{u.underlying} · L{u.lotSize}</option>
             ))}
@@ -246,167 +432,90 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
             value={st.expiry ?? ''}
             onChange={e => setStrikes({ expiry: e.target.value || null })}
             disabled={!meta}
-            className="h-7 w-[104px] rounded bg-secondary/60 px-1.5 text-[10px] outline-none"
+            className="h-6 w-[92px] rounded bg-secondary/60 px-1 text-[9px] outline-none"
           >
             <option value="">Nearest</option>
             {(meta?.expiries ?? []).map(x => <option key={x} value={x}>{x}</option>)}
           </select>
         </div>
-        <div className="flex items-center justify-between tabular text-[10px]">
+        <div className="flex items-center justify-between tabular text-[9px]">
           <span className="text-muted-foreground">
             Spot <b className={meta && meta.spot >= meta.prevClose ? 'term-up' : 'term-down'}>{meta ? fmtMoney(meta.spot) : '—'}</b>
           </span>
-          <span className="text-muted-foreground">ATM <b className="text-foreground">{meta?.atm ?? '—'}</b></span>
-          <span className="text-muted-foreground">step {meta?.step ?? '—'}</span>
-          <span className="text-muted-foreground">lot {meta?.lotSize ?? '—'}</span>
+          <span className="text-muted-foreground">
+            C<b className="text-[#00c896]">{meta?.ceAtm ?? '—'}</b> P<b className="text-[#ff4d5e]">{meta?.peAtm ?? '—'}</b>
+          </span>
+          <span className="text-muted-foreground">s{meta?.step ?? '—'} L{meta?.lotSize ?? '—'}</span>
         </div>
 
-        {/* ATM offset quick-add */}
+        {/* compact quick-add: ATM + sign toggle + offset 1..5 */}
         {meta && (
           <div className="space-y-1 pt-0.5">
-            {(['CE', 'PE'] as const).map(t => (
-              <div key={t} className="flex items-center gap-0.5">
-                <span className={`w-5 text-[9px] font-bold ${t === 'CE' ? 'text-[#00c896]' : 'text-[#ff4d5e]'}`}>{t}</span>
-                {OFFSETS.map(o => {
-                  const strike = meta.atm + o * meta.step
-                  const added = st.rows.some(r => r.id === `${strike}:${t}`)
-                  return (
-                    <button
-                      key={o}
-                      onClick={() => addStrike(strike, t)}
-                      title={`${t} ${strike}${o === 0 ? ' (ATM)' : ` (${o > 0 ? 'OTM' : 'ITM'} ${Math.abs(o)})`}`}
-                      className={`flex-1 px-0 py-0.5 rounded text-[9px] tabular transition-colors ${
-                        added ? 'bg-primary/25 text-foreground' : 'bg-secondary/70 text-muted-foreground hover:text-foreground hover:bg-accent'
-                      }`}
-                    >{o === 0 ? 'ATM' : o > 0 ? `+${o}` : o}</button>
-                  )
-                })}
-              </div>
-            ))}
-            <div className="flex gap-1 pt-0.5">
+            <div className="flex items-center gap-0.5">
+              <button
+                onClick={() => addOffset(0)}
+                title={`Add ATM pair — CE ${meta.ceAtm} + PE ${meta.peAtm}`}
+                className="flex-1 px-0 py-0.5 rounded text-[9px] font-bold bg-primary/25 text-foreground hover:bg-primary/40 transition-colors"
+              >ATM</button>
+              <button
+                onClick={() => setSign(s => (s === 1 ? -1 : 1))}
+                title={`Direction for offset buttons: ${sign === 1 ? 'above ATM (OTM CE / ITM PE)' : 'below ATM (ITM CE / OTM PE)'}`}
+                className="w-6 px-0 py-0.5 rounded text-[9px] font-bold bg-secondary/70 text-foreground hover:bg-accent transition-colors tabular"
+              >{sign === 1 ? '+' : '−'}</button>
+              {OFFSETS.map(o => {
+                const ce = meta.ceAtm + sign * o * meta.step
+                const pe = meta.peAtm + sign * o * meta.step
+                const added = st.rows.some(r => r.id === `${ce}:CE`) && st.rows.some(r => r.id === `${pe}:PE`)
+                return (
+                  <button
+                    key={o}
+                    onClick={() => addOffset(o)}
+                    title={`${sign === 1 ? '+' : '−'}${o} → CE ${ce} · PE ${pe}`}
+                    className={`flex-1 px-0 py-0.5 rounded text-[9px] tabular transition-colors ${
+                      added ? 'bg-primary/25 text-foreground' : 'bg-secondary/70 text-muted-foreground hover:text-foreground hover:bg-accent'
+                    }`}
+                  >{o}</button>
+                )
+              })}
+            </div>
+            <div className="flex gap-1">
               <Input
                 value={specific}
                 onChange={e => setSpecific(e.target.value.replace(/[^0-9.]/g, ''))}
                 onKeyDown={e => e.key === 'Enter' && addSpecific()}
                 placeholder="Specific strike…"
-                className="h-6 flex-1 text-[10px] bg-secondary/60"
+                className="h-6 flex-1 min-w-0 text-[10px] bg-secondary/60"
               />
-              <Button size="sm" variant="secondary" className="h-6 px-2 text-[10px]" onClick={addSpecific} disabled={!specific}>
-                <Plus className="h-3 w-3 mr-0.5" /> Add CE+PE
+              <Button size="sm" variant="secondary" className="h-6 px-1.5 text-[10px]" onClick={addSpecific} disabled={!specific}>
+                <Plus className="h-3 w-3" />
               </Button>
             </div>
           </div>
         )}
       </div>
 
-      {/* strike rows */}
+      {/* strike rows — grouped CE / PE */}
       <div className="flex-1 overflow-y-auto">
         {st.rows.length === 0 && (
-          <div className="p-4 text-center text-[10px] text-muted-foreground leading-relaxed">
-            Add strikes with the CE/PE ATM ± buttons above,<br />or enter a specific strike.
+          <div className="p-3 text-center text-[10px] text-muted-foreground leading-relaxed">
+            Tap <b>ATM</b> or an offset number to add<br />CE+PE strikes, or enter a specific strike.<br />
+            <span className="text-[9px]">Click a strike to load it into the chart pane.</span>
           </div>
         )}
-        {sortedRows.map(row => {
-          const cell = cellFor(row)
-          const chainRow = rowByStrike.get(row.strike)
-          const offsetLabel = chainRow ? chainRow.offset : null
-          const pos = cell?.exists ? posBySymbol.get(cell.symbol) : undefined
-          const lots = pos ? Math.abs(pos.netQty) / (meta?.lotSize || 1) : 0
-          const isCE = row.type === 'CE'
-          return (
-            <div key={row.id} className={`border-b border-border/60 ${expanded === row.id ? 'bg-accent/40' : ''}`}>
-              <div className="flex items-center gap-1 px-1.5 py-1">
-                <button
-                  onClick={() => setRow(row.id, { enabled: !row.enabled })}
-                  title={row.enabled ? 'Enabled for deploy' : 'Disabled'}
-                  className={`h-3.5 w-3.5 rounded-sm border flex items-center justify-center shrink-0 ${
-                    row.enabled ? 'bg-primary border-primary' : 'border-muted-foreground/40'
-                  }`}
-                >
-                  {row.enabled && <Power className="h-2.5 w-2.5 text-primary-foreground" />}
-                </button>
-                <div className="w-14 shrink-0 tabular font-semibold">{row.strike}</div>
-                <span className={`w-7 shrink-0 text-[9px] font-bold ${isCE ? 'text-[#00c896]' : 'text-[#ff4d5e]'}`}>{row.type}</span>
-                <span className="w-8 shrink-0 text-[9px] text-muted-foreground" title="ATM offset">
-                  {offsetLabel == null ? '—' : offsetLabel === 0 ? 'ATM' : offsetLabel > 0 ? `+${offsetLabel}` : String(offsetLabel)}
-                </span>
-                <div className="flex-1 min-w-0 text-right pr-1">
-                  <div className={`tabular ${cell && cell.ltp >= cell.prevClose ? 'term-up' : 'term-down'}`}>
-                    {cell?.exists ? fmtMoney(cell.ltp) : '—'}
-                  </div>
-                  <div className="tabular text-[9px] text-muted-foreground">
-                    {cell?.exists ? `${fmtMoney(cell.high, 1)}/${fmtMoney(cell.low, 1)}` : 'H/L —'}
-                  </div>
-                </div>
-                {lots > 0 && (
-                  <span className={`text-[8px] px-1 rounded ${pos && pos.netQty > 0 ? 'bg-up text-[#00c896]' : 'bg-down text-[#ff4d5e]'}`} title={`${lots} lots @ ${fmtMoney(pos!.avgPrice)}`}>
-                    {pos && pos.netQty > 0 ? 'L' : 'S'}{lots}
-                  </span>
-                )}
-                <div className="flex gap-0.5 shrink-0">
-                  <button onClick={() => rowBuy(row)} className="px-1.5 py-0.5 rounded bg-up text-[#00c896] hover:brightness-125 text-[9px] font-bold">B</button>
-                  <button onClick={() => rowSell(row)} className="px-1.5 py-0.5 rounded bg-down text-[#ff4d5e] hover:brightness-125 text-[9px] font-bold">S</button>
-                  <button onClick={() => rowExit(row)} className="px-1.5 py-0.5 rounded bg-secondary text-muted-foreground hover:text-foreground text-[9px] font-bold">X</button>
-                  <button
-                    onClick={() => setExpanded(expanded === row.id ? null : row.id)}
-                    className={`p-0.5 rounded ${expanded === row.id ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
-                    title="Edit open position"
-                  >
-                    <Pencil className="h-2.5 w-2.5" />
-                  </button>
-                </div>
-              </div>
-
-              {expanded === row.id && (
-                <StrikeRowEditor
-                  row={row}
-                  cell={cell}
-                  lots={lots}
-                  pos={pos ?? null}
-                  lotSize={meta?.lotSize ?? 1}
-                  onApply={async (deltaLots) => {
-                    const cell2 = cellFor(row)
-                    if (!cell2?.exists) return
-                    if (deltaLots > 0) {
-                      const res = await api.placeOrder({
-                        symbol: cell2.symbol, exchange: 'NFO', side: 'BUY', qty: deltaLots,
-                        orderType: 'MARKET', productType: 'MIS', source: 'MANUAL',
-                      })
-                      res.status === 'FAILED' ? toast.error(`Add failed — ${res.message}`) : toast.success(`+${deltaLots} lot(s)/leg — ${res.legs.filter(l => l.status === 'FILLED').length} legs`)
-                    } else if (deltaLots < 0) {
-                      await api.placeOrder({
-                        symbol: cell2.symbol, exchange: 'NFO', side: 'SELL', qty: Math.abs(deltaLots),
-                        orderType: 'MARKET', productType: 'MIS', source: 'MANUAL', reduceOnly: true,
-                      })
-                      toast.success(`${deltaLots} lot(s)/leg exited`)
-                    }
-                  }}
-                  onExit={async () => {
-                    const cell2 = cellFor(row)
-                    if (!cell2) return
-                    const so = await api.squareOffAll(false, [cell2.symbol])
-                    toast.success(`Exited — ${so.filledLegs} legs`)
-                  }}
-                  onRemove={() => { removeRow(row.id); setExpanded(null) }}
-                  allocPct={row.allocPct}
-                  onAlloc={v => setRow(row.id, { allocPct: v })}
-                />
-              )}
-            </div>
-          )
-        })}
+        {(ceRows.length > 0 || peRows.length > 0) && (
+          <>
+            {ceRows.length > 0 && <>{sideHeader('CE')}{ceRows.map(renderRow)}</>}
+            {peRows.length > 0 && <div className="h-1 bg-border/40" />}
+            {peRows.length > 0 && <>{sideHeader('PE')}{peRows.map(renderRow)}</>}
+          </>
+        )}
       </div>
 
       {/* quick deploy bar */}
-      <div className="border-t border-border p-2 space-y-1.5 bg-card/40">
-        <div className="flex items-center gap-1 text-[10px]">
-          <span className="text-muted-foreground">Alloc %/strike</span>
-          <Input
-            value={st.allocPct}
-            onChange={e => setStrikes({ allocPct: Math.max(0.1, Math.min(100, Number(e.target.value.replace(/[^0-9.]/g, '')) || 1)) })}
-            className="h-6 w-14 text-[10px] bg-secondary/60"
-          />
-          <span className="text-[9px] text-muted-foreground">% of each account's usable capital per order</span>
+      <div className="border-t border-border p-1.5 space-y-1 bg-card/40">
+        <div className="flex items-center justify-between text-[8px] text-muted-foreground px-0.5">
+          <span>enabled strikes deploy at their alloc %</span>
+          <span><b className="text-[#00c896]">CE Σ{sideSum('CE')}%</b> · <b className="text-[#ff4d5e]">PE Σ{sideSum('PE')}%</b></span>
         </div>
         <div className="grid grid-cols-2 gap-1">
           <Button size="sm" className="h-7 text-[10px] bg-up text-[#00c896] hover:bg-[#00c896] hover:text-black" disabled={busy || !underlying} onClick={() => deploy('CE')}>
@@ -428,9 +537,31 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
 }
 
 // ------------------------------------------------------------
+// Per-strike alloc % — local edit state, commits on blur/Enter
+// (re-normalizing on every keystroke would fight the typist)
+// ------------------------------------------------------------
+function AllocInput({ value, enabled, onCommit }: { value: number; enabled: boolean; onCommit: (v: number) => void }) {
+  const [txt, setTxt] = useState(String(value))
+  const [focus, setFocus] = useState(false)
+  useEffect(() => { if (!focus) setTxt(String(Math.round(value * 10) / 10)) }, [value, focus])
+  return (
+    <input
+      value={txt}
+      disabled={!enabled}
+      onChange={e => setTxt(e.target.value.replace(/[^0-9.]/g, ''))}
+      onFocus={() => setFocus(true)}
+      onBlur={() => { setFocus(false); onCommit(Number(txt)) }}
+      onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+      title="Alloc % of usable capital — side auto-normalizes to 100%"
+      className="h-4.5 w-9 shrink-0 rounded bg-secondary/60 text-center text-[9px] tabular outline-none focus:ring-1 ring-primary/60 disabled:opacity-40"
+    />
+  )
+}
+
+// ------------------------------------------------------------
 // Inline "edit open position" editor
 // ------------------------------------------------------------
-function StrikeRowEditor({ row, cell, lots, pos, lotSize, onApply, onExit, onRemove, allocPct, onAlloc }: {
+function StrikeRowEditor({ row, cell, lots, pos, lotSize, onApply, onExit, onRemove }: {
   row: StrikeRowCfg
   cell: OptionQuoteCell | null
   lots: number
@@ -439,8 +570,6 @@ function StrikeRowEditor({ row, cell, lots, pos, lotSize, onApply, onExit, onRem
   onApply: (deltaLots: number) => Promise<void>
   onExit: () => Promise<void>
   onRemove: () => void
-  allocPct: number
-  onAlloc: (v: number) => void
 }) {
   const [delta, setDelta] = useState('')
   const [busy, setBusy] = useState(false)
@@ -482,13 +611,7 @@ function StrikeRowEditor({ row, cell, lots, pos, lotSize, onApply, onExit, onRem
         </Button>
       </div>
       <div className="flex items-center gap-1 text-[10px]">
-        <span className="text-muted-foreground">Alloc %</span>
-        <Input
-          value={allocPct}
-          onChange={e => onAlloc(Math.max(0.1, Math.min(100, Number(e.target.value.replace(/[^0-9.]/g, '')) || 1)))}
-          className="h-6 w-14 text-[10px] bg-secondary/60"
-        />
-        <span className="text-[9px] text-muted-foreground">lot {lotSize} · orders fan out to all enabled accounts</span>
+        <span className="text-[9px] text-muted-foreground">alloc {row.allocPct}% · lot {lotSize} · orders fan out to all enabled accounts</span>
       </div>
     </div>
   )

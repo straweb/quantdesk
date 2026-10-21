@@ -22,13 +22,24 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: `No option contracts for ${underlying}` }, { status: 404 })
   }
 
-  // requested strikes + ATM row (for the default CE/PE mini charts)
+  // requested strikes + ATM rows (for the default CE/PE chart panes)
   const want = [...strikes]
   if (!want.includes(meta.atm)) want.push(meta.atm)
-  const rows = await getChainQuotes(underlying, meta.expiry, want, meta.atm, meta.step)
+  if (!want.includes(meta.ceAtm)) want.push(meta.ceAtm)
+  if (!want.includes(meta.peAtm)) want.push(meta.peAtm)
+  const rows = await getChainQuotes(underlying, meta.expiry, want, meta.atm, meta.step, meta.ceAtm, meta.peAtm)
   const atmRow = rows.find(r => r.strike === meta.atm) ?? null
+  const ceRow = rows.find(r => r.strike === meta.ceAtm) ?? null
+  const peRow = rows.find(r => r.strike === meta.peAtm) ?? null
 
-  return NextResponse.json({ meta, rows, atmRow })
+  return NextResponse.json({
+    meta,
+    rows,
+    atmRow,
+    // hedge-desk convention: CE ATM = floor(spot), PE ATM = ceil(spot)
+    atmCe: ceRow ? { ...ceRow.ce, strike: meta.ceAtm } : null,
+    atmPe: peRow ? { ...peRow.pe, strike: meta.peAtm } : null,
+  })
 }
 
 export const dynamic = 'force-dynamic'

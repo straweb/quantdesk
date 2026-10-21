@@ -63,3 +63,25 @@ Stage Summary:
 - E2E verified via browser: NIFTY chain (spot 24,499 → ATM 24500 step 50 lot 75), CE ATM + PE +1 add, Deploy CE → 34/6 lots on 2 accounts by house rules, PE Swap → CE flat + PE 1350@87.2, Δ-3/leg reduce capped per account (router fix), Exit full → all flat, dynamic 25200 contracts created+quoted, mini charts live both sides
 - Console clean, no hydration errors, FEED LIVE on gateway path (:81). FEED DOWN on :3000 direct is expected (socket.io proxies only via Caddy XTransformPort)
 
+
+---
+Task ID: 4
+Agent: main (Z.ai)
+Task: Multi-layout chart panes per workspace + compact strike quick-add (ATM + offset buttons) + per-side 100% auto-normalized alloc + per-account capital chips in top bar.
+
+Work Log:
+- option-service: hedge-desk dual-ATM convention — ceAtm = floor(spot/step)*step, peAtm = ceil(spot/step)*step (spot 24520 -> CE 24500 / PE 24550); ChainMeta gained ceAtm/peAtm, ChainStrikeRow gained offsetCe/offsetPe (live side-relative offsets)
+- /api/options/chain: response now includes atmCe/atmPe quote cells (side-ATM contracts) alongside legacy atmRow
+- store: WorkspaceCfg.layout ('single' | 'spot-atm' | 'grid4') + PaneCfg[] (ce/pe/extra, strike:null = follow live ATM); helpers wsLayout/wsPanes/pinStrikePanes/unpinPane; legacy showOptionMinis migrated via fallback
+- strikes-panel rework (compact): quick-add row [ATM][+/- toggle][1..5] — ATM adds CE@ceAtm+PE@peAtm, offset n adds both sides n steps from their side ATM; specific-strike input kept; rows grouped CE/PE with sticky side headers (ATM + Σ% badge + count); per-row alloc% input (commit on blur/Enter) with normalizeSide() — enabled rows per side always sum to exactly 100 (proportional scaling, drift dumped on largest); click strike cell -> pins into CE/PE pane + mirrors scratch pane (ring highlight); deploy bar shows CE Σ/PE Σ; removed global allocPct
+- fixed parallel-add race: addOffset/addSpecific now sequential + addStrike re-reads store after ensureStrike await (CE row was being clobbered by PE add)
+- option-panes.tsx (new, replaces option-mini-charts): OptionPane (ce/pe/extra) — header (strike/type/side-offset/underlying/expiry/lot/LTP/chg%, ATM-follow badge vs PIN badge + unpin, set-active-symbol button), body = CanvasChart 1m; scratch pane defaults to underlying spot; WorkspacePanes renders 'single' | 'spot-atm' (spot top + CE|PE row) | 'grid4' (spot/CE/PE/scratch)
+- terminal-view: layout selector [1][S+2][2×2] in toolbar; center region via WorkspacePanes; right dock compacted 23% -> 18% default; panel sizes now sum to 100 (killed layout-normalization warning)
+- app-shell: CapitalChips top-right — one chip per account (dot = order-routing state, label, compact usable ₹ format k/L/Cr); popover: order-routing Switch (instant PATCH), capital size input, sizing-mode Select (short labels + detail), realized PnL, Apply
+- /api/accounts GET: added missing `mode` field (was only modeLabel — Select rendered empty)
+- E2E verified via agent-browser: ATM + offsets add both sides w/ live side-relative offsets; PE side normalized 25/25/50 after adds; Deploy CE -> 24500CE legs at 100% usable (SIM Master 20700 qty, Trader 3 4275, zero-usable acct skipped); row click pins CE pane (stays pinned while ATM re-keys), PE click pins PE + scratch mirrors; unpin -> ATM follow; 2x2 + single layouts OK; capital chip: initial 500000->300000 saved, mode PROFIT_ONLY->INITIAL_WITH_LOSS_REDUCTION -> usable ₹2.98L (300k − 2.2k realized loss); console clean, no hydration errors
+
+Stage Summary:
+- Default FNO workspace = S+2 layout: spot top, live side-ATM CE (left) / PE (right) panes below; strike rows load into panes on click
+- Alloc semantics: each side independently auto-normalizes to 100% of per-account usable capital; deploy/cancel/swap per side unchanged
+- Capital chips give one-click account enable/disable + capital sizing without leaving the terminal

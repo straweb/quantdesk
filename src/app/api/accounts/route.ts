@@ -17,7 +17,7 @@ export async function GET(req: NextRequest) {
     include: { capital: true },
     orderBy: { sortOrder: 'asc' },
   })
-  const snapshots = []
+  const snapshots: Record<string, unknown>[] = []
   for (const a of accounts) {
     const capital = a.capital
     const state = capital ? {
@@ -39,6 +39,7 @@ export async function GET(req: NextRequest) {
       isOrderEnabled: a.isOrderEnabled,
       isCopyMaster: a.isCopyMaster,
       sortOrder: a.sortOrder,
+      mode: capital?.mode ?? null,
       modeLabel: state ? capital?.mode : null,
       usableCapital: state ? computeUsableCapital(state) : 0,
       initialCapital: capital?.initialCapital ?? 0,
