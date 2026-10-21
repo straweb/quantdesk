@@ -103,6 +103,12 @@ export interface WorkspaceCfg {
   showBOLL?: boolean
   showRSI?: boolean
   showMACD?: boolean
+  // 1M ghost overlay (sample-tool #ghostCtl): 1m candles ghosted on >1m charts
+  showGhost?: boolean
+  ghostStyle?: 'hollow' | 'fade'
+  // axis scales: topmost enabled = right axis, others = left measurement
+  // column; % / pts are relative to a draggable baseline
+  scales?: { price: boolean; pct: boolean; inv: boolean; pts: boolean }
   // strike allocation mode: % of usable capital (auto-normalized per side)
   // or fixed ₹ per strike per account
   allocMode?: AllocMode
@@ -128,6 +134,8 @@ interface TerminalState {
   workspaces: WorkspaceCfg[]
   activeWs: string
   selectedSymbol: string
+  // starred watchlist (Watch tab in the left panel)
+  watchSymbols: string[]
   // order pad state (shared + synced from chart/panels)
   side: OrderSide
   orderType: OrderTypeKind
@@ -150,12 +158,17 @@ interface TerminalState {
   setQtyMode: (m: 'AUTO' | 'MANUAL') => void
   setLimitPrice: (p: number | null) => void
   setBottomTab: (t: 'orders' | 'trades' | 'positions' | 'funds' | 'logs') => void
+  toggleWatch: (s: string) => void
+  /** Open (or re-activate) a per-symbol workspace; FNO ones get the
+   *  spot+ATM layout and the strikes panel auto-bound to the symbol. */
+  openSymbolWorkspace: (s: string, fno?: boolean) => void
 }
 
 const mkWs = (id: string, name: string, symbol: string): WorkspaceCfg => ({
   id, name, symbol, tf: '5m', chartType: 'candles', showVolume: true, showSMA20: false, showSMA50: false,
   allocMode: 'PCT', showOptionMinis: true, layout: 'spot-atm', panes: defaultPanes(), strikes: defaultStrikes(),
   depthPanels: defaultDepthPanels(symbol),
+  showGhost: false, ghostStyle: 'hollow', scales: { price: true, pct: false, inv: false, pts: false },
 })
 
 export const useTerminal = create<TerminalState>()(
@@ -165,6 +178,7 @@ export const useTerminal = create<TerminalState>()(
       workspaces: [mkWs('ws1', 'Workspace 1', 'NIFTY'), mkWs('ws2', 'Hedge Desk', 'BANKNIFTY')],
       activeWs: 'ws1',
       selectedSymbol: 'NIFTY',
+      watchSymbols: ['NIFTY', 'SENSEX', 'BANKNIFTY'],
       side: 'BUY',
       orderType: 'MARKET',
       productType: 'MIS',
@@ -202,10 +216,26 @@ export const useTerminal = create<TerminalState>()(
       setQtyMode: m => set({ qtyMode: m }),
       setLimitPrice: p => set({ limitPrice: p }),
       setBottomTab: t => set({ bottomTab: t }),
+      toggleWatch: s => {
+        const cur = get().watchSymbols
+        set({ watchSymbols: cur.includes(s) ? cur.filter(x => x !== s) : [...cur, s] })
+      },
+      openSymbolWorkspace: (s, fno = false) => {
+        const existing = get().workspaces.find(w => w.symbol === s)
+        if (existing) {
+          set({ activeWs: existing.id, selectedSymbol: s })
+          return
+        }
+        const n = get().workspaces.length + 1
+        const ws = mkWs(`ws${Date.now().toString(36)}`, s, s)
+        ws.layout = fno ? 'spot-atm' : 'single'
+        if (fno) ws.strikes = { ...defaultStrikes(), underlying: s, expiry: null, rows: [] }
+        set({ workspaces: [...get().workspaces, ws], activeWs: ws.id, selectedSymbol: s })
+      },
     }),
     {
       name: 'zterm-workspaces',
-      partialize: s => ({ workspaces: s.workspaces, activeWs: s.activeWs, productType: s.productType, qtyMode: s.qtyMode }),
+      partialize: s => ({ workspaces: s.workspaces, activeWs: s.activeWs, productType: s.productType, qtyMode: s.qtyMode, watchSymbols: s.watchSymbols }),
       // Avoid SSR/CSR hydration mismatch: server renders defaults, client
       // must not rehydrate synchronously before the first render.
       // We call useTerminal.persist.rehydrate() inside a useEffect after mount.

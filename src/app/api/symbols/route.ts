@@ -12,10 +12,12 @@ export async function GET(req: NextRequest) {
   const q = (url.searchParams.get('q') ?? '').trim().toUpperCase()
   const exchange = url.searchParams.get('exchange') ?? ''
   const instrumentType = url.searchParams.get('type') ?? ''
+  const symbolsIn = (url.searchParams.get('symbols') ?? '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
   const limit = Math.min(200, Number(url.searchParams.get('limit') ?? 50))
 
   const where: Record<string, unknown> = {}
   if (q) where.symbol = { contains: q }
+  if (symbolsIn.length > 0) where.symbol = { in: symbolsIn } // explicit lookup (watchlist stars)
   if (exchange) where.exchange = exchange
   if (instrumentType) where.instrumentType = instrumentType
 

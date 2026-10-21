@@ -1,8 +1,12 @@
 import { createServer } from 'http'
 import { Server } from 'socket.io'
-import { readFileSync, writeFileSync, mkdirSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, readdirSync } from 'fs'
 import path from 'path'
 import { spawn } from 'child_process'
+// bun:sqlite — embedded recorder for tick-by-tick session backups
+// (used later for paper trading / replay). Node fallback: not supported.
+// @ts-ignore bun runtime builtin
+import { Database } from 'bun:sqlite'
 
 // ============================================================
 // Market Feed Mini-Service (port 3003, bun runtime)
@@ -50,6 +54,7 @@ const REST_PORT = Number(process.env.REST_PORT || 3004) // REST (Next.js server-
 const DEFAULT_UNIVERSE: UniverseEntry[] = [
   { symbol: 'NIFTY', basePrice: 24500, lotSize: 1, instrumentType: 'INDEX' },
   { symbol: 'BANKNIFTY', basePrice: 51800, lotSize: 1, instrumentType: 'INDEX' },
+  { symbol: 'SENSEX', basePrice: 81000, lotSize: 1, instrumentType: 'INDEX' },
   { symbol: 'RELIANCE', basePrice: 2870, lotSize: 250, instrumentType: 'EQ' },
   { symbol: 'TCS', basePrice: 4150, lotSize: 175, instrumentType: 'EQ' },
   { symbol: 'HDFCBANK', basePrice: 1740, lotSize: 550, instrumentType: 'EQ' },
@@ -116,6 +121,125 @@ try {
   const raw = readFileSync(FEED_SRC_FILE, 'utf8')
   feedSource = (JSON.parse(raw) as { source?: string }).source ?? 'sim'
 } catch { /* first boot — default 'sim' */ }
+
+// ---------- tick recorder (session live-feed backup) ----------
+// Every tick of the configured symbols is written to a per-session SQLite
+// DB (one file per feed boot, plus a new file when the IST date rolls over).
+// Default: NIFTY + SENSEX. Admin can disable or add symbols via REST/Next API.
+// These archives power the future paper-trading/replay engine.
+const TICK_DIR = path.resolve(process.cwd(), '../../db/ticks')
+const TICK_CFG_FILE = process.env.TICK_CFG_FILE || path.join(TICK_DIR, 'tick-recorder.json')
+
+interface TickCfg { enabled: boolean; symbols: string[] }
+let tickCfg: TickCfg = { enabled: true, symbols: ['NIFTY', 'SENSEX'] }
+try {
+  const raw = readFileSync(TICK_CFG_FILE, 'utf8')
+  const parsed = JSON.parse(raw) as Partial<TickCfg>
+  if (typeof parsed.enabled === 'boolean') tickCfg.enabled = parsed.enabled
+  if (Array.isArray(parsed.symbols)) tickCfg.symbols = parsed.symbols.filter(s => typeof s === 'string').slice(0, 32)
+} catch { /* first boot — defaults */ }
+
+interface TickSession {
+  db: InstanceType<typeof Database> | null
+  file: string
+  startedAt: string
+  istDate: string
+  rows: number
+}
+const gTick = g as unknown as { __tickSession?: TickSession }
+const gTimers = g as unknown as { __tickRecTimer?: ReturnType<typeof setInterval> }
+
+function istDateStr(ts = Date.now()): string {
+  return new Date(ts + 5.5 * 3600_000).toISOString().slice(0, 10)
+}
+
+function openTickSession(): void {
+  if (!gTimers.__tickRecTimer) {
+    gTimers.__tickRecTimer = setInterval(recordTickOnce, 250)
+  }
+  if (!tickCfg.enabled) { closeTickSession(); return }
+  if (gTick.__tickSession) return
+  try {
+    const now = Date.now()
+    const day = istDateStr(now)
+    const dir = path.join(TICK_DIR, day)
+    mkdirSync(dir, { recursive: true })
+    const d = new Date(now + 5.5 * 3600_000)
+    const file = path.join(dir, `session-${d.toISOString().slice(11, 19).replaceAll(':', '')}.db`)
+    const DatabaseAny = Database as unknown as new (p: string) => InstanceType<typeof Database>
+    const dbh = new DatabaseAny(file)
+    dbh.exec(`
+      CREATE TABLE IF NOT EXISTS ticks (
+        ts INTEGER NOT NULL, symbol TEXT NOT NULL, ltp REAL, bid REAL, ask REAL,
+        vol INTEGER, high REAL, low REAL, open REAL, prevClose REAL
+      );
+      CREATE INDEX IF NOT EXISTS ix_ticks_sym_ts ON ticks(symbol, ts);
+      CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+    `)
+    dbh.prepare(`INSERT OR REPLACE INTO meta (k, v) VALUES ('startedAt', ?), ('symbols', ?)`).run(
+      new Date(now).toISOString(), tickCfg.symbols.join(','),
+    )
+    gTick.__tickSession = { db: dbh, file, startedAt: new Date(now).toISOString(), istDate: day, rows: 0 }
+    console.log(`[market-feed] tick recorder ON — session ${file} (${tickCfg.symbols.join(', ')})`)
+  } catch (e) {
+    console.error('[market-feed] tick session open failed:', e)
+  }
+}
+
+function closeTickSession(): void {
+  const s = gTick.__tickSession
+  if (s?.db) { try { s.db.close() } catch { /* ignore */ } }
+  if (s) console.log(`[market-feed] tick session closed (${s.rows} rows) — ${s.file}`)
+  gTick.__tickSession = undefined
+}
+
+function recordTickOnce(): void {
+  const s = gTick.__tickSession
+  if (!tickCfg.enabled) { if (s) closeTickSession(); return }
+  if (!s) { openTickSession(); return }
+  // new IST day -> new session file (a fresh db per trading session)
+  if (s.istDate !== istDateStr()) { closeTickSession(); openTickSession(); return }
+  if (!s.db) return
+  const now = Date.now()
+  const stmt = s.db.prepare(`INSERT INTO ticks (ts, symbol, ltp, bid, ask, vol, high, low, open, prevClose) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+  const many: unknown[][] = []
+  for (const sym of tickCfg.symbols) {
+    const st = S.states.get(sym)
+    if (!st) continue
+    many.push([now, sym, st.ltp, st.bid, st.ask, st.vol, st.high, st.low, st.open, st.prevClose])
+  }
+  if (many.length === 0) return
+  try {
+    s.db.transaction(() => { for (const r of many) stmt.run(...(r as [unknown])) })()
+    s.rows += many.length
+  } catch (e) {
+    console.error('[market-feed] tick write failed:', e)
+  }
+}
+
+function tickSessionInfo() {
+  const s = gTick.__tickSession
+  return s
+    ? { file: s.file, startedAt: s.startedAt, rows: s.rows }
+    : null
+}
+
+function listTickSessions(): { file: string; bytes: number; mtime: string }[] {
+  const out: { file: string; bytes: number; mtime: string }[] = []
+  try {
+    if (!existsSync(TICK_DIR)) return out
+    for (const day of readdirSync(TICK_DIR)) {
+      const dayDir = path.join(TICK_DIR, day)
+      for (const f of readdirSync(dayDir)) {
+        if (!f.endsWith('.db')) continue
+        const p = path.join(dayDir, f)
+        const stt = statSync(p)
+        out.push({ file: path.relative(path.resolve(process.cwd(), '../..'), p), bytes: stt.size, mtime: stt.mtime.toISOString() })
+      }
+    }
+  } catch { /* ignore */ }
+  return out.sort((a, b) => (a.file < b.file ? 1 : -1)).slice(0, 40)
+}
 
 // ---------- sidecar supervisor: keep the Next.js dev server alive ----------
 // This service is boot-spawned and outlives agent tool sessions (whose spawned
@@ -334,6 +458,56 @@ const httpServer = createServer((req, res) => {
 
   if (url.pathname === '/health') return json(200, { ok: true, symbols: S.states.size, ts: Date.now() })
 
+  // ---- tick recorder config (session live-feed backup) ----
+  if (url.pathname === '/tick-config') {
+    if (req.method === 'POST') {
+      let body = ''
+      req.on('data', c => (body += c))
+      req.on('end', () => {
+        try {
+          const b = JSON.parse(body) as Partial<TickCfg>
+          if (typeof b.enabled === 'boolean') tickCfg.enabled = b.enabled
+          if (Array.isArray(b.symbols)) {
+            tickCfg.symbols = b.symbols.filter(s => typeof s === 'string' && s.trim()).map(s => s.trim().toUpperCase()).slice(0, 32)
+          }
+          try {
+            mkdirSync(path.dirname(TICK_CFG_FILE), { recursive: true })
+            writeFileSync(TICK_CFG_FILE, JSON.stringify(tickCfg, null, 2))
+          } catch (e) { console.error('[market-feed] tick-config persist failed:', e) }
+          if (tickCfg.enabled) openTickSession()
+          else closeTickSession()
+          console.log(`[market-feed] tick recorder config: enabled=${tickCfg.enabled} symbols=[${tickCfg.symbols.join(',')}]`)
+          json(200, { ok: true, ...tickCfg, session: tickSessionInfo() })
+        } catch (e) { json(400, { ok: false, error: String(e) }) }
+      })
+      return
+    }
+    return json(200, { ...tickCfg, session: tickSessionInfo() })
+  }
+
+  if (url.pathname === '/tick-sessions') {
+    return json(200, { sessions: listTickSessions(), current: tickSessionInfo() })
+  }
+
+  // tick sample replay — future paper-trading input:
+  // GET /tick-sample?file=db/ticks/2026-10-21/session-091500.db&symbol=NIFTY&limit=200&from=0
+  if (url.pathname === '/tick-sample') {
+    const file = url.searchParams.get('file') ?? ''
+    const symbol = url.searchParams.get('symbol') ?? ''
+    const limit = Math.min(5000, Number(url.searchParams.get('limit') ?? 500))
+    const from = Math.max(0, Number(url.searchParams.get('from') ?? 0))
+    if (!file || !file.includes('db/ticks') || file.includes('..')) return json(400, { error: 'file required' })
+    try {
+      const DatabaseAny = Database as unknown as new (p: string, ro: boolean) => InstanceType<typeof Database>
+      const dbh = new DatabaseAny(path.resolve(process.cwd(), '../..', file), true)
+      const rows = symbol
+        ? dbh.prepare('SELECT * FROM ticks WHERE symbol = ? ORDER BY ts LIMIT ? OFFSET ?').all(symbol, limit, from)
+        : dbh.prepare('SELECT * FROM ticks ORDER BY ts LIMIT ? OFFSET ?').all(limit, from)
+      dbh.close()
+      return json(200, { file, count: rows.length, ticks: rows })
+    } catch (e) { return json(500, { error: String(e) }) }
+  }
+
   // ---- active feed source (which account the terminal pulls data from) ----
   // Persisted to a shared JSON file so the Next.js API can read/write it too.
   // 'sim' = built-in simulated feed; otherwise a BrokerAccount id whose
@@ -452,14 +626,22 @@ loadUniverse(DEFAULT_UNIVERSE)
 
 // ---- timers: bun --hot stacks intervals across reloads — deregister the
 // previous module's loops first (globalThis survives hot reloads) ----
-interface HotTimers { tick?: ReturnType<typeof setInterval>; stream?: ReturnType<typeof setInterval>; watch?: ReturnType<typeof setInterval> }
+interface HotTimers { tick?: ReturnType<typeof setInterval>; stream?: ReturnType<typeof setInterval>; watch?: ReturnType<typeof setInterval>; tickRec?: ReturnType<typeof setInterval> }
 const hot = g as unknown as { __feedTimers?: HotTimers }
 if (hot.__feedTimers) {
   if (hot.__feedTimers.tick) clearInterval(hot.__feedTimers.tick)
   if (hot.__feedTimers.stream) clearInterval(hot.__feedTimers.stream)
   if (hot.__feedTimers.watch) clearInterval(hot.__feedTimers.watch)
+  if (hot.__feedTimers.tickRec) clearInterval(hot.__feedTimers.tickRec)
 }
 hot.__feedTimers = {}
+// the tick-recorder loop registers itself via gTimers.__tickRecTimer inside
+// openTickSession() — clear any stale one left by a previous module instance
+if (gTimers.__tickRecTimer) clearInterval(gTimers.__tickRecTimer)
+gTimers.__tickRecTimer = undefined
+
+// ---- tick recorder: open the session DB if enabled (after timer cleanup) ----
+if (tickCfg.enabled) openTickSession()
 
 // tick loop 250ms — streams subscribed symbols
 hot.__feedTimers.tick = setInterval(tickOnce, 250)

@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { db } from '@/lib/db'
 
 const FEED_URL = process.env.FEED_SERVICE_URL || 'http://localhost:3004'
 
-// REST proxy: full quote + market depth
+// REST proxy: full quote + market depth, enriched with the master-contract
+// lot size so depth quantity can be rendered in LOTS when the instrument
+// has one (F&O) and in raw shares otherwise.
 export async function GET(req: NextRequest) {
   const url = new URL(req.url)
   const symbol = url.searchParams.get('symbol') ?? ''
@@ -13,7 +16,13 @@ export async function GET(req: NextRequest) {
       cache: 'no-store',
     })
     const data = await res.json()
-    return NextResponse.json(data, { status: res.status })
+    let lotSize = 1
+    let instrumentType: string | null = null
+    try {
+      const m = await db.symbolMaster.findFirst({ where: { symbol }, select: { lotSize: true, instrumentType: true } })
+      if (m) { lotSize = m.lotSize || 1; instrumentType = m.instrumentType }
+    } catch { /* fall back to raw qty */ }
+    return NextResponse.json({ ...data, lotSize, instrumentType }, { status: res.status })
   } catch (e) {
     return NextResponse.json({ error: `feed unavailable: ${e instanceof Error ? e.message : ''}` }, { status: 502 })
   }

@@ -1,4 +1,33 @@
 {
-  "rules": [],
-  "updatedAt": "2026-10-21T18:41:55.981Z"
+  "rules": [
+    {
+      "id": "AR-MVIJGOUD878VPH",
+      "name": "E2E single-fire",
+      "underlying": "NIFTY",
+      "expiry": null,
+      "kind": "TIME",
+      "cross": "ABOVE",
+      "time": "01:33:09",
+      "action": "DEPLOY",
+      "optType": "PE",
+      "offset": 0,
+      "strikes": [
+        {
+          "strike": 24550,
+          "type": "PE",
+          "allocPct": 5
+        }
+      ],
+      "allocPct": 5,
+      "enabled": true,
+      "repeatDaily": true,
+      "fireCount": 1,
+      "createdAt": "2026-10-21T20:02:25.093Z",
+      "lastFiredDate": "2026-10-22",
+      "lastFiredAt": "2026-10-21T20:03:09.980Z",
+      "lastStatus": "FIRED",
+      "lastMessage": "BUY 1 strike(s) — 3/3 account fills @ MKT"
+    }
+  ],
+  "updatedAt": "2026-10-21T20:06:05.939Z"
 }

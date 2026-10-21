@@ -214,6 +214,8 @@ export const api = {
 
   symbols: (q: string, type: string) =>
     fetch(`/api/symbols?q=${encodeURIComponent(q)}&type=${type}&limit=120`).then(r => j<{ symbols: SymbolRow[] }>(r)),
+  symbolsByList: (list: string[]) =>
+    fetch(`/api/symbols?symbols=${encodeURIComponent(list.join(','))}&limit=200`).then(r => j<{ symbols: SymbolRow[] }>(r)),
   syncSymbols: () => fetch('/api/symbols/sync', { method: 'POST' }).then(r => j<{ ok: boolean; symbolCount: number; mappedCount: number }>(r)),
   syncInfo: () => fetch('/api/symbols/sync').then(r => j<{ lastSync: string | null; counts: { symbols: number; mappings: number } }>(r)),
 
@@ -241,7 +243,15 @@ export const api = {
   candles: (symbol: string, tf: Timeframe, limit = 500) =>
     fetch(`/api/market/candles?symbol=${encodeURIComponent(symbol)}&tf=${tf}&limit=${limit}`).then(r => j<{ candles: Candle[] }>(r)),
   quote: (symbol: string) =>
-    fetch(`/api/market/quote?symbol=${encodeURIComponent(symbol)}`).then(r => j<{ symbol: string; ltp: number; prevClose: number; bid: number; ask: number; depth: { buys: { price: number; qty: number }[]; sells: { price: number; qty: number }[] } }>(r)),
+    fetch(`/api/market/quote?symbol=${encodeURIComponent(symbol)}`).then(r => j<{ symbol: string; ltp: number; prevClose: number; bid: number; ask: number; lotSize?: number; instrumentType?: string | null; depth: { buys: { price: number; qty: number }[]; sells: { price: number; qty: number }[] } }>(r)),
+  indexComponents: (symbol: string) =>
+    fetch(`/api/market/index?symbol=${encodeURIComponent(symbol)}`).then(r => j<IndexComponentsResp>(r)),
+  sessionStats: () => fetch('/api/stats/session').then(r => j<SessionStatsResp>(r)),
+  tickRecorder: () => fetch('/api/tickrecorder').then(r => j<TickRecorderResp>(r)),
+  setTickRecorder: (body: { enabled?: boolean; symbols?: string[] }) =>
+    fetch('/api/tickrecorder', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => j<{ ok: boolean; enabled: boolean; symbols: string[] }>(r)),
+  cancelOrder: (accountId: string, orderId: string) =>
+    fetch('/api/orders/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accountId, orderId }) }).then(r => j<{ ok: boolean }>(r)),
   status: () => fetch('/api/market/status').then(r => j<{ services: Record<string, string | number>; masterContracts: { count: number; lastSync: string | null }; accounts: number; enabledStrategies: number }>(r)),
 
   // ---- options chain (strikes panel) ----
@@ -272,14 +282,20 @@ export interface AutoRuleRow {
   name: string
   underlying: string
   expiry: string | null
-  kind: 'INDEX' | 'TIME'
+  kind: 'INDEX' | 'INDEX_RANGE' | 'TIME'
   level?: number
   cross?: 'ABOVE' | 'BELOW'
+  lo?: number
+  hi?: number
   time?: string
-  action: 'BUY' | 'SELL'
+  action: 'BUY' | 'SELL' | 'DEPLOY' | 'CANCEL'
   optType: 'CE' | 'PE'
   offset: number
+  strikes?: { strike: number; type: 'CE' | 'PE'; allocPct: number }[]
   allocPct: number
+  entryPrice?: number
+  stopLoss?: number
+  target?: number
   enabled: boolean
   repeatDaily: boolean
   lastFiredDate?: string
@@ -288,6 +304,44 @@ export interface AutoRuleRow {
   lastMessage?: string
   fireCount: number
   createdAt: string
+}
+
+export interface IndexComponentRow {
+  symbol: string
+  weight: number
+  ltp: number
+  high: number
+  low: number
+  vol: number
+  chgPct: number
+  pts: number
+}
+
+export interface IndexComponentsResp {
+  index: { symbol: string; name: string; ltp: number; prevClose: number; high: number; low: number; vol: number; chgPts: number; chgPct: number }
+  constituents: IndexComponentRow[]
+  totalPts: number
+}
+
+export interface SessionStatsResp {
+  winRate: number | null
+  pts: number
+  realized: number
+  unrealized: number
+  net: number
+  closes: number
+  wins: number
+  trades: number
+  charges: number
+  perAccount: { accountId: string; label: string; brokerType: string; trades: number; closes: number; wins: number; pts: number; realized: number; unrealized: number; charges: number }[]
+  topSymbols: { symbol: string; pts: number }[]
+}
+
+export interface TickRecorderResp {
+  enabled: boolean
+  symbols: string[]
+  session: { file: string; startedAt: string; rows: number } | null
+  sessions: { file: string; bytes: number; mtime: string }[]
 }
 
 export interface BrokerBookRow {

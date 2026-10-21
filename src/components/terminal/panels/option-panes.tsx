@@ -151,6 +151,7 @@ export function OptionPane({ ws, kind }: { ws: WorkspaceCfg; kind: PaneCfg['key'
             showSMA20={ws.showSMA20} showSMA50={ws.showSMA50}
             showEMA={ws.showEMA} showVWAP={ws.showVWAP} showBOLL={ws.showBOLL}
             showRSI={ws.showRSI} showMACD={ws.showMACD}
+            showGhost={ws.showGhost} ghostStyle={ws.ghostStyle} scales={ws.scales}
             height="h-full"
           />
         </div>
@@ -226,6 +227,7 @@ export function OptionPane({ ws, kind }: { ws: WorkspaceCfg; kind: PaneCfg['key'
         showBOLL={ws.showBOLL}
         showRSI={ws.showRSI}
         showMACD={ws.showMACD}
+        showGhost={ws.showGhost} ghostStyle={ws.ghostStyle} scales={ws.scales}
         height="h-full"
       />
     )

@@ -28,6 +28,11 @@ export interface ChartMarker { price: number; label: string; color: string }
 /** Blank bars the user can pan into beyond the live edge. */
 export const FUTURE_BARS = 50
 
+/** Axis scales (sample-tool "SCALES" popup): topmost enabled scale gets the
+ *  right axis, the others render as a left measurement column. % / pts are
+ *  relative to a baseline the user can drag or set by clicking the chart. */
+export interface ScalesCfg { price: boolean; pct: boolean; inv: boolean; pts: boolean }
+
 interface Props {
   symbol: string
   tf: string
@@ -40,6 +45,10 @@ interface Props {
   showBOLL?: boolean
   showRSI?: boolean
   showMACD?: boolean
+  // 1M ghost: overlay 1m candles on higher-timeframe charts (hollow/fade)
+  showGhost?: boolean
+  ghostStyle?: 'hollow' | 'fade'
+  scales?: ScalesCfg
   markers?: ChartMarker[]
   onPriceClick?: (price: number) => void
   height: string
@@ -189,8 +198,29 @@ function fmtVol(v: number): string {
   return String(Math.round(v))
 }
 
+// ---- scale labels (percent / points vs baseline) ----
+function labelPct(v: number): string {
+  const s = v >= 0 ? '+' : '-', a = Math.abs(v)
+  return s + (a >= 100 ? a.toFixed(0) : a >= 10 ? a.toFixed(1) : a.toFixed(2)) + '%'
+}
+function labelPts(v: number): string {
+  const s = v >= 0 ? '+' : '-', a = Math.abs(v)
+  return s + (a >= 1000 ? a.toFixed(0) : a >= 100 ? a.toFixed(1) : a.toFixed(2))
+}
+
+// baseline pick-mode bus (toolbar "Set base" button arms ALL charts;
+// the next chart click consumes it)
+const BASE_PICK_EVENT = 'qd-chart-set-base'
+const BASE_SET_EVENT = 'qd-chart-base-set'
+
+function lowerBoundTime(arr: Candle[], t: number): number {
+  let lo = 0, hi = arr.length
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (arr[mid].t < t) lo = mid + 1; else hi = mid }
+  return lo
+}
+
 interface DragState {
-  zone: 'plot' | 'price' | 'time'
+  zone: 'plot' | 'price' | 'time' | 'base'
   startX: number
   startY: number
   startOffset: number
@@ -203,6 +233,7 @@ interface DragState {
 export function CanvasChart({
   symbol, tf, chartType, showVolume, showSMA20, showSMA50,
   showEMA = false, showVWAP = false, showBOLL = false, showRSI = false, showMACD = false,
+  showGhost = false, ghostStyle = 'hollow', scales,
   markers = [], onPriceClick, height, mini = false,
 }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null)
@@ -224,6 +255,26 @@ export function CanvasChart({
   const lastRangeRef = useRef({ pMin: 0, pMax: 1 }) // survives full-future views
   const lastVolRef = useRef<Record<string, number>>({})
   const chartId = useRef(++CHART_SEQ)
+  // ---- 1M ghost overlay ----
+  const [ghost, setGhost] = useState<Candle[]>([])
+  // ---- scales baseline (null = day open ref) + pick mode ----
+  const baseRef = useRef<number | null>(null)
+  const pickRef = useRef(false)
+  const [baseArmed, setBaseArmed] = useState(false)
+  // last-drawn baseline geometry (for the grab zone) — updated every frame
+  const drawMetaRef = useRef({ yBase: -1, baseline: 0 })
+
+  // ---- baseline pick-mode bus (armed from the toolbar SCALES popover) ----
+  useEffect(() => {
+    const arm = () => { pickRef.current = true; setBaseArmed(true) }
+    const disarm = () => { pickRef.current = false; setBaseArmed(false) }
+    window.addEventListener(BASE_PICK_EVENT, arm)
+    window.addEventListener(BASE_SET_EVENT, disarm)
+    return () => {
+      window.removeEventListener(BASE_PICK_EVENT, arm)
+      window.removeEventListener(BASE_SET_EVENT, disarm)
+    }
+  }, [])
 
   // ---- crosshair sync (same tf only — charts are interval-locked) ----
   useEffect(() => {
@@ -269,6 +320,21 @@ export function CanvasChart({
     }
   }, [symbol, tf, load])
 
+  // ---- 1m ghost data (only meaningful on higher timeframes) ----
+  useEffect(() => {
+    if (!showGhost || tf === '1m') { setGhost([]); return }
+    let dead = false
+    const pull = async () => {
+      try {
+        const r = await api.candles(symbol, '1m' as never, 1200)
+        if (!dead) setGhost(r.candles ?? [])
+      } catch { /* ghost is best-effort */ }
+    }
+    pull()
+    const iv = setInterval(pull, 30_000)
+    return () => { dead = true; clearInterval(iv) }
+  }, [symbol, tf, showGhost])
+
   // ---- live ticks merge into the last candle ----
   useEffect(() => {
     return onTicks(map => {
@@ -293,8 +359,27 @@ export function CanvasChart({
         }
         return arr
       })
+      // ghost 1m last bar follows live ticks as well
+      if (showGhost && tf !== '1m') {
+        setGhost(prevG => {
+          if (prevG.length === 0) return prevG
+          const gArr = prevG.slice()
+          const gl = { ...gArr[gArr.length - 1] }
+          const gb = Math.floor(t.ts / 60_000) * 60_000
+          if (gb > gl.t) {
+            gArr.push({ t: gb, o: t.ltp, h: t.ltp, l: t.ltp, c: t.ltp, v: 0 })
+            if (gArr.length > 2400) gArr.splice(0, 200)
+          } else {
+            gl.c = t.ltp
+            gl.h = Math.max(gl.h, t.ltp)
+            gl.l = Math.min(gl.l, t.ltp)
+            gArr[gArr.length - 1] = gl
+          }
+          return gArr
+        })
+      }
     })
-  }, [symbol, tf])
+  }, [symbol, tf, showGhost])
 
   // ---- render loop ----
   useEffect(() => {
@@ -345,6 +430,7 @@ export function CanvasChart({
       if (slots < 2) { offsetRef.current = 0; return }
       const vis: (Candle | null)[] = new Array(slots)
       for (let i = 0; i < slots; i++) vis[i] = data[start + i] ?? null
+      const lastC0 = data[data.length - 1]
       const lastT = data[data.length - 1].t
       const tfMs = TF_MS[tf as keyof typeof TF_MS] ?? 60_000
       const timeOfSlot = (i: number) => {
@@ -352,9 +438,26 @@ export function CanvasChart({
         return di < data.length ? data[di].t : lastT + (di - (data.length - 1)) * tfMs
       }
 
+      // day-change reference (session open) — the default scales baseline
+      const dayKey = (t: number) => new Date(t + 5.5 * 3600_000).toISOString().slice(0, 10)
+      const todayKey = dayKey(lastT)
+      let dayRef = lastC0.o
+      for (let i = data.length - 1; i >= 0; i--) {
+        if (dayKey(data[i].t) !== todayKey) break
+        dayRef = data[i].o
+      }
+      const baseline = baseRef.current ?? dayRef
+      const pctOf = (p: number) => (baseline ? ((p - baseline) / baseline) * 100 : 0)
+
       // price range over real candles + overlays
       let pMin = Infinity, pMax = -Infinity
       for (const c of vis) { if (!c) continue; if (c.l < pMin) pMin = c.l; if (c.h > pMax) pMax = c.h }
+      // ghost 1m candles stretch the range too
+      if (showGhost && ghost.length > 0 && tfMs > 60_000) {
+        const tA = timeOfSlot(0), tB = timeOfSlot(slots - 1) + tfMs
+        const g0 = lowerBoundTime(ghost, tA), g1 = lowerBoundTime(ghost, tB)
+        for (let gi = g0; gi < g1; gi++) { const g = ghost[gi]; if (g.l < pMin) pMin = g.l; if (g.h > pMax) pMax = g.h }
+      }
       const s20 = showSMA20 ? sma(data, 20) : null
       const s50 = showSMA50 ? sma(data, 50) : null
       const e9 = showEMA ? ema(data, 9) : null
@@ -387,15 +490,59 @@ export function CanvasChart({
       const xOf = (i: number) => i * cw + cw / 2
       const yOf = (p: number) => ((pMax - p) / (pMax - pMin)) * priceH
 
-      // grid + price axis
+      // ---- scales config: topmost enabled = right axis, others = left column ----
+      const scalesCfg = scales ?? { price: true, pct: false, inv: false, pts: false }
+      const enabledScales = (['price', 'pct', 'inv', 'pts'] as const).filter(k => scalesCfg[k])
+      const primary = enabledScales[0] ?? 'price'
+      const secondaries = enabledScales.slice(1)
+      const scaleLabel = (p: number) =>
+        primary === 'pct' ? labelPct(pctOf(p))
+        : primary === 'inv' ? labelPct(-pctOf(p))
+        : primary === 'pts' ? labelPts(p - baseline)
+        : (p >= 1000 ? p.toLocaleString('en-IN', { maximumFractionDigits: 1 }) : p.toFixed(2))
+
+      // grid + price axis (labels follow the primary scale)
       ctx.textAlign = 'left'
       ctx.textBaseline = 'middle'
-      for (const p of niceTicks(pMin, pMax, Math.max(mini ? 2 : 3, Math.floor(priceH / (mini ? 90 : 55))))) {
+      const tickList = niceTicks(pMin, pMax, Math.max(mini ? 2 : 3, Math.floor(priceH / (mini ? 90 : 55))))
+      for (const p of tickList) {
         const y = yOf(p)
         ctx.strokeStyle = GRID
         ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke()
         ctx.fillStyle = AXIS_TXT
-        ctx.fillText(p >= 1000 ? p.toLocaleString('en-IN', { maximumFractionDigits: 1 }) : p.toFixed(2), plotW + 6, y)
+        ctx.fillText(scaleLabel(p), plotW + 6, y)
+      }
+
+      // ---- left measurement column (secondary scales, sample-tool style) ----
+      const colW = secondaries.length > 0 ? 10 + Math.max(34, secondaries.length * 40) : 0
+      if (colW > 0 && !mini) {
+        ctx.fillStyle = 'rgba(11,14,17,0.66)'
+        ctx.fillRect(0, 0, colW, priceH)
+        ctx.strokeStyle = 'rgba(255,255,255,0.08)'
+        ctx.beginPath(); ctx.moveTo(colW, 0); ctx.lineTo(colW, priceH); ctx.stroke()
+        ctx.textAlign = 'left'
+        ctx.textBaseline = 'middle'
+        const yBase = yOf(baseline)
+        for (const p of tickList) {
+          const y = yOf(p)
+          if (y < 8 || y > priceH - 8) continue
+          let ly = y - (secondaries.length - 1) * 6
+          for (const s of secondaries) {
+            const v = s === 'pct' ? labelPct(pctOf(p)) : s === 'inv' ? labelPct(-pctOf(p)) : labelPts(p - baseline)
+            ctx.fillStyle = s === 'pct' ? 'rgba(224,166,63,0.85)' : s === 'inv' ? 'rgba(224,106,159,0.85)' : 'rgba(77,208,225,0.85)'
+            ctx.fillText(v, 3, ly)
+            ly += 12
+          }
+        }
+        // baseline marker in the column
+        if (yBase >= 0 && yBase <= priceH) {
+          ctx.fillStyle = 'rgba(224,166,63,0.95)'
+          ctx.fillRect(0, yBase - 7, colW, 14)
+          ctx.fillStyle = '#0b0e11'
+          ctx.font = 'bold 9px ui-monospace, monospace'
+          ctx.fillText('BASE', 3, yBase)
+          ctx.font = '10px ui-monospace, monospace'
+        }
       }
 
       // time axis (labels incl. future space)
@@ -511,6 +658,48 @@ export function CanvasChart({
         ctx.fillStyle = '#4dd0e1'
         ctx.textAlign = 'left'; ctx.textBaseline = 'top'
         ctx.fillText('MACD 12·26·9', 4, top + 1)
+      }
+
+      // ---- 1M ghost overlay (sample-tool #ghostCtl): 1m candles on >1m charts ----
+      if (showGhost && ghost.length > 0 && tfMs > 60_000) {
+        const tA = timeOfSlot(0), tB = timeOfSlot(slots - 1) + tfMs
+        const g0 = lowerBoundTime(ghost, tA), g1 = lowerBoundTime(ghost, tB)
+        if (g1 > g0) {
+          ctx.lineWidth = 1
+          ctx.textAlign = 'left'; ctx.textBaseline = 'top'
+          for (let i = 0; i < slots; i++) {
+            const t0 = timeOfSlot(i)
+            if (t0 < ghost[0].t) continue
+            const t1 = t0 + tfMs
+            const lo = Math.max(g0, lowerBoundTime(ghost, t0))
+            const hi = Math.min(g1, lowerBoundTime(ghost, t1))
+            const k = hi - lo
+            if (k <= 0) continue
+            const bw = Math.max(1.5, Math.min(6, (cw / k) * 0.62))
+            for (let j = 0; j < k; j++) {
+              const g = ghost[lo + j]
+              const x = xOf(i) - cw / 2 + ((j + 0.5) / k) * cw
+              const up = g.c >= g.o
+              const col = up ? UP : DOWN
+              const yH = yOf(g.h), yL = yOf(g.l), yO = yOf(g.o), yC = yOf(g.c)
+              if (Math.max(yH, yL) < -4 || Math.min(yH, yL) > priceH + 4) continue
+              ctx.globalAlpha = ghostStyle === 'fade' ? 0.26 : 0.6
+              ctx.strokeStyle = col
+              ctx.beginPath(); ctx.moveTo(x, yH); ctx.lineTo(x, yL); ctx.stroke()
+              const top = Math.min(yO, yC)
+              const bh = Math.max(1, Math.abs(yC - yO))
+              if (ghostStyle === 'hollow') {
+                ctx.strokeRect(x - bw / 2, top, bw, bh)
+              } else {
+                ctx.fillStyle = col
+                ctx.fillRect(x - bw / 2, top, bw, bh)
+              }
+              ctx.globalAlpha = 1
+            }
+          }
+          ctx.fillStyle = 'rgba(224,166,63,0.9)'
+          ctx.fillText('1M GHOST', 4, 14)
+        }
       }
 
       // series
@@ -632,6 +821,24 @@ export function CanvasChart({
         }
       }
 
+      // scales baseline — dashed amber line, draggable / set-by-click
+      if (!mini && (secondaries.includes('pct') || secondaries.includes('inv') || secondaries.includes('pts') || primary !== 'price')) {
+        const yBase = yOf(baseline)
+        drawMetaRef.current = { yBase, baseline }
+        if (yBase >= 0 && yBase <= priceH) {
+          ctx.setLineDash([5, 4])
+          ctx.strokeStyle = 'rgba(224,166,63,0.75)'
+          ctx.lineWidth = 1
+          ctx.beginPath(); ctx.moveTo(colW, yBase); ctx.lineTo(plotW, yBase); ctx.stroke()
+          ctx.setLineDash([])
+          ctx.lineWidth = 1
+          // zero anchors of the % / pts scales sit on the baseline
+          ctx.fillStyle = 'rgba(224,166,63,0.9)'
+          ctx.textAlign = 'right'; ctx.textBaseline = 'middle'
+          ctx.fillText(primary === 'price' ? '0%' : '0', plotW - 4, yBase - 6)
+        }
+      }
+
       // ---- legend: ALWAYS visible. Hovered candle wins over last. ----
       const drawLegend = (c: Candle, idxTime: number, livePct: number | null) => {
         const up = c.c >= c.o
@@ -729,16 +936,9 @@ export function CanvasChart({
       }
 
       // day change reference for the legend %
-      const dayKey = (t: number) => new Date(t + 5.5 * 3600_000).toISOString().slice(0, 10)
-      const todayKey = dayKey(lastT)
-      let refOpen = lastC.o
-      for (let i = data.length - 1; i >= 0; i--) {
-        if (dayKey(data[i].t) !== todayKey) break
-        refOpen = data[i].o
-      }
       const fc = focus as { c: Candle; t: number } | null
       if (fc) {
-        const pct = refOpen ? ((fc.c.c - refOpen) / refOpen) * 100 : null
+        const pct = dayRef ? ((fc.c.c - dayRef) / dayRef) * 100 : null
         drawLegend(fc.c, fc.t, pct)
       }
     }
@@ -748,7 +948,7 @@ export function CanvasChart({
     const ro = new ResizeObserver(() => forceRender(n => n + 1))
     ro.observe(wrap)
     return () => { cancelAnimationFrame(raf); ro.disconnect() }
-  }, [candles, barCount, chartType, showVolume, showSMA20, showSMA50, showEMA, showVWAP, showBOLL, showRSI, showMACD, markers, symbol, tf, loading, err, mini])
+  }, [candles, ghost, barCount, chartType, showVolume, showSMA20, showSMA50, showEMA, showVWAP, showBOLL, showRSI, showMACD, showGhost, ghostStyle, scales, markers, symbol, tf, loading, err, mini])
 
   // ---- interactions ----
   const onWheel = (e: React.WheelEvent) => {
@@ -769,6 +969,17 @@ export function CanvasChart({
     const x = e.clientX - rect.left
     const y = e.clientY - rect.top
     const win = winRef.current
+    // baseline drag zone (scales % / pts enabled): grab within 5px of the line
+    const sc = scales
+    const baselineEnabled = sc && (sc.pct || sc.inv || sc.pts) && !mini
+    if (baselineEnabled && x < win.plotW && y <= win.priceH) {
+      const meta = drawMetaRef.current
+      if (meta.yBase >= 0 && Math.abs(y - meta.yBase) <= 5) {
+        baseRef.current = meta.baseline // freeze the (possibly default) baseline
+        dragRef.current = { zone: 'base', startX: e.clientX, startY: e.clientY, startOffset: 0, startPriceOff: 0, startPriceZoom: 1, pxPerPx: (win.pMax - win.pMin) / (win.priceH || 1), moved: 0 }
+        return
+      }
+    }
     const zone: DragState['zone'] = x >= win.plotW ? 'price' : y >= win.h - win.axisH ? 'time' : 'plot'
     dragRef.current = {
       zone,
@@ -803,6 +1014,12 @@ export function CanvasChart({
     const d = dragRef.current
     if (!d) return
     d.moved = Math.max(d.moved, Math.abs(e.clientX - d.startX) + Math.abs(e.clientY - d.startY))
+    if (d.zone === 'base') {
+      // drag the baseline — % and pts scales follow ("rearrange")
+      const y = Math.min(win.priceH, Math.max(0, e.clientY - rect.top))
+      baseRef.current = Number((win.pMax - (y / (win.priceH || 1)) * (win.pMax - win.pMin)).toFixed(2))
+      return
+    }
     if (d.zone === 'price') {
       const f = Math.exp((d.startY - e.clientY) / 180)
       priceZoomRef.current = Math.max(0.15, Math.min(10, d.startPriceZoom * f))
@@ -821,14 +1038,22 @@ export function CanvasChart({
   const onMouseUp = (e: React.MouseEvent) => {
     const d = dragRef.current
     dragRef.current = null
-    if (!d || d.moved >= 4 || !onPriceClick) return
+    if (!d || d.moved >= 4) return
     const rect = canvasRef.current!.getBoundingClientRect()
     const x = e.clientX - rect.left
     const y = e.clientY - rect.top
     const win = winRef.current
     if (x < win.plotW && y < win.priceH && win.pMax > win.pMin) {
-      const price = win.pMax - (y / win.priceH) * (win.pMax - win.pMin)
-      onPriceClick(Number(price.toFixed(2)))
+      const price = Number((win.pMax - (y / win.priceH) * (win.pMax - win.pMin)).toFixed(2))
+      // scales baseline pick mode — consumed by the first chart clicked
+      if (pickRef.current) {
+        baseRef.current = price
+        pickRef.current = false
+        setBaseArmed(false)
+        window.dispatchEvent(new Event(BASE_SET_EVENT))
+        return
+      }
+      onPriceClick?.(price)
     }
   }
   const onMouseLeave = () => {
@@ -840,6 +1065,7 @@ export function CanvasChart({
     offsetRef.current = 0
     priceZoomRef.current = 1
     priceOffRef.current = 0
+    baseRef.current = null // baseline returns to the day-open ref
     setBarCount(mini ? 60 : 120)
     setDirty(false)
   }
@@ -862,7 +1088,13 @@ export function CanvasChart({
         {showEMA && <span className="text-[#ffd166]">EMA9/21</span>}
         {showVWAP && <span className="text-[#4dd0e1]">VWAP</span>}
         {showBOLL && <span className="text-muted-foreground">BB</span>}
+        {showGhost && tf !== '1m' && <span className="text-[#e0a63f]">1M GHOST</span>}
       </div>
+      {baseArmed && (
+        <div className="absolute left-1/2 top-1.5 -translate-x-1/2 px-2 py-0.5 rounded bg-[#e0a63f] text-black text-[9px] font-bold pointer-events-none">
+          click the chart to set the scales baseline
+        </div>
+      )}
       {!dirty && !mini && (
         <div className="absolute bottom-6 right-14 text-[9px] text-muted-foreground/60 pointer-events-none flex items-center gap-1">
           <span className="h-1.5 w-1.5 rounded-full bg-[#00c896] pulse-dot" /> LIVE

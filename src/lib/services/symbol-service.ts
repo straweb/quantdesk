@@ -21,7 +21,64 @@ export const INDEX_UNIVERSE: { symbol: string; name: string; base: number }[] = 
   { symbol: 'BANKNIFTY', name: 'Nifty Bank Index', base: 51800 },
   { symbol: 'FINNIFTY', name: 'Nifty Financial Services', base: 23100 },
   { symbol: 'MIDCPNIFTY', name: 'Nifty Midcap Select', base: 12250 },
+  { symbol: 'SENSEX', name: 'BSE Sensex', base: 81000 },
 ]
+
+/** Index constituent weights (%) used by the watchlist Index tab —
+ *  contribution pts ≈ stock change pts × weight/100. Only symbols that
+ *  exist in the EQ_UNIVERSE are listed (the rest of the real index weight
+ *  sits in names we don't simulate). */
+export const INDEX_CONSTITUENTS: Record<string, { symbol: string; weight: number }[]> = {
+  NIFTY: [
+    { symbol: 'RELIANCE', weight: 9.5 }, { symbol: 'HDFCBANK', weight: 8.6 },
+    { symbol: 'ICICIBANK', weight: 7.4 }, { symbol: 'INFY', weight: 5.9 },
+    { symbol: 'TCS', weight: 4.6 }, { symbol: 'ITC', weight: 4.4 },
+    { symbol: 'LT', weight: 4.0 }, { symbol: 'KOTAKBANK', weight: 3.4 },
+    { symbol: 'BHARTIARTL', weight: 3.4 }, { symbol: 'SBIN', weight: 3.1 },
+    { symbol: 'AXISBANK', weight: 2.9 }, { symbol: 'M&M', weight: 2.6 },
+    { symbol: 'MARUTI', weight: 2.4 }, { symbol: 'SUNPHARMA', weight: 2.0 },
+    { symbol: 'TATAMOTORS', weight: 1.9 }, { symbol: 'NTPC', weight: 1.7 },
+    { symbol: 'POWERGRID', weight: 1.6 }, { symbol: 'HINDUNILVR', weight: 1.6 },
+    { symbol: 'ULTRACEMCO', weight: 1.5 }, { symbol: 'BAJFINANCE', weight: 1.5 },
+    { symbol: 'ASIANPAINT', weight: 1.1 }, { symbol: 'TITAN', weight: 1.1 },
+    { symbol: 'WIPRO', weight: 1.0 }, { symbol: 'HCLTECH', weight: 1.0 },
+    { symbol: 'TECHM', weight: 1.0 }, { symbol: 'TATASTEEL', weight: 0.9 },
+    { symbol: 'JSWSTEEL', weight: 0.9 }, { symbol: 'COALINDIA', weight: 0.8 },
+    { symbol: 'ADANIENT', weight: 0.8 }, { symbol: 'ONGC', weight: 0.8 },
+  ],
+  BANKNIFTY: [
+    { symbol: 'HDFCBANK', weight: 27.1 }, { symbol: 'ICICIBANK', weight: 23.3 },
+    { symbol: 'SBIN', weight: 10.2 }, { symbol: 'KOTAKBANK', weight: 9.4 },
+    { symbol: 'AXISBANK', weight: 8.4 }, { symbol: 'INDUSINDBK', weight: 5.0 },
+  ],
+  FINNIFTY: [
+    { symbol: 'HDFCBANK', weight: 24.9 }, { symbol: 'ICICIBANK', weight: 20.4 },
+    { symbol: 'KOTAKBANK', weight: 9.6 }, { symbol: 'AXISBANK', weight: 7.7 },
+    { symbol: 'BAJFINANCE', weight: 7.6 }, { symbol: 'SBIN', weight: 6.2 },
+  ],
+  MIDCPNIFTY: [
+    { symbol: 'TATASTEEL', weight: 6.4 }, { symbol: 'JSWSTEEL', weight: 5.9 },
+    { symbol: 'COALINDIA', weight: 5.1 }, { symbol: 'ASIANPAINT', weight: 4.7 },
+    { symbol: 'TITAN', weight: 4.4 }, { symbol: 'MARUTI', weight: 4.2 },
+  ],
+  SENSEX: [
+    { symbol: 'RELIANCE', weight: 9.9 }, { symbol: 'HDFCBANK', weight: 9.3 },
+    { symbol: 'ICICIBANK', weight: 8.2 }, { symbol: 'INFY', weight: 6.1 },
+    { symbol: 'TCS', weight: 4.5 }, { symbol: 'BHARTIARTL', weight: 4.1 },
+    { symbol: 'ITC', weight: 3.9 }, { symbol: 'LT', weight: 3.6 },
+    { symbol: 'KOTAKBANK', weight: 3.1 }, { symbol: 'SBIN', weight: 3.0 },
+    { symbol: 'AXISBANK', weight: 2.8 }, { symbol: 'M&M', weight: 2.7 },
+    { symbol: 'MARUTI', weight: 2.6 }, { symbol: 'SUNPHARMA', weight: 2.1 },
+    { symbol: 'TATAMOTORS', weight: 1.9 }, { symbol: 'NTPC', weight: 1.8 },
+    { symbol: 'HINDUNILVR', weight: 1.7 }, { symbol: 'POWERGRID', weight: 1.6 },
+    { symbol: 'ULTRACEMCO', weight: 1.6 }, { symbol: 'BAJFINANCE', weight: 1.5 },
+    { symbol: 'ASIANPAINT', weight: 1.1 }, { symbol: 'TITAN', weight: 1.1 },
+    { symbol: 'WIPRO', weight: 1.0 }, { symbol: 'HCLTECH', weight: 1.0 },
+    { symbol: 'TECHM', weight: 1.0 }, { symbol: 'TATASTEEL', weight: 0.9 },
+    { symbol: 'JSWSTEEL', weight: 0.9 }, { symbol: 'COALINDIA', weight: 0.8 },
+    { symbol: 'ADANIENT', weight: 0.8 }, { symbol: 'ONGC', weight: 0.8 },
+  ],
+}
 
 export const EQ_UNIVERSE: { symbol: string; name: string; base: number; lot: number }[] = [
   { symbol: 'RELIANCE', name: 'Reliance Industries Ltd', base: 2870, lot: 250 },

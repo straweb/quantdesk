@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { RefreshCw, Trash2, Download, Radio, ShieldAlert, ShieldCheck } from 'lucide-react'
+import { RefreshCw, Trash2, Download, Radio, ShieldAlert, ShieldCheck, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
@@ -21,7 +21,105 @@ export function AdminView() {
         <CopyTradeManager />
         <MasterContracts />
       </div>
+      <TickRecorder />
       <AuditTrail />
+    </div>
+  )
+}
+
+// ---------------- Tick recorder (session live-feed backup) ----------------
+// Every tick of the configured symbols (default NIFTY + SENSEX) is written
+// to a per-session SQLite DB by the market-feed service. These archives
+// power the future paper-trading / replay engine.
+function TickRecorder() {
+  const qc = useQueryClient()
+  const { data } = useQuery({ queryKey: ['tick-recorder'], queryFn: () => api.tickRecorder(), refetchInterval: 5000 })
+  const [sym, setSym] = useState('')
+  if (!data) return null
+
+  const save = async (body: { enabled?: boolean; symbols?: string[] }) => {
+    try {
+      await api.setTickRecorder(body)
+      await qc.invalidateQueries({ queryKey: ['tick-recorder'] })
+      toast.success('Tick recorder updated')
+    } catch (e) { toast.error(e instanceof Error ? e.message : 'Update failed') }
+  }
+
+  const addSym = () => {
+    const s = sym.trim().toUpperCase()
+    if (!s) return
+    if (data.symbols.includes(s)) { toast.info('Symbol already recorded'); return }
+    setSym('')
+    void save({ symbols: [...data.symbols, s] })
+  }
+
+  return (
+    <div className="rounded-lg border border-border bg-card p-4 space-y-3">
+      <div className="flex items-center gap-2">
+        <Radio className="h-4 w-4 text-primary" />
+        <div className="font-bold text-sm">Tick Data Recorder</div>
+        <span className="text-[10px] text-muted-foreground">session live-feed backup — every tick stored per session for paper trading</span>
+        <div className="flex-1" />
+        <span className={`text-[10px] font-bold ${data.enabled ? 'text-[#00c896]' : 'text-muted-foreground'}`}>{data.enabled ? 'RECORDING' : 'OFF'}</span>
+        <Switch checked={data.enabled} onCheckedChange={v => save({ enabled: v })} />
+      </div>
+
+      <div className="flex flex-wrap items-center gap-1.5">
+        {data.symbols.map(s => (
+          <span key={s} className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-secondary text-[10px] tabular">
+            {s}
+            <button
+              onClick={() => save({ symbols: data.symbols.filter(x => x !== s) })}
+              className="text-muted-foreground hover:text-[#ff4d5e]"
+              title={`Stop recording ${s}`}
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </span>
+        ))}
+        <div className="flex items-center gap-1">
+          <Input
+            value={sym}
+            onChange={e => setSym(e.target.value.toUpperCase())}
+            onKeyDown={e => e.key === 'Enter' && addSym()}
+            placeholder="add symbol…"
+            className="h-6 w-28 text-[10px] bg-secondary/60"
+          />
+          <Button size="sm" variant="secondary" className="h-6 px-2 text-[10px]" onClick={addSym}>Add</Button>
+        </div>
+      </div>
+
+      {data.session && (
+        <div className="text-[10px] text-muted-foreground tabular">
+          current session: <b className="text-foreground">{data.session.file.split('/').pop()}</b> · {data.session.rows.toLocaleString('en-IN')} ticks · started {fmtDateTime(data.session.startedAt)}
+        </div>
+      )}
+
+      {data.sessions.length > 0 && (
+        <div className="rounded border border-border/60 max-h-40 overflow-y-auto">
+          <table className="w-full text-[10px] tabular">
+            <thead className="text-muted-foreground sticky top-0 bg-card">
+              <tr>
+                <th className="text-left font-medium px-2 py-1">Session DB</th>
+                <th className="text-left font-medium px-2 py-1">Size</th>
+                <th className="text-left font-medium px-2 py-1">Last write</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.sessions.map(s => (
+                <tr key={s.file} className={`border-t border-border/40 ${data.session?.file.endsWith(s.file.split('/').pop() ?? '##') ? 'bg-primary/10' : ''}`}>
+                  <td className="px-2 py-1">{s.file.replace('db/ticks/', '')}</td>
+                  <td className="px-2 py-1">{(s.bytes / 1024).toFixed(0)} KB</td>
+                  <td className="px-2 py-1 text-muted-foreground">{fmtDateTime(s.mtime)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <div className="text-[9px] text-muted-foreground leading-snug">
+        A new SQLite DB is created per feed session (and rolls over at the IST day boundary). Replay API: <code>/api/tickrecorder</code> — the stored ticks will feed the paper-trading engine.
+      </div>
     </div>
   )
 }

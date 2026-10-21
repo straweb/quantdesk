@@ -20,8 +20,11 @@ export async function POST(req: NextRequest) {
   if (body.kind === 'INDEX' && !Number.isFinite(Number(body.level))) {
     return NextResponse.json({ error: 'index level is required for INDEX rules' }, { status: 400 })
   }
-  if (body.kind === 'TIME' && !/^\d{2}:\d{2}$/.test(String(body.time ?? ''))) {
-    return NextResponse.json({ error: 'time HH:MM is required for TIME rules' }, { status: 400 })
+  if (body.kind === 'INDEX_RANGE' && (!Number.isFinite(Number(body.lo)) || !Number.isFinite(Number(body.hi)))) {
+    return NextResponse.json({ error: 'range low and high are required for INDEX_RANGE rules' }, { status: 400 })
+  }
+  if (body.kind === 'TIME' && !/^\d{1,2}:\d{2}(:\d{2})?$/.test(String(body.time ?? ''))) {
+    return NextResponse.json({ error: 'time HH:MM or HH:MM:SS is required for TIME rules' }, { status: 400 })
   }
   const rule = await createRule(body)
   return NextResponse.json({ ok: true, rule })

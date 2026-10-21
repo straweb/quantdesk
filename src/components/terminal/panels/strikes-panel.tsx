@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { LineChart, Pencil, Plus, Power, Trash2 } from 'lucide-react'
@@ -60,6 +60,14 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
   })
   const underlyings = undData?.underlyings ?? []
 
+  // accounts: representative usable capital (first order-enabled) + PnL labels
+  const { data: accData } = useQuery({ queryKey: ['accounts'], queryFn: () => api.accounts(), refetchInterval: 4000 })
+  const accounts = accData?.accounts ?? []
+  const repUsable = useMemo(() => {
+    const on = accounts.filter(a => a.isOrderEnabled)
+    return (on[0] ?? accounts[0])?.usableCapital ?? 0
+  }, [accounts])
+
   // auto-bind the workspace's F&O symbol on first open
   useEffect(() => {
     if (!st.underlying && underlyings.some(u => u.underlying === ws.symbol)) {
@@ -83,12 +91,53 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
     return m
   }, [chainData])
 
+  // auto-load the side-ATM pair the first time an F&O workspace binds
+  // (watchlist / search → open workspace lands with ATM CE + PE ready)
+  const autoLoadedRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!underlying || !meta || st.rows.length > 0) return
+    const key = `${ws.id}:${underlying}:${meta.expiry}`
+    if (autoLoadedRef.current === key) return
+    autoLoadedRef.current = key
+    void (async () => {
+      await addStrike(meta.ceAtm, 'CE')
+      await addStrike(meta.peAtm, 'PE')
+    })()
+  }, [underlying, meta, st.rows.length]) // eslint-disable-line react-hooks/exhaustive-deps
+
   const { data: posData } = useQuery({ queryKey: ['positions'], queryFn: () => api.positions(), refetchInterval: 2000 })
   const posBySymbol = useMemo(() => {
-    const m = new Map<string, { netQty: number; avgPrice: number; unrealizedPnl: number }>()
-    for (const p of posData?.bySymbol ?? []) m.set(p.symbol, p)
+    const m = new Map<string, { netQty: number; avgPrice: number; unrealizedPnl: number; realizedPnl: number }>()
+    for (const p of posData?.bySymbol ?? []) {
+      m.set(p.symbol, { netQty: p.netQty, avgPrice: p.avgPrice, unrealizedPnl: p.unrealizedPnl, realizedPnl: (p as unknown as { realizedPnl?: number }).realizedPnl ?? 0 })
+    }
     return m
   }, [posData])
+
+  // ---- PnL rollup: per account / per side / total (unrealized + realized) ----
+  const pnl = useMemo(() => {
+    const positions = posData?.positions ?? []
+    let totalU = 0, totalR = 0
+    const byAccount = new Map<string, { label: string; u: number; r: number }>()
+    for (const p of positions) {
+      totalU += p.unrealizedPnl
+      totalR += p.realizedPnl
+      const a = byAccount.get(p.accountId) ?? { label: p.accountLabel, u: 0, r: 0 }
+      a.u += p.unrealizedPnl
+      a.r += p.realizedPnl
+      byAccount.set(p.accountId, a)
+    }
+    return { totalU, totalR, byAccount }
+  }, [posData])
+  const sidePnl = (type: 'CE' | 'PE') => {
+    let u = 0
+    for (const row of st.rows.filter(r => r.type === type && r.enabled)) {
+      const cell = cellFor(row)
+      const pos = cell ? posBySymbol.get(cell.symbol) : undefined
+      if (pos) u += pos.unrealizedPnl
+    }
+    return u
+  }
 
   const [specific, setSpecific] = useState('')
   const [sign, setSign] = useState<1 | -1>(1)
@@ -403,9 +452,15 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
     const pos = cell?.exists ? posBySymbol.get(cell.symbol) : undefined
     const lots = pos ? Math.abs(pos.netQty) / (meta?.lotSize || 1) : 0
     const pinned = (row.type === 'CE' ? ws.panes?.find(p => p.key === 'ce') : ws.panes?.find(p => p.key === 'pe'))?.strike === row.strike
+    // planned sizing: ₹ amount + the lots it will place (at the live premium)
+    const ltpSafe = cell?.exists && cell.ltp > 0 ? cell.ltp : 0
+    const planAmt = allocMode === 'FIXED' ? (row.allocAmt ?? 0) : (row.allocPct / 100) * repUsable
+    const planLots = ltpSafe > 0 ? Math.floor(planAmt / (ltpSafe * (meta?.lotSize || 1))) : 0
+    const strikePnl = pos ? pos.unrealizedPnl + (pos.realizedPnl ?? 0) : null
     return (
       <div key={row.id} className={expanded === row.id ? 'bg-accent/40' : ''}>
-        <div className="flex items-center gap-1 px-1.5 py-1">
+        {/* line 1 — enable · label · alloc slider · LTP · B/S/X/edit */}
+        <div className="flex items-center gap-1 px-1.5 pt-1 pb-0.5">
           <button
             onClick={() => toggleRow(row)}
             title={row.enabled ? 'Enabled for deploy — click to disable' : 'Disabled — click to enable'}
@@ -415,7 +470,6 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
           >
             {row.enabled && <Power className="h-2.5 w-2.5 text-primary-foreground" />}
           </button>
-          <AllocCell value={allocMode === 'FIXED' ? (row.allocAmt ?? 0) : row.allocPct} mode={allocMode} enabled={row.enabled} onCommit={v => setAlloc(row, v)} />
           <button
             onClick={() => pinToPane(row)}
             title={`Load ${row.strike} ${row.type} into the ${row.type} chart pane`}
@@ -426,6 +480,7 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
               {row.type}{offset == null ? '' : offset === 0 ? ' ·ATM' : offset > 0 ? ` +${offset}` : ` ${offset}`}
             </span>
           </button>
+          <AllocCell value={allocMode === 'FIXED' ? (row.allocAmt ?? 0) : row.allocPct} mode={allocMode} enabled={row.enabled} onCommit={v => setAlloc(row, v)} />
           <div className="flex-1 min-w-0 text-right pr-1">
             <div className={`tabular ${cell && cell.ltp >= cell.prevClose ? 'term-up' : 'term-down'}`}>
               {cell?.exists ? fmtMoney(cell.ltp) : '—'}
@@ -451,6 +506,17 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
               <Pencil className="h-2.5 w-2.5" />
             </button>
           </div>
+        </div>
+        {/* line 2 — amount / lots preview + strike PnL */}
+        <div className="flex items-center justify-between px-1.5 pb-1 pl-6 text-[8px] tabular">
+          <span className="text-muted-foreground" title={allocMode === 'FIXED' ? 'Fixed ₹ allocation per account' : `% × representative usable (${fmtMoney(repUsable, 0)})`}>
+            ≈ {allocMode === 'FIXED' ? `₹${fmtMoney(planAmt, 0)}` : fmtMoney(planAmt, 0)} · {planLots} lot{planLots === 1 ? '' : 's'}
+          </span>
+          {strikePnl != null && lots > 0 && (
+            <span className={strikePnl >= 0 ? 'term-up font-semibold' : 'term-down font-semibold'} title={`unrealized ${fmtMoney(pos!.unrealizedPnl)} + realized ${fmtMoney(pos!.realizedPnl ?? 0)}`}>
+              {strikePnl >= 0 ? '+' : ''}{fmtMoney(strikePnl, 0)}
+            </span>
+          )}
         </div>
 
         {expanded === row.id && (
@@ -497,6 +563,7 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
     const sum = sideSum(type)
     const n = st.rows.filter(r => r.type === type && r.enabled).length
     const tint = type === 'CE' ? 'text-[#00c896]' : 'text-[#ff4d5e]'
+    const sPnl = sidePnl(type)
     return (
       <div className="flex items-center gap-1.5 px-1.5 py-0.5 bg-secondary/40 border-b border-border/60 sticky top-0 z-10">
         <span className={`text-[9px] font-bold ${tint}`}>{type}</span>
@@ -504,6 +571,11 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
           {type === 'CE' && meta ? `ATM ${meta.ceAtm}` : meta ? `ATM ${meta.peAtm}` : ''}
         </span>
         <div className="flex-1" />
+        {sPnl !== 0 && (
+          <span className={`text-[8px] tabular font-semibold ${sPnl >= 0 ? 'term-up' : 'term-down'}`} title={`Open ${type} positions PnL (this side's enabled strikes)`}>
+            {sPnl >= 0 ? '+' : ''}{fmtMoney(sPnl, 0)}
+          </span>
+        )}
         {allocMode === 'FIXED' ? (
           <span className="text-[8px] tabular px-1 rounded bg-secondary/70 text-foreground" title="Enabled strikes fixed ₹ allocation (per account)">
             Σ ₹{sum.toLocaleString('en-IN')}
@@ -618,6 +690,26 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
 
       {/* quick deploy bar */}
       <div className="border-t border-border p-1.5 space-y-1 bg-card/40">
+        {/* session PnL strip — total / net / per account */}
+        <div className="rounded bg-secondary/30 px-1.5 py-1 space-y-0.5" title="Total PnL = open (unrealized) + booked (realized) · Net = unrealized + realized">
+          <div className="flex items-center justify-between text-[9px] tabular">
+            <span className="text-muted-foreground">Open <b className={pnl.totalU >= 0 ? 'term-up' : 'term-down'}>{fmtMoney(pnl.totalU, 0)}</b></span>
+            <span className="text-muted-foreground">Booked <b className={pnl.totalR >= 0 ? 'term-up' : 'term-down'}>{fmtMoney(pnl.totalR, 0)}</b></span>
+            <span className="text-muted-foreground">Net <b className={pnl.totalU + pnl.totalR >= 0 ? 'term-up' : 'term-down'}>{fmtMoney(pnl.totalU + pnl.totalR, 0)}</b></span>
+          </div>
+          {pnl.byAccount.size > 0 && (
+            <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[8px] tabular">
+              {[...pnl.byAccount.values()].map(a => {
+                const net = a.u + a.r
+                return (
+                  <span key={a.label} className="text-muted-foreground">
+                    {a.label} <b className={net >= 0 ? 'term-up' : 'term-down'}>{net >= 0 ? '+' : ''}{fmtMoney(net, 0)}</b>
+                  </span>
+                )
+              })}
+            </div>
+          )}
+        </div>
         <div className="flex items-center justify-between text-[8px] text-muted-foreground px-0.5">
           <span>enabled strikes deploy at their alloc</span>
           <span>

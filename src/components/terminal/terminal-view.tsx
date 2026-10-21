@@ -3,8 +3,9 @@
 import { useMemo, useState } from 'react'
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
 import { useQuery } from '@tanstack/react-query'
-import { ListTree, FileBox, Plus, X, Crosshair, Layers, Bot } from 'lucide-react'
+import { ListTree, FileBox, Plus, X, Crosshair, Layers, Bot, Ghost, Ruler } from 'lucide-react'
 import { toast } from 'sonner'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { CanvasChart } from './chart/canvas-chart'
 import { Watchlist, DepthStack } from './panels/watchlist'
 import { OrderPad } from './panels/order-pad'
@@ -119,6 +120,64 @@ export function TerminalView() {
             >{label}</button>
           ))}
           <span className="w-px h-4 bg-border mx-0.5" />
+          {/* 1M ghost (#ghostCtl) + scales popover */}
+          <button
+            onClick={() => patchWs(ws.id, { showGhost: !ws.showGhost })}
+            title="1M GHOST — overlay 1-minute candles on higher-timeframe charts"
+            className={`flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] text-[#e0a63f] ${ws.showGhost ? 'bg-accent' : 'bg-secondary/60 text-muted-foreground'}`}
+          >
+            <Ghost className="h-3 w-3" /> 1m
+          </button>
+          {ws.showGhost && (
+            <div className="flex rounded overflow-hidden border border-border">
+              {(['hollow', 'fade'] as const).map(s => (
+                <button
+                  key={s}
+                  onClick={() => patchWs(ws.id, { ghostStyle: s })}
+                  className={`px-1 py-0.5 text-[8px] uppercase ${(ws.ghostStyle ?? 'hollow') === s ? 'bg-primary text-primary-foreground' : 'bg-secondary text-muted-foreground'}`}
+                >{s}</button>
+              ))}
+            </div>
+          )}
+          <Popover>
+            <PopoverTrigger asChild>
+              <button
+                title="Axis scales — topmost enabled = right axis, others = left measurement column. % / pts are relative to the baseline (drag it, or set by clicking the chart)."
+                className="flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] text-muted-foreground hover:text-foreground bg-secondary/60"
+              >
+                <Ruler className="h-3 w-3" /> scales
+              </button>
+            </PopoverTrigger>
+            <PopoverContent align="end" className="w-60 p-2.5 text-[10px] space-y-2">
+              <div className="text-[8px] uppercase tracking-wide text-muted-foreground">topmost enabled = right axis · others = left measurement column</div>
+              {([
+                ['price', 'Price'],
+                ['pct', 'Percent'],
+                ['inv', 'Inverted % (sellers)'],
+                ['pts', 'Points'],
+              ] as [keyof NonNullable<typeof ws.scales>, string][]).map(([k, label]) => (
+                <label key={k} className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={!!ws.scales?.[k]}
+                    onChange={e => patchWs(ws.id, { scales: { price: true, pct: false, inv: false, pts: false, ...(ws.scales ?? {}), [k]: e.target.checked } })}
+                    className="accent-[#3b82f6]"
+                  />
+                  <span>{label}</span>
+                </label>
+              ))}
+              <button
+                onClick={() => window.dispatchEvent(new Event('qd-chart-set-base'))}
+                className="w-full mt-1 px-2 py-1 rounded bg-[#e0a63f]/20 border border-[#e0a63f]/40 text-[#e0a63f] font-semibold hover:bg-[#e0a63f]/30"
+              >
+                Set baseline — then click a chart
+              </button>
+              <div className="text-[8px] text-muted-foreground leading-snug">
+                The baseline is the amber dashed line: drag it to rearrange, double-click the chart to reset it to the session open.
+              </div>
+            </PopoverContent>
+          </Popover>
+          <span className="w-px h-4 bg-border mx-0.5" />
           <button
             onClick={() => {
               const { patch, error } = addDepthPanelTo(ws, ws.symbol)
@@ -171,6 +230,9 @@ export function TerminalView() {
                         showBOLL={ws.showBOLL}
                         showRSI={ws.showRSI}
                         showMACD={ws.showMACD}
+                        showGhost={ws.showGhost}
+                        ghostStyle={ws.ghostStyle}
+                        scales={ws.scales}
                         markers={markers}
                         onPriceClick={p => { setLimitPrice(p); setOrderType('LIMIT') }}
                         height="h-full"

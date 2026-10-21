@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Activity, SquareTerminal, Settings2, Bot, LogOut, CircleDot } from 'lucide-react'
+import { Activity, SquareTerminal, Settings2, Bot, LogOut, CircleDot, Trophy } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
@@ -34,6 +34,18 @@ function fmtCompact(n: number | null | undefined): string {
   return `₹${Math.round(n)}`
 }
 
+// broker icon glyph + tint — replaces the full account label on the chip
+// (saves horizontal space; the label lives in the tooltip + popover)
+const BROKER_ICON: Record<string, { glyph: string; cls: string }> = {
+  SIMFEED: { glyph: '⚡', cls: 'bg-slate-500/25 text-slate-300' },
+  DHAN: { glyph: 'D', cls: 'bg-[#3b82f6]/25 text-[#60a5fa]' },
+  SHOONYA: { glyph: 'S', cls: 'bg-[#8b5cf6]/25 text-[#a78bfa]' },
+  ICICI_BREEZE: { glyph: 'iB', cls: 'bg-[#f97316]/25 text-[#fb923c]' },
+}
+function brokerIcon(brokerType: string) {
+  return BROKER_ICON[brokerType] ?? { glyph: brokerType.slice(0, 1) ?? '?', cls: 'bg-secondary text-muted-foreground' }
+}
+
 const qc = new QueryClient({
   defaultOptions: { queries: { retry: 1, staleTime: 1000 } },
 })
@@ -59,6 +71,8 @@ function Shell() {
     // didn't match the client properties") caused by localStorage state
     // diverging from server-rendered defaults.
     void useTerminal.persist.rehydrate()
+    // debug/E2E hook (harmless in prod)
+    ;(window as unknown as { __qdStore?: typeof useTerminal }).__qdStore = useTerminal
     api.me().then(r => setUser(r.user)).catch(() => setUser(null))
     ensureSocket()
     return onFeedStatus(setFeedUp)
@@ -106,6 +120,7 @@ function Shell() {
 
         {/* per-account capital chips — quick enable + capital sizing */}
         <CapitalChips />
+        <SessionStatsChip />
 
         <div className="flex items-center gap-2 text-[10px]">
           <FeedChip up={feedUp} />
@@ -177,16 +192,18 @@ function CapitalChip({ acc }: { acc: AccountRow }) {
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <button
-          className={`flex items-center gap-1 h-6 px-1.5 rounded-full border text-[9px] whitespace-nowrap transition-colors ${
+          className={`flex items-center gap-1 h-6 pl-1 pr-1.5 rounded-full border transition-colors ${
             acc.isOrderEnabled
               ? 'border-[#00c896]/40 bg-up text-foreground hover:bg-up/70'
               : 'border-border bg-secondary/50 text-muted-foreground hover:text-foreground'
           }`}
           title={`${acc.label} (${acc.brokerType}) — usable ${fmtCompact(acc.usableCapital)} · click to manage capital sizing`}
         >
-          <span className={`h-1.5 w-1.5 rounded-full ${acc.isOrderEnabled ? 'bg-[#00c896]' : 'bg-muted-foreground/50'}`} />
-          <span className="font-semibold max-w-[90px] truncate">{acc.label}</span>
-          <span className="tabular font-bold">{fmtCompact(acc.usableCapital)}</span>
+          <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${acc.isOrderEnabled ? 'bg-[#00c896]' : 'bg-muted-foreground/50'}`} />
+          <span className={`h-4 w-4 rounded text-[8px] font-bold grid place-items-center shrink-0 ${brokerIcon(acc.brokerType).cls}`}>
+            {brokerIcon(acc.brokerType).glyph}
+          </span>
+          <span className="tabular font-bold text-[9px]">{fmtCompact(acc.usableCapital)}</span>
         </button>
       </PopoverTrigger>
       <PopoverContent align="end" className="w-64 p-3 space-y-2.5 text-[11px]">
@@ -236,6 +253,104 @@ function CapitalChip({ acc }: { acc: AccountRow }) {
             {busy ? 'Saving…' : 'Apply'}
           </Button>
         </div>
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+// ------------------------------------------------------------
+// Session stats chip — win rate + points captured this session,
+// with a per-account breakdown popover.
+// ------------------------------------------------------------
+interface SessionStats {
+  winRate: number | null
+  pts: number
+  realized: number
+  unrealized: number
+  net: number
+  closes: number
+  wins: number
+  trades: number
+  charges: number
+  perAccount: { accountId: string; label: string; brokerType: string; trades: number; closes: number; wins: number; pts: number; realized: number; unrealized: number; charges: number }[]
+  topSymbols: { symbol: string; pts: number }[]
+}
+
+function SessionStatsChip() {
+  const { data } = useQuery({ queryKey: ['session-stats'], queryFn: () => api.sessionStats(), refetchInterval: 6000 })
+  if (!data) return null
+  const wr = data.winRate
+  const pos = data.pts >= 0
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          className="flex items-center gap-1 px-1.5 py-1 rounded border border-border bg-card text-[10px] hover:bg-secondary/60 transition-colors"
+          title="Session performance — win rate + net points captured (click for per-account breakdown)"
+        >
+          <Trophy className={`h-3 w-3 ${pos ? 'text-[#00c896]' : 'text-[#ff4d5e]'}`} />
+          <span className="tabular font-bold">{wr != null ? `${wr.toFixed(0)}%` : '—'}</span>
+          <span className="text-muted-foreground">WR</span>
+          <span className="w-px h-3 bg-border" />
+          <span className={`tabular font-bold ${pos ? 'term-up' : 'term-down'}`}>
+            {pos ? '+' : ''}{data.pts.toFixed(1)} pts
+          </span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-72 p-3 text-[11px] space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="text-[9px] uppercase tracking-wide text-muted-foreground">current session</span>
+          <span className="text-[9px] text-muted-foreground">{data.trades} trades · {data.closes} closed</span>
+        </div>
+        <div className="grid grid-cols-2 gap-1.5">
+          <div className="rounded bg-secondary/50 p-1.5">
+            <div className="text-[8px] text-muted-foreground">WIN RATE</div>
+            <div className="tabular font-bold text-sm">{wr != null ? `${wr.toFixed(1)}%` : '—'}</div>
+            <div className="text-[8px] text-muted-foreground">{data.wins}W / {data.closes - data.wins}L</div>
+          </div>
+          <div className="rounded bg-secondary/50 p-1.5">
+            <div className="text-[8px] text-muted-foreground">NET POINTS</div>
+            <div className={`tabular font-bold text-sm ${data.pts >= 0 ? 'term-up' : 'term-down'}`}>{data.pts >= 0 ? '+' : ''}{data.pts.toFixed(1)}</div>
+            <div className={`text-[8px] tabular ${data.net >= 0 ? 'term-up' : 'term-down'}`}>net {fmtCompact(data.net)}</div>
+          </div>
+        </div>
+        <div className="flex gap-3 text-[9px] text-muted-foreground tabular">
+          <span>realized <b className={data.realized >= 0 ? 'term-up' : 'term-down'}>{fmtCompact(data.realized)}</b></span>
+          <span>unrealized <b className={data.unrealized >= 0 ? 'term-up' : 'term-down'}>{fmtCompact(data.unrealized)}</b></span>
+          <span>charges {fmtCompact(data.charges)}</span>
+        </div>
+        {data.perAccount.length > 0 && (
+          <div className="border-t border-border/60 pt-1.5 space-y-0.5">
+            <div className="text-[8px] uppercase tracking-wide text-muted-foreground">per account (net = realized + unrealized)</div>
+            {data.perAccount.map(a => {
+              const net = a.realized + a.unrealized
+              return (
+                <div key={a.accountId} className="flex items-center justify-between text-[10px]">
+                  <span className="flex items-center gap-1 min-w-0">
+                    <span className={`h-3 w-3 rounded text-[7px] font-bold grid place-items-center shrink-0 ${brokerIcon(a.brokerType).cls}`}>{brokerIcon(a.brokerType).glyph}</span>
+                    <span className="truncate text-muted-foreground">{a.label}</span>
+                  </span>
+                  <span className="tabular shrink-0">
+                    <span className="text-muted-foreground mr-1.5">{a.closes ? `${((a.wins / a.closes) * 100).toFixed(0)}%` : '—'}</span>
+                    <b className={net >= 0 ? 'term-up' : 'term-down'}>{fmtCompact(net)}</b>
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+        )}
+        {data.topSymbols.length > 0 && (
+          <div className="border-t border-border/60 pt-1.5">
+            <div className="text-[8px] uppercase tracking-wide text-muted-foreground mb-0.5">pts by symbol</div>
+            <div className="flex flex-wrap gap-1">
+              {data.topSymbols.map(s => (
+                <span key={s.symbol} className={`px-1 py-0.5 rounded text-[9px] tabular ${s.pts >= 0 ? 'bg-up text-[#00c896]' : 'bg-down text-[#ff4d5e]'}`}>
+                  {s.symbol} {s.pts >= 0 ? '+' : ''}{s.pts.toFixed(1)}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
       </PopoverContent>
     </Popover>
   )

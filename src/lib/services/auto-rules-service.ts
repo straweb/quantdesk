@@ -2,26 +2,39 @@ import { readFile, writeFile, mkdir } from 'fs/promises'
 import path from 'path'
 import { newId } from '../../../brokers/registry'
 import { fetchQuotes } from '../../../brokers/feed-client'
-import { placeMasterOrder } from './order-router'
+import { placeMasterOrder, cancelAllOrders } from './order-router'
 import { getChainMeta, ensureOptionContracts } from './option-service'
 import { logBroker } from '../../../brokers/database'
 
 // ============================================================
-// Auto-rules engine — index-level and time-based CE/PE entries.
+// Auto-rules engine v2 — the "auto bot".
 //
-// Rule kinds:
-//  · INDEX  — fires when the underlying spot crosses ABOVE/BELOW
-//             a level (edge-triggered, one shot per crossing)
-//  · TIME   — fires at HH:MM IST (5-minute late-grace window),
-//             once per day
+// Trigger kinds:
+//  · TIME        — fires at HH:MM:SS IST (seconds precision; 250ms
+//                  scheduler so the fire lands within the second)
+//  · INDEX       — spot crosses ABOVE/BELOW a level (edge-triggered)
+//  · INDEX_RANGE — spot enters a [lo, hi] band (edge-triggered)
 //
-// Action: BUY/SELL CE/PE at side-ATM + offset steps (hedge-desk
-// ATM convention), auto-sized per account via capitalPct.
-// Rules run server-side (1s scheduler in instrumentation) so they
+// Actions:
+//  · BUY / SELL — option entry (MARKET, or LIMIT when entryPrice set)
+//  · DEPLOY     — buy the full strike list of one side (CE or PE)
+//  · CANCEL     — cancel pending orders on that side's strike list
+//
+// Optional risk legs (any subset, all optional):
+//  · entryPrice — LIMIT entry instead of MARKET
+//  · stopLoss   — reduce-only SL-M armed on the resulting position
+//  · target     — reduce-only LIMIT armed on the resulting position
+//
+// Strike selection: rule.strikes [{strike, type, allocPct}] (user
+// picked), or side-ATM + offset when the list is empty.
+// Rules run server-side (250ms scheduler in instrumentation) so they
 // fire even when no terminal tab is open. Storage: db/auto-rules.json.
 // ============================================================
 
-export type AutoRuleKind = 'INDEX' | 'TIME'
+export type AutoRuleKind = 'INDEX' | 'INDEX_RANGE' | 'TIME'
+export type AutoRuleAction = 'BUY' | 'SELL' | 'DEPLOY' | 'CANCEL'
+
+export interface AutoStrike { strike: number; type: 'CE' | 'PE'; allocPct: number }
 
 export interface AutoRule {
   id: string
@@ -32,13 +45,21 @@ export interface AutoRule {
   // INDEX trigger
   level?: number
   cross?: 'ABOVE' | 'BELOW'
-  // TIME trigger (HH:MM IST)
+  // INDEX_RANGE trigger
+  lo?: number
+  hi?: number
+  // TIME trigger (HH:MM:SS IST)
   time?: string
   // action
-  action: 'BUY' | 'SELL'
+  action: AutoRuleAction
   optType: 'CE' | 'PE'
-  offset: number // steps from side ATM (0 = ATM)
-  allocPct: number // % of each enabled account's usable capital
+  offset: number // steps from side ATM (0 = ATM) — used when strikes list empty
+  strikes?: AutoStrike[] // user-selected strikes / strike set
+  allocPct: number // % of each enabled account's usable capital (default for strikes without own alloc)
+  // optional price legs (any subset)
+  entryPrice?: number
+  stopLoss?: number
+  target?: number
   enabled: boolean
   repeatDaily: boolean
   lastFiredDate?: string
@@ -66,6 +87,11 @@ async function writeRules(rules: AutoRule[]) {
   await writeFile(RULES_FILE, JSON.stringify({ rules, updatedAt: new Date().toISOString() }, null, 2))
 }
 
+function num(v: unknown): number | undefined {
+  const n = Number(v)
+  return Number.isFinite(n) && n !== 0 ? n : undefined
+}
+
 // ---- CRUD (used by the API routes) ----
 
 export async function listRules(): Promise<AutoRule[]> {
@@ -74,19 +100,36 @@ export async function listRules(): Promise<AutoRule[]> {
 
 export async function createRule(input: Partial<AutoRule>): Promise<AutoRule> {
   const rules = await readRules()
+  const timeStr = typeof input.time === 'string' ? input.time.trim() : ''
+  const timeOk = /^\d{1,2}:\d{2}(:\d{2})?$/.test(timeStr)
+    ? timeStr.split(':').map(p => p.padStart(2, '0')).join(':')
+    : undefined
+  const kind: AutoRuleKind = input.kind === 'TIME' ? 'TIME' : input.kind === 'INDEX_RANGE' ? 'INDEX_RANGE' : 'INDEX'
+  const strikes: AutoStrike[] = Array.isArray(input.strikes)
+    ? (input.strikes as AutoStrike[])
+        .filter(s => Number.isFinite(Number(s.strike)) && (s.type === 'CE' || s.type === 'PE'))
+        .slice(0, 24)
+        .map(s => ({ strike: Math.round(Number(s.strike)), type: s.type, allocPct: Math.max(1, Math.min(100, Number(s.allocPct ?? input.allocPct ?? 100))) }))
+    : []
   const rule: AutoRule = {
     id: newId('AR-'),
-    name: String(input.name || 'Untitled rule').slice(0, 60),
+    name: String(input.name || 'Untitled rule').slice(0, 80),
     underlying: String(input.underlying || ''),
     expiry: input.expiry ?? null,
-    kind: input.kind === 'TIME' ? 'TIME' : 'INDEX',
-    level: input.level != null && Number.isFinite(Number(input.level)) ? Number(input.level) : undefined,
+    kind,
+    level: num(input.level),
     cross: input.cross === 'BELOW' ? 'BELOW' : 'ABOVE',
-    time: typeof input.time === 'string' && /^\d{2}:\d{2}$/.test(input.time) ? input.time : undefined,
-    action: input.action === 'SELL' ? 'SELL' : 'BUY',
+    lo: num(input.lo),
+    hi: num(input.hi),
+    time: kind === 'TIME' ? timeOk : undefined,
+    action: input.action === 'SELL' ? 'SELL' : input.action === 'DEPLOY' ? 'DEPLOY' : input.action === 'CANCEL' ? 'CANCEL' : 'BUY',
     optType: input.optType === 'PE' ? 'PE' : 'CE',
     offset: Math.max(-9, Math.min(9, Math.round(Number(input.offset ?? 0)) || 0)),
+    strikes,
     allocPct: Math.max(1, Math.min(100, Number(input.allocPct ?? 100))),
+    entryPrice: num(input.entryPrice),
+    stopLoss: num(input.stopLoss),
+    target: num(input.target),
     enabled: input.enabled !== false,
     repeatDaily: input.repeatDaily !== false,
     fireCount: 0,
@@ -126,13 +169,20 @@ const gEng = globalThis as unknown as {
   __autoRuleBeat?: number
   __autoPrevSpot?: Map<string, number>
   __autoRulesCache?: { rules: AutoRule[]; ts: number }
+  __autoFiredToday?: Map<string, string> // ruleId -> IST date (immediate dedupe;
+  // the 2s rules cache is too stale to dedupe a seconds-precision fire window)
 }
 
-function istNow(): { date: string; minutes: number } {
+function istNow(): { date: string; secondsOfDay: number } {
   const d = new Date(Date.now() + 5.5 * 3600_000)
   const date = d.toISOString().slice(0, 10)
-  const minutes = d.getUTCHours() * 60 + d.getUTCMinutes()
-  return { date, minutes }
+  const secondsOfDay = d.getUTCHours() * 3600 + d.getUTCMinutes() * 60 + d.getUTCSeconds()
+  return { date, secondsOfDay }
+}
+
+function timeToSeconds(t: string): number {
+  const [hh = '0', mm = '0', ss = '0'] = t.split(':')
+  return Number(hh) * 3600 + Number(mm) * 60 + Number(ss || 0)
 }
 
 async function loadRulesCached(): Promise<AutoRule[]> {
@@ -143,31 +193,102 @@ async function loadRulesCached(): Promise<AutoRule[]> {
   return rules
 }
 
-/** Resolve the contract symbol for side-ATM + offset and place the order. */
+/** Resolve the contract symbol for a strike/type and place the order.
+ *  Side/action semantics:
+ *   BUY/SELL/DEPLOY -> entry order (DEPLOY is always BUY of the side list)
+ *   CANCEL          -> pending orders of those symbols are cancelled. */
+async function executeStrikes(rule: AutoRule, list: AutoStrike[]): Promise<{ ok: boolean; message: string }> {
+  if (list.length === 0) return { ok: false, message: 'no strikes to execute' }
+  const meta = await getChainMeta(rule.underlying, rule.expiry)
+  if (!meta) return { ok: false, message: `no option chain for ${rule.underlying}` }
+
+  if (rule.action === 'CANCEL') {
+    const symbols = list.map(s => `${rule.underlying}${meta.expiry.replaceAll('-', '')}${s.strike}${s.type}`)
+    const cancelled = await cancelAllOrders(symbols)
+    return { ok: cancelled > 0, message: `cancelled ${cancelled} pending order(s)` }
+  }
+
+  const side = rule.action === 'SELL' ? 'SELL' : 'BUY'
+  let fills = 0, legs = 0, fails = 0
+  const filledSymbols: { symbol: string; lots: number }[] = []
+  for (const s of list) {
+    try {
+      await ensureOptionContracts(rule.underlying, s.strike, meta.expiry)
+      const symbol = `${rule.underlying}${meta.expiry.replaceAll('-', '')}${s.strike}${s.type}`
+      const res = await placeMasterOrder({
+        symbol,
+        exchange: 'NFO',
+        side,
+        qty: 0,
+        orderType: rule.entryPrice ? 'LIMIT' : 'MARKET',
+        productType: 'MIS',
+        source: 'SYSTEM',
+        capitalPct: s.allocPct ?? rule.allocPct,
+        limitPrice: rule.entryPrice,
+        strategyId: `auto:${rule.id}`,
+      })
+      const f = res.legs.filter(l => l.status === 'FILLED').length
+      fills += f
+      legs += res.legs.length
+      if (f === 0) fails++
+      else filledSymbols.push({ symbol, lots: 9999 })
+    } catch {
+      fails++
+    }
+  }
+
+  // optional risk legs on the resulting positions (per account, capped at held)
+  if (filledSymbols.length > 0 && (rule.stopLoss || rule.target)) {
+    await armRiskLegs(rule, filledSymbols.map(f => f.symbol), meta.lotSize)
+  }
+
+  return {
+    ok: fills > 0,
+    message: `${side} ${list.length} strike(s) — ${fills}/${legs} account fills${fails ? ` · ${fails} strike fails` : ''}${rule.entryPrice ? ` @ LIMIT ${rule.entryPrice}` : ' @ MKT'}`,
+  }
+}
+
+/** Arm reduce-only target (LIMIT) / stopLoss (SL-M) legs on whatever the
+ *  rule's entry just bought/sold — executed by the resting-order monitor. */
+async function armRiskLegs(rule: AutoRule, symbols: string[], _lotSize: number) {
+  for (const symbol of symbols) {
+    try {
+      if (rule.target) {
+        const posSide = rule.action === 'SELL' ? 'BUY' : 'SELL' // close the entry side
+        await placeMasterOrder({
+          symbol, exchange: 'NFO', side: posSide, qty: 9999,
+          orderType: 'LIMIT', productType: 'MIS', source: 'SYSTEM',
+          limitPrice: rule.target, reduceOnly: true, strategyId: 'reduce',
+        })
+      }
+      if (rule.stopLoss) {
+        const posSide = rule.action === 'SELL' ? 'BUY' : 'SELL'
+        await placeMasterOrder({
+          symbol, exchange: 'NFO', side: posSide, qty: 9999,
+          orderType: 'SL-M', productType: 'MIS', source: 'SYSTEM',
+          triggerPrice: rule.stopLoss, reduceOnly: true, strategyId: 'reduce',
+        })
+      }
+    } catch { /* risk legs best-effort */ }
+  }
+}
+
+/** Build the strike list for a rule: user picks win; else side-ATM + offset. */
+async function strikesFor(rule: AutoRule): Promise<AutoStrike[]> {
+  const wanted = rule.action === 'DEPLOY' || rule.action === 'CANCEL'
+    ? (rule.strikes ?? []).filter(s => s.type === rule.optType)
+    : rule.strikes ?? []
+  if (wanted.length > 0) return wanted
+  const meta = await getChainMeta(rule.underlying, rule.expiry)
+  if (!meta) return []
+  const sideAtm = rule.optType === 'CE' ? meta.ceAtm : meta.peAtm
+  return [{ strike: sideAtm + rule.offset * meta.step, type: rule.optType, allocPct: rule.allocPct }]
+}
+
 async function fireRule(rule: AutoRule): Promise<{ ok: boolean; message: string }> {
   try {
-    const meta = await getChainMeta(rule.underlying, rule.expiry)
-    if (!meta) return { ok: false, message: `no option chain for ${rule.underlying}` }
-    const sideAtm = rule.optType === 'CE' ? meta.ceAtm : meta.peAtm
-    const strike = sideAtm + rule.offset * meta.step
-    await ensureOptionContracts(rule.underlying, strike, meta.expiry)
-    const symbol = `${rule.underlying}${meta.expiry.replaceAll('-', '')}${strike}${rule.optType}`
-    const res = await placeMasterOrder({
-      symbol,
-      exchange: 'NFO',
-      side: rule.action,
-      qty: 0,
-      orderType: 'MARKET',
-      productType: 'MIS',
-      source: 'SYSTEM',
-      capitalPct: rule.allocPct,
-      strategyId: `auto:${rule.id}`,
-    })
-    const fills = res.legs.filter(l => l.status === 'FILLED').length
-    return {
-      ok: fills > 0,
-      message: `${rule.action} ${strike} ${rule.optType} (${rule.underlying}) — ${fills}/${res.legs.length} account fills`,
-    }
+    const list = await strikesFor(rule)
+    return await executeStrikes(rule, list)
   } catch (e) {
     return { ok: false, message: e instanceof Error ? e.message : 'fire failed' }
   }
@@ -192,6 +313,20 @@ function fireWithTimeout(rule: AutoRule, ms = 20_000): Promise<{ ok: boolean; me
   ])
 }
 
+/** In-memory once-per-day guard — consulted BEFORE firing so a stale rules
+ *  cache (2s TTL) can't double-fire inside a seconds-precision window. */
+function alreadyFiredToday(rule: AutoRule): boolean {
+  if (!rule.repeatDaily) return rule.lastFiredDate != null || (gEng.__autoFiredToday?.has(rule.id) ?? false)
+  const today = istNow().date
+  if (gEng.__autoFiredToday?.get(rule.id) === today) return true
+  return rule.lastFiredDate === today
+}
+
+function markFiredMemory(ruleId: string): void {
+  if (!gEng.__autoFiredToday) gEng.__autoFiredToday = new Map()
+  gEng.__autoFiredToday.set(ruleId, istNow().date)
+}
+
 async function engineOnce() {
   const busyAt = gEng.__autoRuleBusyAt ?? 0
   if (busyAt && Date.now() - busyAt < 30_000) return // previous tick still inside its grace window
@@ -199,26 +334,26 @@ async function engineOnce() {
   // heartbeat: prove the scheduler is alive (once a minute)
   if (!gEng.__autoRuleBeat || Date.now() - gEng.__autoRuleBeat > 60_000) {
     gEng.__autoRuleBeat = Date.now()
-    console.log('[auto-rules] tick ok')
+    console.log('[auto-rules] tick ok (250ms scheduler)')
   }
   try {
     const rules = await loadRulesCached()
-    const { date, minutes } = istNow()
+    const { date, secondsOfDay } = istNow()
     const active = rules.filter(r => r.enabled && r.underlying)
 
-    // ---- TIME rules ----
+    // ---- TIME rules (HH:MM:SS, fires within 2s of the target second) ----
     for (const rule of active.filter(r => r.kind === 'TIME' && r.time)) {
-      if (rule.repeatDaily && rule.lastFiredDate === date) continue
-      if (!rule.repeatDaily && rule.lastFiredDate) continue
-      const [hh, mm] = rule.time!.split(':').map(Number)
-      const target = hh * 60 + mm
-      if (minutes < target || minutes >= target + 5) continue // 5-min late grace
+      if (alreadyFiredToday(rule)) continue
+      const target = timeToSeconds(rule.time!)
+      if (secondsOfDay < target || secondsOfDay >= target + 2) continue // 2s late grace
+      markFiredMemory(rule.id)
       const out = await fireWithTimeout(rule)
       await markFired(rule, out.ok, out.message)
     }
 
-    // ---- INDEX rules (edge-triggered crossings) ----
-    const indexRules = active.filter(r => r.kind === 'INDEX' && r.level != null)
+    // ---- INDEX + INDEX_RANGE rules (edge-triggered, 250ms sampling) ----
+    const indexRules = active.filter(r =>
+      (r.kind === 'INDEX' && r.level != null) || (r.kind === 'INDEX_RANGE' && r.lo != null && r.hi != null))
     if (indexRules.length > 0) {
       const unds = [...new Set(indexRules.map(r => r.underlying))]
       const quotes = await fetchQuotes(unds)
@@ -229,13 +364,19 @@ async function engineOnce() {
         const prev = gEng.__autoPrevSpot.get(rule.id)
         gEng.__autoPrevSpot.set(rule.id, q.ltp)
         if (prev == null) continue // first observation — arm only
-        const level = rule.level!
-        const crossedUp = prev < level && q.ltp >= level
-        const crossedDown = prev > level && q.ltp <= level
-        const hit = rule.cross === 'BELOW' ? crossedDown : crossedUp
+        if (alreadyFiredToday(rule)) continue
+        let hit = false
+        if (rule.kind === 'INDEX' && rule.level != null) {
+          const crossedUp = prev < rule.level && q.ltp >= rule.level
+          const crossedDown = prev > rule.level && q.ltp <= rule.level
+          hit = rule.cross === 'BELOW' ? crossedDown : crossedUp
+        } else if (rule.kind === 'INDEX_RANGE' && rule.lo != null && rule.hi != null) {
+          const inside = q.ltp >= rule.lo && q.ltp <= rule.hi
+          const wasInside = prev >= rule.lo && prev <= rule.hi
+          hit = inside && !wasInside // entered the band
+        }
         if (!hit) continue
-        if (rule.repeatDaily && rule.lastFiredDate === date) continue
-        if (!rule.repeatDaily && rule.lastFiredDate) continue
+        markFiredMemory(rule.id)
         const out = await fireWithTimeout(rule)
         await markFired(rule, out.ok, out.message)
       }
@@ -249,6 +390,6 @@ async function engineOnce() {
 
 export function ensureAutoRuleEngine() {
   if (gEng.__autoRuleTimer) return
-  gEng.__autoRuleTimer = setInterval(() => { void engineOnce() }, 1000)
-  console.log('[auto-rules] engine started (1s scheduler)')
+  gEng.__autoRuleTimer = setInterval(() => { void engineOnce() }, 250)
+  console.log('[auto-rules] engine started (250ms scheduler — seconds precision)')
 }
