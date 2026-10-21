@@ -10,7 +10,7 @@ import { api, fmtMoney } from '../lib/client-api'
 import type { ChainStrikeRow, OptionQuoteCell } from '../lib/client-api'
 import {
   useTerminal, defaultStrikes, pinStrikePanes,
-  type StrikesCfg, type StrikeRowCfg, type WorkspaceCfg,
+  type StrikesCfg, type StrikeRowCfg, type WorkspaceCfg, type AllocMode,
 } from '../lib/store'
 
 // ============================================================
@@ -18,16 +18,17 @@ import {
 // - Quick-add: [ATM] + [+/-] toggle + [1..5] offset buttons.
 //   Hedge-desk ATM convention: CE ATM = floor(spot/step)*step,
 //   PE ATM = ceil(spot/step)*step (spot 23020 -> CE 23000 / PE 23050).
-// - Per-strike alloc % — CE-side enabled strikes auto-normalize
-//   to 100%, PE-side likewise (independent per side).
-// - Strike rows: enable, alloc%, strike (click -> load into the
+// - Per-strike allocation: % slider (side auto-normalizes to 100%)
+//   or fixed ₹ value — workspace allocMode toggle.
+// - Strike rows: enable, alloc, strike (click -> load into the
 //   CE/PE chart pane), side offset, LTP, day H/L, B/S/X, edit.
-// - Quick deploy: Deploy CE / Deploy PE / Cancel CE / PE Swap.
+// - Quick deploy: Deploy CE/PE · Cancel CE/PE · Swap CE↔PE · Exit All.
 // ============================================================
 
 const OFFSETS = [1, 2, 3, 4, 5] as const
 
-/** Re-scale one side's enabled rows so they always sum to 100%. */
+/** Re-scale one side's enabled rows so they always sum to 100%.
+ *  PCT mode only — FIXED (₹) allocations are absolute, never normalized. */
 function normalizeSide(rows: StrikeRowCfg[], type: 'CE' | 'PE'): StrikeRowCfg[] {
   const side = rows.filter(r => r.type === type && r.enabled)
   if (side.length === 0) return rows
@@ -95,13 +96,14 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
   const [expanded, setExpanded] = useState<string | null>(null)
 
   const setStrikes = (next: Partial<StrikesCfg>) => patchWs(ws.id, { strikes: { ...st, ...next } })
+  const allocMode: AllocMode = ws.allocMode ?? 'PCT'
 
-  /** Replace rows + re-normalize the affected side. Callers build rows from the
+  /** Replace rows + re-normalize the affected side (PCT mode only). Callers build rows from the
    *  LATEST persisted state (rapid consecutive toggles must not clobber each
    *  other's change); this re-reads the cfg for the remaining fields. */
   const commitRows = (nextRows: StrikeRowCfg[], type: 'CE' | 'PE') => {
     const cur = useTerminal.getState().workspaces.find(w => w.id === ws.id)?.strikes ?? st
-    patchWs(ws.id, { strikes: { ...cur, rows: normalizeSide(nextRows, type) } })
+    patchWs(ws.id, { strikes: { ...cur, rows: allocMode === 'PCT' ? normalizeSide(nextRows, type) : nextRows } })
   }
 
   const addStrike = async (strike: number, type: 'CE' | 'PE') => {
@@ -158,9 +160,15 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
   }
 
   const setAlloc = (row: StrikeRowCfg, v: number) => {
-    const clamped = Math.max(0, Math.min(100, Number.isFinite(v) ? v : 0))
     const cur = useTerminal.getState().workspaces.find(w => w.id === ws.id)?.strikes ?? st
-    const rows = cur.rows.map(r => (r.id === row.id ? { ...r, allocPct: clamped } : r))
+    let rows: StrikeRowCfg[]
+    if (allocMode === 'FIXED') {
+      const amt = Math.max(0, Number.isFinite(v) ? v : 0)
+      rows = cur.rows.map(r => (r.id === row.id ? { ...r, allocAmt: amt } : r))
+    } else {
+      const clamped = Math.max(0, Math.min(100, Number.isFinite(v) ? v : 0))
+      rows = cur.rows.map(r => (r.id === row.id ? { ...r, allocPct: clamped } : r))
+    }
     commitRows(rows, row.type)
   }
 
@@ -185,18 +193,30 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
     return row.type === 'CE' ? c.ce : c.pe
   }
 
-  const deploy = async (type: 'CE' | 'PE') => {
-    const rows = rowsFor(type) // ONLY enabled strikes participate
-    if (rows.length === 0) { toast.error(`No enabled ${type} strikes`); return }
-    setBusy(true)
+  /** Sizing params for one strike row in the current alloc mode. */
+  const sizingFor = (row: StrikeRowCfg): Record<string, unknown> =>
+    allocMode === 'FIXED'
+      ? { tag: `abs:${Math.max(0, row.allocAmt ?? 0)}` } // router: absolute ₹ per account
+      : { capitalPct: row.allocPct }
+
+  /** Deploy every enabled strike of one side — the shared core used by
+   *  Deploy buttons AND the swap buttons (after the other side is closed). */
+  const deployRows = async (type: 'CE' | 'PE', rows: StrikeRowCfg[]) => {
     let strikesOk = 0, strikesFail = 0, fills = 0, skipped = 0
+    // fresh quotes so a swap doesn't deploy off stale LTP cells
+    const allStrikes = [...new Set(rows.map(r => r.strike))]
+    const cd = allStrikes.length ? await api.optionChain(underlying!, st.expiry, allStrikes) : null
+    const fresh = new Map<number, ChainStrikeRow>((cd?.rows ?? []).map(r => [r.strike, r]))
     for (const row of rows) {
-      const cell = cellFor(row)
-      if (!cell?.exists || !(row.allocPct > 0)) { strikesFail++; continue }
+      const c = fresh.get(row.strike)
+      const cell = c ? (row.type === 'CE' ? c.ce : c.pe) : cellFor(row)
+      const alloc = allocMode === 'FIXED' ? (row.allocAmt ?? 0) : row.allocPct
+      if (!cell?.exists || !(alloc > 0)) { strikesFail++; continue }
       try {
         const res = await api.placeOrder({
           symbol: cell.symbol, exchange: 'NFO', side: 'BUY', qty: 0,
-          orderType: 'MARKET', productType: 'MIS', source: 'MANUAL', capitalPct: row.allocPct,
+          orderType: 'MARKET', productType: 'MIS', source: 'MANUAL',
+          ...sizingFor(row),
         })
         const f = res.legs.filter(l => l.status === 'FILLED').length
         fills += f
@@ -204,10 +224,18 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
         f > 0 ? strikesOk++ : strikesFail++
       } catch { strikesFail++ }
     }
+    return { strikesOk, strikesFail, fills, skipped, total: rows.length }
+  }
+
+  const deploy = async (type: 'CE' | 'PE') => {
+    const rows = rowsFor(type) // ONLY enabled strikes participate
+    if (rows.length === 0) { toast.error(`No enabled ${type} strikes`); return }
+    setBusy(true)
+    const r = await deployRows(type, rows)
     setBusy(false)
-    strikesOk > 0
-      ? toast.success(`Deploy ${type}: ${strikesOk}/${rows.length} enabled strikes · ${fills} account fills${skipped ? ` · ${skipped} legs skipped` : ''}`)
-      : toast.error(`Deploy ${type} failed — no fills (${strikesFail} strikes skipped)`)
+    r.strikesOk > 0
+      ? toast.success(`Deploy ${type}: ${r.strikesOk}/${rows.length} enabled strikes · ${r.fills} account fills${r.skipped ? ` · ${r.skipped} legs skipped` : ''}`)
+      : toast.error(`Deploy ${type} failed — no fills (${r.strikesFail} strikes skipped)`)
   }
 
   const cancelType = async (type: 'CE' | 'PE') => {
@@ -219,61 +247,60 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
     } catch (e) { toast.error(e instanceof Error ? e.message : 'Cancel failed') }
   }
 
-  const peSwap = async () => {
-    const ceRows = rowsFor('CE')
-    const ceSyms = ceRows.map(r => cellFor(r)?.symbol).filter((s): s is string => !!s)
+  const peSwap = async () => swapSide('PE')
+
+  /** SWAP: close every enabled position of side `from`, then deploy the
+   *  opposite side (CE↔PE for FNO; for equities the order pad B/S covers
+   *  buy↔sell). Auto-adds an ATM strike of the target side if none listed. */
+  const swapSide = async (from: 'CE' | 'PE') => {
+    const to = from === 'CE' ? 'PE' : 'CE'
+    const fromSyms = rowsFor(from).map(r => cellFor(r)?.symbol).filter((s): s is string => !!s)
     setBusy(true)
     try {
-      if (ceSyms.length > 0) {
-        const so = await api.squareOffAll(false, ceSyms)
-        toast.success(`CE squared off — ${so.filledLegs} legs`)
+      let closedLegs = 0
+      if (fromSyms.length > 0) {
+        const so = await api.squareOffAll(false, fromSyms)
+        closedLegs = so.filledLegs
       }
-      // flip on: deploy PE on enabled PE rows (auto-add PE ATM if none listed)
-      let peRows = rowsFor('PE')
-      if (peRows.length === 0) {
-        if (meta) {
-          await addStrike(meta.peAtm, 'PE')
-          await new Promise(r => setTimeout(r, 500))
-          const ws2 = useTerminal.getState().workspaces.find(w => w.id === ws.id)
-          peRows = (ws2?.strikes?.rows ?? []).filter(r => r.type === 'PE' && r.enabled)
-        }
+      // deploy target side on enabled rows (auto-add side ATM if none listed)
+      let toRows = rowsFor(to)
+      if (toRows.length === 0 && meta) {
+        await addStrike(to === 'CE' ? meta.ceAtm : meta.peAtm, to)
+        await new Promise(r => setTimeout(r, 500))
+        const ws2 = useTerminal.getState().workspaces.find(w => w.id === ws.id)
+        toRows = (ws2?.strikes?.rows ?? []).filter(r => r.type === to && r.enabled)
       }
-      let strikesOk = 0, strikesFail = 0, fills = 0, skipped = 0
-      const allStrikes = [...new Set(st.rows.map(r => r.strike))]
-      const cd = await api.optionChain(underlying!, st.expiry, allStrikes)
-      const fresh = new Map<number, ChainStrikeRow>(cd.rows.map(r => [r.strike, r]))
-      for (const row of peRows) {
-        const c = fresh.get(row.strike)
-        const cell = row.type === 'PE' ? c?.pe : c?.ce
-        if (!cell?.exists) { strikesFail++; continue }
-        try {
-          const res = await api.placeOrder({
-            symbol: cell.symbol, exchange: 'NFO', side: 'BUY', qty: 0,
-            orderType: 'MARKET', productType: 'MIS', source: 'MANUAL', capitalPct: row.allocPct,
-          })
-          const f = res.legs.filter(l => l.status === 'FILLED').length
-          fills += f
-          skipped += res.legs.length - f
-          f > 0 ? strikesOk++ : strikesFail++
-        } catch { strikesFail++ }
-      }
-      strikesOk > 0
-        ? toast.success(`PE Swap: CE flat · ${strikesOk}/${peRows.length} enabled PE strikes · ${fills} fills${skipped ? ` · ${skipped} skipped` : ''}`)
-        : toast.error(`PE Swap failed — no PE fills`)
+      const r = await deployRows(to, toRows)
+      r.strikesOk > 0
+        ? toast.success(`Swap ${from}→${to}: ${from} flat (${closedLegs} legs) · ${r.strikesOk}/${toRows.length} ${to} strikes · ${r.fills} fills${r.skipped ? ` · ${r.skipped} skipped` : ''}`)
+        : toast.error(`Swap ${from}→${to} — ${from} flat but no ${to} fills`)
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'PE Swap failed')
+      toast.error(e instanceof Error ? e.message : `Swap ${from}→${to} failed`)
     } finally { setBusy(false) }
   }
 
+  /** EXIT ALL — square off every open position across all symbols/accounts. */
+  const exitAll = async () => {
+    setBusy(true)
+    try {
+      const so = await api.squareOffAll(false)
+      so.orders > 0
+        ? toast.success(`Exit All — ${so.orders} orders · ${so.filledLegs} legs closed`)
+        : toast.info('No open positions')
+    } catch (e) { toast.error(e instanceof Error ? e.message : 'Exit All failed') }
+    finally { setBusy(false) }
+  }
+
   /** B = plain market BUY of THIS strike; S = plain market SELL of THIS strike.
-   *  Sizing = the row's alloc % of each enabled account's usable capital. */
+   *  Sizing = the row's alloc (PCT % of usable capital, or fixed ₹) per account. */
   const rowOrder = async (row: StrikeRowCfg, side: 'BUY' | 'SELL') => {
     const cell = cellFor(row)
     if (!cell?.exists) { toast.error('Quote unavailable'); return }
     try {
       const res = await api.placeOrder({
         symbol: cell.symbol, exchange: 'NFO', side, qty: 0,
-        orderType: 'MARKET', productType: 'MIS', source: 'MANUAL', capitalPct: row.allocPct,
+        orderType: 'MARKET', productType: 'MIS', source: 'MANUAL',
+        ...sizingFor(row),
       })
       res.status === 'FAILED'
         ? toast.error(`${side} failed — ${res.message}`)
@@ -358,8 +385,11 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
 
   const ceRows = useMemo(() => st.rows.filter(r => r.type === 'CE').sort((a, b) => a.strike - b.strike), [st.rows])
   const peRows = useMemo(() => st.rows.filter(r => r.type === 'PE').sort((a, b) => a.strike - b.strike), [st.rows])
-  const sideSum = (type: 'CE' | 'PE') =>
-    Math.round(st.rows.filter(r => r.type === type && r.enabled).reduce((s, r) => s + r.allocPct, 0) * 10) / 10
+  const sideSum = (type: 'CE' | 'PE') => {
+    const on = st.rows.filter(r => r.type === type && r.enabled)
+    if (allocMode === 'FIXED') return on.reduce((s, r) => s + (r.allocAmt ?? 0), 0)
+    return Math.round(on.reduce((s, r) => s + r.allocPct, 0) * 10) / 10
+  }
 
   const offsetFor = (row: StrikeRowCfg): number | null => {
     const chainRow = rowByStrike.get(row.strike)
@@ -385,7 +415,7 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
           >
             {row.enabled && <Power className="h-2.5 w-2.5 text-primary-foreground" />}
           </button>
-          <AllocInput value={row.allocPct} enabled={row.enabled} onCommit={v => setAlloc(row, v)} />
+          <AllocCell value={allocMode === 'FIXED' ? (row.allocAmt ?? 0) : row.allocPct} mode={allocMode} enabled={row.enabled} onCommit={v => setAlloc(row, v)} />
           <button
             onClick={() => pinToPane(row)}
             title={`Load ${row.strike} ${row.type} into the ${row.type} chart pane`}
@@ -410,8 +440,8 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
             </span>
           )}
           <div className="flex gap-0.5 shrink-0">
-            <button onClick={() => rowOrder(row, 'BUY')} title={`Market BUY ${row.strike} ${row.type} (${row.allocPct}% per account)`} className="px-1 py-0.5 rounded bg-up text-[#00c896] hover:brightness-125 text-[9px] font-bold">B</button>
-            <button onClick={() => rowOrder(row, 'SELL')} title={`Market SELL ${row.strike} ${row.type} (${row.allocPct}% per account)`} className="px-1 py-0.5 rounded bg-down text-[#ff4d5e] hover:brightness-125 text-[9px] font-bold">S</button>
+            <button onClick={() => rowOrder(row, 'BUY')} title={`Market BUY ${row.strike} ${row.type} (${allocMode === 'FIXED' ? `₹${row.allocAmt ?? 0}` : `${row.allocPct}%`} per account)`} className="px-1 py-0.5 rounded bg-up text-[#00c896] hover:brightness-125 text-[9px] font-bold">B</button>
+            <button onClick={() => rowOrder(row, 'SELL')} title={`Market SELL ${row.strike} ${row.type} (${allocMode === 'FIXED' ? `₹${row.allocAmt ?? 0}` : `${row.allocPct}%`} per account)`} className="px-1 py-0.5 rounded bg-down text-[#ff4d5e] hover:brightness-125 text-[9px] font-bold">S</button>
             <button onClick={() => rowExit(row)} title="Exit this strike's position" className="px-1 py-0.5 rounded bg-secondary text-muted-foreground hover:text-foreground text-[9px] font-bold">X</button>
             <button
               onClick={() => setExpanded(expanded === row.id ? null : row.id)}
@@ -474,9 +504,15 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
           {type === 'CE' && meta ? `ATM ${meta.ceAtm}` : meta ? `ATM ${meta.peAtm}` : ''}
         </span>
         <div className="flex-1" />
-        <span className={`text-[8px] tabular px-1 rounded ${sum === 100 ? 'bg-up/60 text-[#00c896]' : 'bg-amber-500/15 text-amber-400'}`} title="Enabled strikes alloc sum (auto-normalized to 100%)">
-          Σ {sum}%
-        </span>
+        {allocMode === 'FIXED' ? (
+          <span className="text-[8px] tabular px-1 rounded bg-secondary/70 text-foreground" title="Enabled strikes fixed ₹ allocation (per account)">
+            Σ ₹{sum.toLocaleString('en-IN')}
+          </span>
+        ) : (
+          <span className={`text-[8px] tabular px-1 rounded ${sum === 100 ? 'bg-up/60 text-[#00c896]' : 'bg-amber-500/15 text-amber-400'}`} title="Enabled strikes alloc sum (auto-normalized to 100%)">
+            Σ {sum}%
+          </span>
+        )}
         <span className="text-[8px] text-muted-foreground">{n} on</span>
       </div>
     )
@@ -583,8 +619,24 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
       {/* quick deploy bar */}
       <div className="border-t border-border p-1.5 space-y-1 bg-card/40">
         <div className="flex items-center justify-between text-[8px] text-muted-foreground px-0.5">
-          <span>enabled strikes deploy at their alloc %</span>
-          <span><b className="text-[#00c896]">CE Σ{sideSum('CE')}%</b> · <b className="text-[#ff4d5e]">PE Σ{sideSum('PE')}%</b></span>
+          <span>enabled strikes deploy at their alloc</span>
+          <span>
+            {allocMode === 'FIXED' ? (
+              <><b className="text-[#00c896]">CE ₹{sideSum('CE').toLocaleString('en-IN')}</b> · <b className="text-[#ff4d5e]">PE ₹{sideSum('PE').toLocaleString('en-IN')}</b></>
+            ) : (
+              <><b className="text-[#00c896]">CE Σ{sideSum('CE')}%</b> · <b className="text-[#ff4d5e]">PE Σ{sideSum('PE')}%</b></>
+            )}
+          </span>
+          <div className="flex rounded overflow-hidden border border-border">
+            {(['PCT', 'FIXED'] as AllocMode[]).map(m => (
+              <button
+                key={m}
+                onClick={() => patchWs(ws.id, { allocMode: m })}
+                title={m === 'PCT' ? '% of each account\'s usable capital (auto-normalized)' : 'Fixed ₹ per strike per account'}
+                className={`px-1.5 py-0.5 text-[8px] font-bold ${allocMode === m ? 'bg-primary text-primary-foreground' : 'bg-secondary text-muted-foreground hover:text-foreground'}`}
+              >{m === 'PCT' ? '%' : '₹'}</button>
+            ))}
+          </div>
         </div>
         <div className="grid grid-cols-2 gap-1">
           <Button size="sm" className="h-7 text-[10px] bg-up text-[#00c896] hover:bg-[#00c896] hover:text-black" disabled={busy || !underlying} onClick={() => deploy('CE')}>
@@ -596,8 +648,17 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
           <Button size="sm" variant="secondary" className="h-7 text-[10px]" disabled={busy || !underlying} onClick={() => cancelType('CE')}>
             Cancel CE
           </Button>
-          <Button size="sm" variant="secondary" className="h-7 text-[10px]" disabled={busy || !underlying} onClick={peSwap}>
-            PE Swap
+          <Button size="sm" variant="secondary" className="h-7 text-[10px]" disabled={busy || !underlying} onClick={() => cancelType('PE')}>
+            Cancel PE
+          </Button>
+          <Button size="sm" variant="secondary" className="h-7 text-[10px]" disabled={busy || !underlying} onClick={() => swapSide('CE')} title="Close all CE positions, then deploy PE on the enabled PE strikes">
+            Swap CE→PE
+          </Button>
+          <Button size="sm" variant="secondary" className="h-7 text-[10px]" disabled={busy || !underlying} onClick={() => swapSide('PE')} title="Close all PE positions, then deploy CE on the enabled CE strikes">
+            Swap PE→CE
+          </Button>
+          <Button size="sm" variant="destructive" className="h-7 text-[10px] col-span-2" disabled={busy} onClick={exitAll} title="Square off every open position across all symbols and accounts">
+            Exit All
           </Button>
         </div>
       </div>
@@ -606,24 +667,58 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
 }
 
 // ------------------------------------------------------------
-// Per-strike alloc % — local edit state, commits on blur/Enter
-// (re-normalizing on every keystroke would fight the typist)
+// Per-strike allocation cell — % (with inline slider) or fixed ₹.
+// Local edit state, commits on blur/Enter/release (re-normalizing
+// on every keystroke would fight the typist).
 // ------------------------------------------------------------
-function AllocInput({ value, enabled, onCommit }: { value: number; enabled: boolean; onCommit: (v: number) => void }) {
-  const [txt, setTxt] = useState(String(value))
+function AllocCell({ value, mode, enabled, onCommit }: {
+  value: number
+  mode: AllocMode
+  enabled: boolean
+  onCommit: (v: number) => void
+}) {
+  const [txt, setTxt] = useState(mode === 'FIXED' ? String(Math.round(value)) : String(value))
   const [focus, setFocus] = useState(false)
-  useEffect(() => { if (!focus) setTxt(String(Math.round(value * 10) / 10)) }, [value, focus])
+  useEffect(() => { if (!focus) setTxt(mode === 'FIXED' ? String(Math.round(value)) : String(Math.round(value * 10) / 10)) }, [value, focus, mode])
+
+  if (mode === 'FIXED') {
+    return (
+      <input
+        value={txt}
+        disabled={!enabled}
+        onChange={e => setTxt(e.target.value.replace(/[^0-9]/g, ''))}
+        onFocus={() => setFocus(true)}
+        onBlur={() => { setFocus(false); onCommit(Number(txt)) }}
+        onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+        title="Fixed ₹ allocation per account for this strike"
+        className="h-4.5 w-11 shrink-0 rounded bg-secondary/60 text-center text-[9px] tabular outline-none focus:ring-1 ring-primary/60 disabled:opacity-40"
+      />
+    )
+  }
   return (
-    <input
-      value={txt}
-      disabled={!enabled}
-      onChange={e => setTxt(e.target.value.replace(/[^0-9.]/g, ''))}
-      onFocus={() => setFocus(true)}
-      onBlur={() => { setFocus(false); onCommit(Number(txt)) }}
-      onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
-      title="Alloc % of usable capital — side auto-normalizes to 100%"
-      className="h-4.5 w-9 shrink-0 rounded bg-secondary/60 text-center text-[9px] tabular outline-none focus:ring-1 ring-primary/60 disabled:opacity-40"
-    />
+    <span className="flex items-center gap-0.5 shrink-0" title="Alloc % of usable capital — drag the slider or type; side auto-normalizes to 100%">
+      <input
+        type="range"
+        min={0}
+        max={100}
+        step={1}
+        value={Math.max(0, Math.min(100, Number(txt) || 0))}
+        disabled={!enabled}
+        onChange={e => setTxt(e.target.value)}
+        onMouseUp={e => onCommit(Number((e.target as HTMLInputElement).value))}
+        onTouchEnd={e => onCommit(Number((e.target as HTMLInputElement).value))}
+        className="h-1 w-8 accent-[#3b82f6] cursor-pointer disabled:opacity-40"
+      />
+      <input
+        value={txt}
+        disabled={!enabled}
+        onChange={e => setTxt(e.target.value.replace(/[^0-9.]/g, ''))}
+        onFocus={() => setFocus(true)}
+        onBlur={() => { setFocus(false); onCommit(Number(txt)) }}
+        onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+        className="h-4.5 w-9 shrink-0 rounded bg-secondary/60 text-center text-[9px] tabular outline-none focus:ring-1 ring-primary/60 disabled:opacity-40"
+      />
+    </span>
   )
 }
 

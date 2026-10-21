@@ -3,14 +3,16 @@
 import { useMemo, useState } from 'react'
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
 import { useQuery } from '@tanstack/react-query'
-import { ListTree, FileBox, Plus, X, Crosshair } from 'lucide-react'
+import { ListTree, FileBox, Plus, X, Crosshair, Layers, Bot } from 'lucide-react'
+import { toast } from 'sonner'
 import { CanvasChart } from './chart/canvas-chart'
 import { Watchlist, DepthStack } from './panels/watchlist'
 import { OrderPad } from './panels/order-pad'
 import { BottomPanel } from './panels/bottom-panel'
 import { StrikesPanel } from './panels/strikes-panel'
+import { AutoPanel } from './panels/auto-panel'
 import { WorkspacePanes } from './panels/option-panes'
-import { useTerminal, wsLayout, type WsLayout } from './lib/store'
+import { useTerminal, wsLayout, addDepthPanelTo, type WsLayout, type WorkspaceCfgFlags } from './lib/store'
 import { api } from './lib/client-api'
 import { TIMEFRAMES } from '@/lib/types'
 import type { Timeframe } from '@/lib/types'
@@ -91,17 +93,47 @@ export function TerminalView() {
             >{label}</button>
           ))}
           <span className="w-px h-4 bg-border mx-0.5" />
+          {([
+            ['showSMA20', 'MA20', 'text-[#4dd0e1]'],
+            ['showSMA50', 'MA50', 'text-[#b48ce8]'],
+            ['showEMA', 'EMA', 'text-[#ffd166]'],
+            ['showVWAP', 'VWAP', 'text-[#4dd0e1]'],
+            ['showBOLL', 'BB', 'text-muted-foreground'],
+          ] as [keyof WorkspaceCfgFlags, string, string][]).map(([key, label, tint]) => (
+            <button
+              key={label}
+              onClick={() => patchWs(ws.id, { [key]: !ws[key] })}
+              title={`${label} overlay`}
+              className={`px-1.5 py-0.5 rounded text-[10px] ${tint} ${ws[key] ? 'bg-accent' : 'bg-secondary/60 text-muted-foreground'}`}
+            >{label}</button>
+          ))}
+          {([
+            ['showRSI', 'RSI'],
+            ['showMACD', 'MACD'],
+          ] as [keyof WorkspaceCfgFlags, string][]).map(([key, label]) => (
+            <button
+              key={label}
+              onClick={() => patchWs(ws.id, { [key]: !ws[key] })}
+              title={`${label} sub-panel`}
+              className={`px-1.5 py-0.5 rounded text-[10px] text-[#f5a623] ${ws[key] ? 'bg-accent' : 'bg-secondary/60 text-muted-foreground'}`}
+            >{label}</button>
+          ))}
+          <span className="w-px h-4 bg-border mx-0.5" />
           <button
-            onClick={() => patchWs(ws.id, { showSMA20: !ws.showSMA20 })}
-            className={`px-1.5 py-0.5 rounded text-[#4dd0e1] ${ws.showSMA20 ? 'bg-accent' : 'bg-secondary/60'}`}
-          >MA20</button>
-          <button
-            onClick={() => patchWs(ws.id, { showSMA50: !ws.showSMA50 })}
-            className={`px-1.5 py-0.5 rounded text-[#b48ce8] ${ws.showSMA50 ? 'bg-accent' : 'bg-secondary/60'}`}
-          >MA50</button>
+            onClick={() => {
+              const { patch, error } = addDepthPanelTo(ws, ws.symbol)
+              if (error) { toast.info(error); return }
+              patchWs(ws.id, patch)
+              toast.success(`Depth panel added — ${ws.symbol}`)
+            }}
+            title="Add this chart's market depth to the left depth stack"
+            className="px-1.5 py-0.5 rounded bg-secondary text-muted-foreground hover:text-foreground flex items-center gap-1"
+          >
+            <Layers className="h-3 w-3" /> depth
+          </button>
           <span
             className="px-1.5 py-0.5 rounded bg-secondary text-muted-foreground flex items-center gap-1"
-            title="Wheel: time zoom · Wheel on price axis / Shift+wheel: price zoom · Drag: free pan (all directions) · Drag price axis: squeeze/stretch · Double-click: reset · Click price: set limit"
+            title="Wheel: time zoom · Wheel on price axis / Shift+wheel: price zoom · Drag: free pan (all directions, 50 bars future space) · Drag price axis: squeeze/stretch · Double-click / ▶LIVE: reset to live · Hover: synced crosshair across all charts"
           >
             <Crosshair className="h-3 w-3" /> zoom/pan
           </span>
@@ -134,6 +166,11 @@ export function TerminalView() {
                         showVolume={ws.showVolume}
                         showSMA20={ws.showSMA20}
                         showSMA50={ws.showSMA50}
+                        showEMA={ws.showEMA}
+                        showVWAP={ws.showVWAP}
+                        showBOLL={ws.showBOLL}
+                        showRSI={ws.showRSI}
+                        showMACD={ws.showMACD}
                         markers={markers}
                         onPriceClick={p => { setLimitPrice(p); setOrderType('LIMIT') }}
                         height="h-full"
@@ -199,9 +236,10 @@ function Handle({ vertical = false }: { vertical?: boolean }) {
   )
 }
 
-// Right dock: Strikes panel | Order pad tabs + global quick buttons
+// Right dock: Strikes panel | Auto rules | Order pad
+type RightTab = 'strikes' | 'auto' | 'order'
 function RightDock({ ws }: { ws: NonNullable<ReturnType<typeof useTerminal.getState>['workspaces'][number]> }) {
-  const [tab, setTab] = useState<'strikes' | 'order'>('strikes')
+  const [tab, setTab] = useState<RightTab>('strikes')
 
   return (
     <div className="h-full flex flex-col border-l border-border">
@@ -213,6 +251,12 @@ function RightDock({ ws }: { ws: NonNullable<ReturnType<typeof useTerminal.getSt
           <ListTree className="h-3 w-3" /> Strikes
         </button>
         <button
+          onClick={() => setTab('auto')}
+          className={`flex items-center gap-1 px-2 py-0.5 rounded text-[10px] ${tab === 'auto' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
+        >
+          <Bot className="h-3 w-3" /> Auto
+        </button>
+        <button
           onClick={() => setTab('order')}
           className={`flex items-center gap-1 px-2 py-0.5 rounded text-[10px] ${tab === 'order' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
         >
@@ -220,7 +264,7 @@ function RightDock({ ws }: { ws: NonNullable<ReturnType<typeof useTerminal.getSt
         </button>
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto">
-        {tab === 'strikes' ? <StrikesPanel ws={ws} /> : <OrderPad />}
+        {tab === 'strikes' ? <StrikesPanel ws={ws} /> : tab === 'auto' ? <AutoPanel ws={ws} /> : <OrderPad />}
       </div>
     </div>
   )

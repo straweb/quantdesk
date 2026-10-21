@@ -11,8 +11,11 @@ export interface StrikeRowCfg {
   strike: number
   type: 'CE' | 'PE'
   enabled: boolean
-  allocPct: number // % of account usable capital to deploy
+  allocPct: number // % of account usable capital to deploy (PCT mode)
+  allocAmt?: number // fixed ₹ allocation per account (FIXED mode)
 }
+
+export type AllocMode = 'PCT' | 'FIXED'
 
 export interface StrikesCfg {
   underlying: string | null
@@ -29,6 +32,17 @@ export interface DepthPanelCfg {
 
 export function defaultDepthPanels(symbol: string): DepthPanelCfg[] {
   return [{ id: `dp-${symbol.toLowerCase()}`, symbol, height: 190 }]
+}
+
+const MAX_DEPTH_PANELS = 6
+
+/** Shared depth-panel add (used by the depth stack header AND the chart-pane
+ *  header depth buttons). Dedupes by symbol, caps the stack size. */
+export function addDepthPanelTo(ws: WorkspaceCfg, symbol: string): { patch: Partial<WorkspaceCfg>; error?: string } {
+  const cur = ws.depthPanels ?? defaultDepthPanels(ws.symbol)
+  if (cur.some(p => p.symbol === symbol)) return { patch: {}, error: `${symbol} depth is already open` }
+  if (cur.length >= MAX_DEPTH_PANELS) return { patch: {}, error: `Max ${MAX_DEPTH_PANELS} depth panels` }
+  return { patch: { depthPanels: [...cur, { id: `dp${Date.now().toString(36)}`, symbol, height: 170 }] } }
 }
 
 // ---- multi-pane chart layouts ----
@@ -83,6 +97,15 @@ export interface WorkspaceCfg {
   showVolume: boolean
   showSMA20: boolean
   showSMA50: boolean
+  // indicator toggles (sample-tool style toolbar)
+  showEMA?: boolean
+  showVWAP?: boolean
+  showBOLL?: boolean
+  showRSI?: boolean
+  showMACD?: boolean
+  // strike allocation mode: % of usable capital (auto-normalized per side)
+  // or fixed ₹ per strike per account
+  allocMode?: AllocMode
   showOptionMinis?: boolean // legacy (pre-layout) — kept for persisted-state migration
   layout?: WsLayout
   panes?: PaneCfg[]
@@ -93,6 +116,12 @@ export interface WorkspaceCfg {
 export function defaultStrikes(): StrikesCfg {
   return { underlying: null, expiry: null, rows: [] }
 }
+
+/** Boolean chart display flags (toolbar toggles). */
+export type WorkspaceCfgFlags = Pick<
+  WorkspaceCfg,
+  'showVolume' | 'showSMA20' | 'showSMA50' | 'showEMA' | 'showVWAP' | 'showBOLL' | 'showRSI' | 'showMACD'
+>
 
 interface TerminalState {
   view: AppView
@@ -125,7 +154,7 @@ interface TerminalState {
 
 const mkWs = (id: string, name: string, symbol: string): WorkspaceCfg => ({
   id, name, symbol, tf: '5m', chartType: 'candles', showVolume: true, showSMA20: false, showSMA50: false,
-  showOptionMinis: true, layout: 'spot-atm', panes: defaultPanes(), strikes: defaultStrikes(),
+  allocMode: 'PCT', showOptionMinis: true, layout: 'spot-atm', panes: defaultPanes(), strikes: defaultStrikes(),
   depthPanels: defaultDepthPanels(symbol),
 })
 

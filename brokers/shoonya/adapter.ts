@@ -1,22 +1,82 @@
-import type { BrokerAdapter, LegContext, OrderLegResult } from '../registry'
+import type {
+  BrokerAdapter, LegContext, OrderLegResult,
+  BrokerBookRow, BrokerTradeRow, BrokerPositionRow, BrokerFundsRow, BrokerQuoteRow, ModifyPatch,
+} from '../registry'
 import { registerAdapter } from '../registry'
 import { applyFill, rejectOrder } from '../execution'
 import { logBroker } from '../database'
+import { liveFetch, num, normalizeStatus } from '../live-api'
 
 // ============================================================
-// Shoonya (Finvasia) broker plugin — Noren REST API.
-// Live mode: POST /PlaceOrder with jKey session token.
-// Symbol format: NSE|RELIANCE-EQ, NFO|NIFTY28OCT25C24500
+// Shoonya (Finvasia) broker plugin — Noren REST API. Full surface:
+//   /PlaceOrder /ModifyOrder /CancelOrder
+//   /OrderBook  /TradeBook  /PositionBook
+//   /Limits     /GetQuote   /SingleOrdHist
+// Auth: every request body carries jKey = session token (Noren
+// convention) + uid/actid. Symbol format: NSE|RELIANCE-EQ,
+// NFO|NIFTY28OCT25C24500.
 // Sandbox mode: sandbox engine fallback (sim LTP), flagged.
 // ============================================================
 
 const BASE = 'https://api.shoonya.com/NorenWClientTP'
+
+/** Noren request wrapper — jKey session token + uid/actid on every call. */
+function norenBody(ctx: LegContext, extra: Record<string, unknown> = {}) {
+  return {
+    uid: ctx.credentials?.userId ?? '',
+    actid: ctx.credentials?.userId ?? '',
+    jKey: ctx.credentials?.sessionId ?? '',
+    ...extra,
+  }
+}
+
+async function norenPost<T>(endpoint: string, body: Record<string, unknown>, timeoutMs = 4000) {
+  return liveFetch<T>(`${BASE}/${endpoint}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    timeoutMs,
+  })
+}
 
 function norenSymbol(ctx: LegContext): string {
   const m = ctx.symbolMap
   if (m.exchange === 'NFO') return m.brokerSymbol
   if (m.exchange === 'BSE') return `BSE|${m.brokerSymbol}`
   return `NSE|${m.brokerSymbol}`
+}
+
+function orderPayload(ctx: LegContext) {
+  const units = ctx.order.qty * ctx.symbolMap.lotSize
+  return {
+    prarr: 'NON-COL',
+    trantype: ctx.order.side === 'BUY' ? 'B' : 'S',
+    prd: ctx.order.productType,
+    exch: ctx.symbolMap.exchange,
+    tsym: norenSymbol(ctx),
+    qty: units,
+    prc: ctx.order.limitPrice ? ctx.order.limitPrice.toFixed(2) : '0',
+    prd_type: ctx.order.orderType === 'LIMIT' ? 'L' : ctx.order.orderType === 'SL' ? 'SL' : ctx.order.orderType === 'SL-M' ? 'SL-M' : 'MKT',
+    trgprc: ctx.order.triggerPrice?.toFixed(2) ?? undefined,
+    ret: 'DAY',
+    remarks: (ctx.order.source + (ctx.order.strategyId ? ':' + ctx.order.strategyId : '')).slice(0, 28),
+  }
+}
+
+function toBookRow(o: Record<string, unknown>): BrokerBookRow {
+  const raw = String(o.status ?? '')
+  return {
+    brokerOrderId: String(o.norenordno ?? o.orderno ?? ''),
+    symbol: String(o.tsym ?? ''),
+    side: o.trantype === 'B' ? 'BUY' : o.trantype === 'S' ? 'SELL' : String(o.trantype ?? ''),
+    qty: num(o.qty) ?? 0,
+    filledQty: num(o.fillshares) ?? (normalizeStatus(raw) === 'FILLED' ? num(o.qty) ?? 0 : 0),
+    status: normalizeStatus(raw),
+    rawStatus: raw,
+    avgPrice: num(o.avgprc) ?? num(o.prc) ?? undefined,
+    orderType: String(o.prd_type ?? o.prc ?? ''),
+    ts: String(o.ordertm ?? o.updatetime ?? ''),
+  }
 }
 
 const shoonyaAdapter: BrokerAdapter = {
@@ -41,42 +101,20 @@ const shoonyaAdapter: BrokerAdapter = {
     return creds?.sessionId ? 'Live (Noren API)' : 'Sandbox (no session token)'
   },
 
+  sessionKind() { return 'daily' }, // Shoonya TOTP sessions are re-established daily
+
   async placeOrder(ctx: LegContext): Promise<OrderLegResult> {
     const units = ctx.order.qty * ctx.symbolMap.lotSize
     if (ctx.credentials?.sessionId) {
-      try {
-        const res = await fetch(`${BASE}/PlaceOrder`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            uid: ctx.credentials.userId ?? '',
-            actid: ctx.credentials.userId ?? '',
-            prarr: 'NON-COL',
-            trantype: ctx.order.side === 'BUY' ? 'B' : 'S',
-            prd: ctx.order.productType,
-            exch: ctx.symbolMap.exchange,
-            tsym: norenSymbol(ctx),
-            qty: units,
-            prc: ctx.order.limitPrice ? ctx.order.limitPrice.toFixed(2) : '0',
-            prd_type: ctx.order.orderType === 'LIMIT' ? 'L' : ctx.order.orderType === 'SL' ? 'SL' : ctx.order.orderType === 'SL-M' ? 'SL-M' : 'MKT',
-            trgprc: ctx.order.triggerPrice?.toFixed(2) ?? undefined,
-            ret: 'DAY',
-            remarks: (ctx.order.source + (ctx.order.strategyId ? ':' + ctx.order.strategyId : '')).slice(0, 28),
-          }),
-          signal: AbortSignal.timeout(4000),
-        })
-        const data = (await res.json()) as { stat?: string; norenordno?: string; emsg?: string }
-        if (data.stat === 'Ok' && data.norenordno) {
-          logBroker('SHOONYA', ctx.accountId, `LIVE order ${data.norenordno} ${ctx.order.side} ${units} ${norenSymbol(ctx)}`)
-          return {
-            accountId: ctx.accountId, accountLabel: ctx.accountLabel, brokerType: 'SHOONYA',
-            brokerOrderId: data.norenordno, status: 'OPEN', qty: ctx.order.qty, message: 'Live order accepted by Shoonya',
-          }
+      const res = await norenPost<{ stat?: string; norenordno?: string; emsg?: string }>('PlaceOrder', norenBody(ctx, orderPayload(ctx)))
+      if (res.data?.stat === 'Ok' && res.data.norenordno) {
+        logBroker('SHOONYA', ctx.accountId, `LIVE order ${res.data.norenordno} ${ctx.order.side} ${units} ${norenSymbol(ctx)}`)
+        return {
+          accountId: ctx.accountId, accountLabel: ctx.accountLabel, brokerType: 'SHOONYA',
+          brokerOrderId: res.data.norenordno, status: 'OPEN', qty: ctx.order.qty, message: 'Live order accepted by Shoonya',
         }
-        logBroker('SHOONYA', ctx.accountId, `API error: ${data.emsg ?? res.status}`, 'WARN')
-      } catch {
-        logBroker('SHOONYA', ctx.accountId, 'API unreachable — sandbox fallback', 'WARN')
       }
+      logBroker('SHOONYA', ctx.accountId, `API error: ${res.data?.emsg ?? res.error ?? res.status}`, 'WARN')
     }
     if (!ctx.credentials?.sessionId) {
       rejectOrder(ctx, 'Sandbox fill (no live credentials)')
@@ -91,23 +129,86 @@ const shoonyaAdapter: BrokerAdapter = {
     }
   },
 
+  async modifyOrder(ctx, brokerOrderId, patch: ModifyPatch) {
+    if (!ctx.credentials?.sessionId) return { ok: false, message: 'no live credentials' }
+    const p = orderPayload(ctx)
+    if (patch.qty != null) p.qty = patch.qty * ctx.symbolMap.lotSize
+    if (patch.limitPrice != null) p.prc = patch.limitPrice.toFixed(2)
+    if (patch.triggerPrice != null) p.trgprc = patch.triggerPrice.toFixed(2)
+    const res = await norenPost<{ stat?: string; result?: string; emsg?: string }>('ModifyOrder', norenBody(ctx, { ...p, orderno: brokerOrderId }))
+    const ok = res.data?.stat === 'Ok'
+    logBroker('SHOONYA', ctx.accountId, `LIVE modify ${brokerOrderId}: ${ok ? 'ok' : res.data?.emsg ?? res.error}`, ok ? 'INFO' : 'WARN')
+    return { ok, message: ok ? 'Live order modified' : res.data?.emsg ?? res.error }
+  },
+
   async cancelOrder(ctx, brokerOrderId) {
     if (ctx.credentials?.sessionId) {
-      try {
-        const res = await fetch(`${BASE}/CancelOrder`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            uid: ctx.credentials.userId ?? '',
-            norenordno: brokerOrderId,
-          }),
-          signal: AbortSignal.timeout(3000),
-        })
-        const data = (await res.json()) as { stat?: string }
-        if (data.stat === 'Ok') return { ok: true }
-      } catch { /* sandbox */ }
+      const res = await norenPost<{ stat?: string; result?: string; emsg?: string }>('CancelOrder', norenBody(ctx, { norenordno: brokerOrderId }), 3000)
+      if (res.data?.stat === 'Ok') return { ok: true, message: 'Live order cancelled' }
+      return { ok: false, message: res.data?.emsg ?? 'cancel failed' }
     }
     return { ok: true, message: 'Sandbox cancel attempted' }
+  },
+
+  async getOrderBook(ctx) {
+    if (!ctx.credentials?.sessionId) return []
+    const res = await norenPost<Record<string, unknown>[] | { emsg?: string }>('OrderBook', norenBody(ctx))
+    const arr = Array.isArray(res.data) ? res.data : []
+    return arr.map(toBookRow)
+  },
+
+  async getTradeBook(ctx) {
+    if (!ctx.credentials?.sessionId) return []
+    const res = await norenPost<Record<string, unknown>[] | { emsg?: string }>('TradeBook', norenBody(ctx))
+    const arr = Array.isArray(res.data) ? res.data : []
+    return arr.map(t => ({
+      tradeId: String(t.tradeid ?? t.exchange_time ?? ''),
+      orderId: String(t.norenordno ?? ''),
+      symbol: String(t.tsym ?? ''),
+      side: t.trantype === 'B' ? 'BUY' : 'SELL',
+      qty: num(t.qty) ?? 0,
+      price: num(t.prc) ?? 0,
+      ts: String(t.trantime ?? ''),
+    }))
+  },
+
+  async getPositionsLive(ctx) {
+    if (!ctx.credentials?.sessionId) return []
+    const res = await norenPost<Record<string, unknown>[] | { emsg?: string }>('PositionBook', norenBody(ctx))
+    const arr = Array.isArray(res.data) ? res.data : []
+    return arr
+      .filter(p => num(p.netqty) !== 0)
+      .map(p => ({
+        symbol: String(p.tsym ?? ''),
+        netQty: num(p.netqty) ?? 0,
+        avgPrice: num(p.avgprc) ?? 0,
+        ltp: num(p.lp) ?? undefined,
+        pnl: (num(p.urmtom) ?? 0) + (num(p.rpmtom) ?? 0),
+        productType: String(p.prd ?? ''),
+      }))
+  },
+
+  async getFunds(ctx) {
+    if (!ctx.credentials?.sessionId) return { cash: 0 }
+    const res = await norenPost<Record<string, unknown> | { emsg?: string }>('Limits', norenBody(ctx))
+    const d = (res.data && !Array.isArray(res.data) ? res.data : {}) as Record<string, unknown>
+    const cash = num(d.cash) ?? 0
+    return { cash, available: num(d.marginavailable) ?? cash, utilized: num(d.marginused) ?? 0 }
+  },
+
+  async getQuote(ctx, token) {
+    if (!ctx.credentials?.sessionId) return { symbol: token, ltp: 0 }
+    const [exch, tsym] = token.includes('|') ? token.split('|') : [ctx.symbolMap.exchange, token]
+    const res = await norenPost<Record<string, unknown>>('GetQuote', norenBody(ctx, { exch, tsym }), 3000)
+    if (!res.data) return { symbol: token, ltp: 0 }
+    return {
+      symbol: tsym,
+      ltp: num(res.data.lp) ?? 0,
+      bid: num(res.data.bp1),
+      ask: num(res.data.sp1),
+      open: num(res.data.o), high: num(res.data.h), low: num(res.data.l), prevClose: num(res.data.c),
+      volume: num(res.data.volume),
+    }
   },
 }
 

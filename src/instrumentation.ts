@@ -7,6 +7,7 @@ export async function register() {
   const { bootstrap } = await import('./lib/services/bootstrap-service')
   const { ensureStrategyScheduler } = await import('./lib/services/strategy-engine')
   const { ensureOrderMonitor } = await import('./lib/services/order-monitor')
+  const { ensureAutoRuleEngine } = await import('./lib/services/auto-rules-service')
 
   bootstrap()
     .then(() => console.log('[instrumentation] bootstrap complete'))
@@ -14,7 +15,15 @@ export async function register() {
 
   ensureStrategyScheduler()
   ensureOrderMonitor()
+  ensureAutoRuleEngine()
+  ensureLiveOrderSync()
   ensureFeedWatchdog()
+}
+
+/** Reconcile live broker OPEN orders against real broker order books. */
+async function ensureLiveOrderSync() {
+  const m = await import('./lib/services/live-order-sync')
+  m.ensureLiveOrderSync()
 }
 
 /** Respawn the market-feed mini-service if :3004 goes dark, then re-push the

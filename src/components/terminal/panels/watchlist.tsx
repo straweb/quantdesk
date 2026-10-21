@@ -6,7 +6,7 @@ import { toast } from 'sonner'
 import { GripHorizontal, Layers, Plus, Search, X } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { api, type SymbolRow } from '../lib/client-api'
-import { useTerminal, defaultDepthPanels, type DepthPanelCfg, type WorkspaceCfg } from '../lib/store'
+import { useTerminal, defaultDepthPanels, addDepthPanelTo, type DepthPanelCfg, type WorkspaceCfg } from '../lib/store'
 import { onTicks, subscribeTicks, unsubscribeTicks } from '../lib/socket'
 import type { Tick } from '@/lib/types'
 
@@ -125,7 +125,6 @@ export function Watchlist() {
 
 const DEPTH_MIN_H = 96
 const DEPTH_MAX_H = 460
-const MAX_PANELS = 6
 
 export function DepthStack({ ws }: { ws: WorkspaceCfg }) {
   const patchWs = useTerminal(s => s.patchWs)
@@ -136,11 +135,11 @@ export function DepthStack({ ws }: { ws: WorkspaceCfg }) {
   const setPanels = (next: DepthPanelCfg[]) => patchWs(ws.id, { depthPanels: next })
 
   const addPanel = () => {
-    const cur = useTerminal.getState().workspaces.find(w => w.id === ws.id)?.depthPanels ?? panels
+    const cur = useTerminal.getState().workspaces.find(w => w.id === ws.id) ?? ws
     const sym = selectedSymbol || ws.symbol
-    if (cur.some(p => p.symbol === sym)) { toast.info(`${sym} depth is already open`); return }
-    if (cur.length >= MAX_PANELS) { toast.error(`Max ${MAX_PANELS} depth panels`); return }
-    setPanels([...cur, { id: `dp${Date.now().toString(36)}`, symbol: sym, height: 170 }])
+    const { patch, error } = addDepthPanelTo(cur, sym)
+    if (error) { toast.info(error); return }
+    setPanels(patch.depthPanels!)
   }
 
   const removePanel = (id: string) => setPanels(panels.filter(p => p.id !== id))

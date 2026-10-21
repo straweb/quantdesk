@@ -253,6 +253,53 @@ export const api = {
   ensureStrike: (underlying: string, strike: number, expiry: string | null) =>
     fetch('/api/options/ensure-strike', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ underlying, strike, expiry }) })
       .then(r => j<{ ok: boolean; created: number; symbols: string[] }>(r)),
+
+  // ---- auto rules (index-based / time-based CE-PE entries) ----
+  autoRules: () => fetch('/api/autorules').then(r => j<{ rules: AutoRuleRow[] }>(r)),
+  createAutoRule: (body: Record<string, unknown>) =>
+    fetch('/api/autorules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => j<{ ok: boolean; rule: AutoRuleRow }>(r)),
+  patchAutoRule: (id: string, body: Record<string, unknown>) =>
+    fetch(`/api/autorules/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => j<{ ok: boolean }>(r)),
+  deleteAutoRule: (id: string) => fetch(`/api/autorules/${id}`, { method: 'DELETE' }).then(r => j<{ ok: boolean }>(r)),
+
+  // ---- live broker API access (order book of a real broker account) ----
+  brokerOrderBook: (accountId: string) =>
+    fetch(`/api/broker-orderbook?accountId=${encodeURIComponent(accountId)}`).then(r => j<{ orders: BrokerBookRow[]; live: boolean; message?: string }>(r)),
+}
+
+export interface AutoRuleRow {
+  id: string
+  name: string
+  underlying: string
+  expiry: string | null
+  kind: 'INDEX' | 'TIME'
+  level?: number
+  cross?: 'ABOVE' | 'BELOW'
+  time?: string
+  action: 'BUY' | 'SELL'
+  optType: 'CE' | 'PE'
+  offset: number
+  allocPct: number
+  enabled: boolean
+  repeatDaily: boolean
+  lastFiredDate?: string
+  lastFiredAt?: string
+  lastStatus?: string
+  lastMessage?: string
+  fireCount: number
+  createdAt: string
+}
+
+export interface BrokerBookRow {
+  brokerOrderId: string
+  symbol: string
+  side: string
+  qty: number
+  filledQty?: number
+  status: string
+  avgPrice?: number
+  orderType?: string
+  ts?: string
 }
 
 export function fmtMoney(n: number | null | undefined, dp = 2): string {

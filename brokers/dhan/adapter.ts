@@ -1,28 +1,49 @@
-import type { BrokerAdapter, LegContext, OrderLegResult } from '../registry'
+import type {
+  BrokerAdapter, LegContext, OrderLegResult,
+  BrokerBookRow, BrokerTradeRow, BrokerPositionRow, BrokerFundsRow, BrokerQuoteRow, ModifyPatch,
+} from '../registry'
 import { registerAdapter } from '../registry'
 import { applyFill, rejectOrder } from '../execution'
 import { logBroker } from '../database'
+import { liveFetch, num, normalizeStatus } from '../live-api'
 
 // ============================================================
-// Dhan broker plugin — Dhan API v2 (REST).
-// Live mode: POST https://api.dhan.co/v2/orders with access-token header.
+// Dhan broker plugin — Dhan API v2 (REST). Full live surface:
+//   POST   /orders                 place
+//   PUT    /orders/{id}            modify
+//   DELETE /orders/{id}            cancel
+//   GET    /orders                 order book
+//   GET    /orders/{id}            order detail / status
+//   GET    /trades                 trade book
+//   GET    /positions              position book
+//   GET    /fundlimit              funds / margin
+//   POST   /marketfeed/quote       L1 quote
+// Auth header: access-token. Docs: https://dhanhq.co/docs/v2/
 // Sandbox mode: if credentials absent or API unreachable, the leg
 // executes against the sandbox engine (sim LTP) and is flagged.
-// Docs: https://dhanhq.co/docs/v2/orders/
 // ============================================================
 
 const BASE = 'https://api.dhan.co/v2'
 
+function headers(creds: Record<string, string> | null): Record<string, string> {
+  return {
+    'access-token': creds?.accessToken ?? '',
+    'Accept': 'application/json',
+    'Content-Type': 'application/json',
+  }
+}
+
 function mapTransactionType(side: 'BUY' | 'SELL') { return side } // Dhan uses BUY/SELL
 function mapProduct(p: 'MIS' | 'CNC' | 'NRML') { return p === 'CNC' ? 'CNC' : p === 'MIS' ? 'INTRADAY' : 'MARGIN' }
 function mapOrderType(t: string) { return t === 'MARKET' ? 'MARKET' : t === 'LIMIT' ? 'LIMIT' : t === 'SL' ? 'STOP_LOSS' : 'STOP_LOSS_MARKET' }
+function mapSegment(exchange: string) { return exchange === 'NFO' ? 'NSE_FNO' : exchange === 'BSE' ? 'BSE_EQ' : 'NSE_EQ' }
 
 function livePayload(ctx: LegContext) {
   const units = ctx.order.qty * ctx.symbolMap.lotSize
   return {
     dhanClientId: ctx.credentials?.clientId ?? '',
     transactionType: mapTransactionType(ctx.order.side),
-    exchangeSegment: ctx.symbolMap.exchange === 'NFO' ? 'NSE_FNO' : ctx.symbolMap.exchange === 'BSE' ? 'BSE_EQ' : 'NSE_EQ',
+    exchangeSegment: mapSegment(ctx.symbolMap.exchange),
     productType: mapProduct(ctx.order.productType),
     orderType: mapOrderType(ctx.order.orderType),
     validity: 'DAY',
@@ -33,6 +54,22 @@ function livePayload(ctx: LegContext) {
     disclosed_quantity: 0,
     afterMarketOrder: false,
     tag: (ctx.order.source + (ctx.order.strategyId ? ':' + ctx.order.strategyId : '')).slice(0, 20),
+  }
+}
+
+/** Dhan order-book row -> normalized row. */
+function toBookRow(o: Record<string, unknown>): BrokerBookRow {
+  return {
+    brokerOrderId: String(o.orderId ?? ''),
+    symbol: String(o.tradingSymbol ?? o.securityId ?? ''),
+    side: String(o.transactionType ?? ''),
+    qty: num(o.quantity) ?? 0,
+    filledQty: num(o.filledQty) ?? num(o.filled_qty) ?? (normalizeStatus(o.orderStatus as string) === 'FILLED' ? num(o.quantity) ?? 0 : 0),
+    status: normalizeStatus(o.orderStatus as string),
+    rawStatus: String(o.orderStatus ?? ''),
+    avgPrice: num(o.averageTradedPrice) ?? num(o.price) ?? undefined,
+    orderType: String(o.orderType ?? ''),
+    ts: String(o.orderTimestamp ?? o.exchangeTime ?? ''),
   }
 }
 
@@ -57,29 +94,25 @@ const dhanAdapter: BrokerAdapter = {
     return creds?.accessToken ? 'Live (Dhan API v2)' : 'Sandbox (no access token)'
   },
 
+  sessionKind() { return 'daily' }, // Dhan access tokens expire daily (24h)
+
   async placeOrder(ctx: LegContext): Promise<OrderLegResult> {
     const units = ctx.order.qty * ctx.symbolMap.lotSize
     if (ctx.credentials?.accessToken) {
       try {
-        const res = await fetch(`${BASE}/orders`, {
+        const res = await liveFetch<{ orderId?: string; remarks?: string; errorMessage?: string; errorCode?: string }>(`${BASE}/orders`, {
           method: 'POST',
-          headers: {
-            'access-token': ctx.credentials.accessToken,
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-          },
+          headers: headers(ctx.credentials),
           body: JSON.stringify(livePayload(ctx)),
-          signal: AbortSignal.timeout(4000),
         })
-        const data = (await res.json()) as { orderId?: string; remarks?: string; errorMessage?: string }
-        if (res.ok && data.orderId) {
-          logBroker('DHAN', ctx.accountId, `LIVE order ${data.orderId} ${ctx.order.side} ${units} ${ctx.symbolMap.brokerSymbol}`)
+        if (res.ok && res.data?.orderId) {
+          logBroker('DHAN', ctx.accountId, `LIVE order ${res.data.orderId} ${ctx.order.side} ${units} ${ctx.symbolMap.brokerSymbol}`)
           return {
             accountId: ctx.accountId, accountLabel: ctx.accountLabel, brokerType: 'DHAN',
-            brokerOrderId: data.orderId, status: 'OPEN', qty: ctx.order.qty, message: 'Live order accepted by Dhan',
+            brokerOrderId: res.data.orderId, status: 'OPEN', qty: ctx.order.qty, message: 'Live order accepted by Dhan',
           }
         }
-        logBroker('DHAN', ctx.accountId, `API error: ${data.errorMessage ?? res.status}`, 'WARN')
+        logBroker('DHAN', ctx.accountId, `API error: ${res.data?.errorMessage ?? res.error ?? res.status}`, 'WARN')
         // fall through to sandbox
       } catch {
         logBroker('DHAN', ctx.accountId, 'API unreachable — sandbox fallback', 'WARN')
@@ -99,18 +132,103 @@ const dhanAdapter: BrokerAdapter = {
     }
   },
 
+  async modifyOrder(ctx, brokerOrderId, patch: ModifyPatch) {
+    if (!ctx.credentials?.accessToken) return { ok: false, message: 'no live credentials' }
+    const payload = { ...livePayload(ctx), orderId: brokerOrderId }
+    if (patch.qty != null) payload.quantity = patch.qty * ctx.symbolMap.lotSize
+    if (patch.limitPrice != null) payload.price = Number(patch.limitPrice.toFixed(2))
+    if (patch.triggerPrice != null) payload.triggerPrice = Number(patch.triggerPrice.toFixed(2))
+    if (patch.orderType) payload.orderType = mapOrderType(patch.orderType)
+    const res = await liveFetch<{ orderId?: string; errorMessage?: string }>(`${BASE}/orders/${brokerOrderId}`, {
+      method: 'PUT', headers: headers(ctx.credentials), body: JSON.stringify(payload),
+    })
+    const ok = res.ok && !!res.data?.orderId
+    logBroker('DHAN', ctx.accountId, `LIVE modify ${brokerOrderId}: ${ok ? 'ok' : res.data?.errorMessage ?? res.error}`, ok ? 'INFO' : 'WARN')
+    return { ok, message: ok ? 'Live order modified' : res.data?.errorMessage ?? res.error }
+  },
+
   async cancelOrder(ctx, brokerOrderId) {
     if (ctx.credentials?.accessToken) {
-      try {
-        const res = await fetch(`${BASE}/orders/${brokerOrderId}`, {
-          method: 'DELETE',
-          headers: { 'access-token': ctx.credentials.accessToken },
-          signal: AbortSignal.timeout(3000),
-        })
-        if (res.ok) return { ok: true }
-      } catch { /* sandbox fallback */ }
+      const res = await liveFetch<unknown>(`${BASE}/orders/${brokerOrderId}`, {
+        method: 'DELETE', headers: headers(ctx.credentials), timeoutMs: 3000,
+      })
+      if (res.ok) return { ok: true, message: 'Live order cancelled' }
     }
     return { ok: true, message: 'Sandbox cancel attempted' }
+  },
+
+  async getOrderBook(ctx) {
+    if (!ctx.credentials?.accessToken) return []
+    const res = await liveFetch<Record<string, unknown>[]>(`${BASE}/orders`, { headers: headers(ctx.credentials) })
+    if (!res.ok || !Array.isArray(res.data)) return []
+    return res.data.map(toBookRow)
+  },
+
+  async getOrderStatus(ctx, brokerOrderId) {
+    if (!ctx.credentials?.accessToken) return null
+    const res = await liveFetch<Record<string, unknown>>(`${BASE}/orders/${brokerOrderId}`, { headers: headers(ctx.credentials) })
+    if (!res.ok || !res.data?.orderId) return null
+    return toBookRow(res.data)
+  },
+
+  async getTradeBook(ctx) {
+    if (!ctx.credentials?.accessToken) return []
+    const res = await liveFetch<Record<string, unknown>[]>(`${BASE}/trades`, { headers: headers(ctx.credentials) })
+    if (!res.ok || !Array.isArray(res.data)) return []
+    return res.data.map(t => ({
+      tradeId: String(t.exchangeTradeId ?? t.tradeId ?? ''),
+      orderId: String(t.orderId ?? ''),
+      symbol: String(t.tradingSymbol ?? ''),
+      side: String(t.transactionType ?? t.trantype ?? ''),
+      qty: num(t.tradeQuantity ?? t.quantity) ?? 0,
+      price: num(t.tradedPrice ?? t.price) ?? 0,
+      ts: String(t.tradedTime ?? ''),
+    }))
+  },
+
+  async getPositionsLive(ctx) {
+    if (!ctx.credentials?.accessToken) return []
+    const res = await liveFetch<Record<string, unknown>[]>(`${BASE}/positions`, { headers: headers(ctx.credentials) })
+    if (!res.ok || !Array.isArray(res.data)) return []
+    return res.data
+      .filter(p => String(p.positionType ?? 'CLOSED') !== 'CLOSED' || num(p.netQty) !== 0)
+      .map(p => ({
+        symbol: String(p.tradingSymbol ?? p.securityId ?? ''),
+        netQty: num(p.netQty) ?? 0,
+        avgPrice: num(p.avgCostPrice ?? p.costPrice) ?? 0,
+        pnl: (num(p.realizedProfit) ?? 0) + (num(p.unrealizedProfit) ?? 0),
+        productType: String(p.productId ?? ''),
+      }))
+  },
+
+  async getFunds(ctx) {
+    if (!ctx.credentials?.accessToken) return { cash: 0 }
+    const res = await liveFetch<Record<string, unknown>>(`${BASE}/fundlimit`, { headers: headers(ctx.credentials) })
+    if (!res.ok || !res.data) return { cash: 0 }
+    // NOTE: Dhan v2 spells the field "availabelBalance" (their typo) — handle both
+    const cash = num(res.data.availabelBalance) ?? num(res.data.availableBalance) ?? num(res.data.withdrawableBalance) ?? 0
+    return { cash, available: num(res.data.withdrawableBalance) ?? cash, utilized: num(res.data.utilizedAmount) ?? 0 }
+  },
+
+  async getQuote(ctx, token) {
+    if (!ctx.credentials?.accessToken) return { symbol: token, ltp: 0 }
+    const segment = mapSegment(ctx.symbolMap.exchange)
+    const res = await liveFetch<{ data?: Record<string, Record<string, unknown>> }>(`${BASE}/marketfeed/quote`, {
+      method: 'POST', headers: headers(ctx.credentials), timeoutMs: 3000,
+      body: JSON.stringify({ [segment]: [token] }),
+    })
+    const q = res.data?.data?.[segment]
+    if (!q) return { symbol: token, ltp: 0 }
+    const ohlc = (q.ohlc ?? {}) as Record<string, unknown>
+    const depth = (q.depth ?? {}) as { buy?: Record<string, unknown>[]; sell?: Record<string, unknown>[] }
+    return {
+      symbol: token,
+      ltp: num(q.last_price) ?? 0,
+      bid: num(depth.buy?.[0]?.price),
+      ask: num(depth.sell?.[0]?.price),
+      open: num(ohlc.open), high: num(ohlc.high), low: num(ohlc.low), prevClose: num(ohlc.close),
+      volume: num(q.volume),
+    }
   },
 }
 
