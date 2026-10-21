@@ -52,6 +52,9 @@ export interface PlaceOrderRequest {
   legAccounts?: string[]
   // reduceOnly: closing an existing position — bypasses capital sizing checks
   reduceOnly?: boolean
+  // deploy % of each account's usable capital (strikes panel quick deploy);
+  // qty>0 takes precedence
+  capitalPct?: number
 }
 
 export interface OrderLegResult {

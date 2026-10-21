@@ -26,6 +26,7 @@ interface Props {
   markers?: ChartMarker[]
   onPriceClick?: (price: number) => void
   height: string
+  mini?: boolean // compact mode (ATM option mini charts): thinner axes, no crosshair legend/time axis
 }
 
 const UP = '#00c896'
@@ -64,13 +65,13 @@ function fmtAxisTime(t: number, tf: string): string {
   return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false })
 }
 
-export function CanvasChart({ symbol, tf, chartType, showVolume, showSMA20, showSMA50, markers = [], onPriceClick, height }: Props) {
+export function CanvasChart({ symbol, tf, chartType, showVolume, showSMA20, showSMA50, markers = [], onPriceClick, height, mini = false }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [candles, setCandles] = useState<Candle[]>([])
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState<string | null>(null)
-  const [barCount, setBarCount] = useState(120)
+  const [barCount, setBarCount] = useState(mini ? 60 : 120)
   const offsetRef = useRef(0)
   const [, forceRender] = useState(0)
   const crossRef = useRef<{ x: number; y: number } | null>(null)
@@ -166,11 +167,11 @@ export function CanvasChart({ symbol, tf, chartType, showVolume, showSMA20, show
         return
       }
 
-      const axisW = 58
-      const axisH = 20
+      const axisW = mini ? 46 : 58
+      const axisH = mini ? 12 : 20
       const plotW = w - axisW
-      const volH = showVolume ? Math.round((h - axisH) * 0.18) : 0
-      const priceH = h - axisH - volH - (showVolume ? 6 : 0)
+      const volH = showVolume && !mini ? Math.round((h - axisH) * 0.18) : 0
+      const priceH = h - axisH - volH - (showVolume && !mini ? 6 : 0)
 
       // visible window
       const end = Math.max(2, data.length - offsetRef.current)
@@ -200,7 +201,7 @@ export function CanvasChart({ symbol, tf, chartType, showVolume, showSMA20, show
       // grid + price axis
       ctx.textAlign = 'left'
       ctx.textBaseline = 'middle'
-      for (const p of niceTicks(pMin, pMax, Math.max(3, Math.floor(priceH / 55)))) {
+      for (const p of niceTicks(pMin, pMax, Math.max(mini ? 2 : 3, Math.floor(priceH / (mini ? 90 : 55))))) {
         const y = yOf(p)
         ctx.strokeStyle = GRID
         ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke()
@@ -208,7 +209,8 @@ export function CanvasChart({ symbol, tf, chartType, showVolume, showSMA20, show
         ctx.fillText(p >= 1000 ? p.toLocaleString('en-IN', { maximumFractionDigits: 1 }) : p.toFixed(2), plotW + 6, y)
       }
 
-      // time axis
+      // time axis (skipped in mini mode — too cramped)
+      if (!mini) {
       ctx.textAlign = 'center'
       ctx.textBaseline = 'top'
       const labelEvery = Math.max(1, Math.ceil(vis.length / Math.max(2, Math.floor(plotW / 90))))
@@ -220,9 +222,10 @@ export function CanvasChart({ symbol, tf, chartType, showVolume, showSMA20, show
         ctx.fillStyle = AXIS_TXT
         ctx.fillText(fmtAxisTime(c.t, tf), x, h - axisH + 4)
       })
+      }
 
       // volume
-      if (showVolume && volH > 0) {
+      if (showVolume && !mini && volH > 0) {
         let vMax = 0
         for (const c of vis) if (c.v > vMax) vMax = c.v
         const vy0 = priceH + 6 + volH
@@ -321,8 +324,8 @@ export function CanvasChart({ symbol, tf, chartType, showVolume, showSMA20, show
         ctx.fillText(lastC.c.toFixed(2), plotW + axisW / 2, y)
       }
 
-      // crosshair
-      const cross = crossRef.current
+      // crosshair (disabled in mini mode)
+      const cross = mini ? null : crossRef.current
       if (cross && cross.x < plotW && cross.y < h - axisH) {
         ctx.strokeStyle = CROSS
         ctx.setLineDash([3, 3])
@@ -399,6 +402,7 @@ export function CanvasChart({ symbol, tf, chartType, showVolume, showSMA20, show
   }
   const onMouseUp = (e: React.MouseEvent) => {
     // click without drag -> price click (sync limit price to order pad)
+    if (mini) { dragRef.current = null; return }
     const moved = dragRef.current ? Math.abs(e.clientX - dragRef.current.startX) : 99
     if (moved < 4 && onPriceClick) {
       const rect = canvasRef.current!.getBoundingClientRect()

@@ -116,6 +116,45 @@ export interface CopyTradeCfg {
   killSwitch: boolean
 }
 
+// ---- options chain ----
+export interface OptionUnderlyingRow {
+  underlying: string
+  name: string
+  lotSize: number
+  expiries: string[]
+  instrumentType: string
+}
+
+export interface ChainMeta {
+  underlying: string
+  exchange: string
+  spot: number
+  prevClose: number
+  atm: number
+  step: number
+  lotSize: number
+  expiry: string
+  expiries: string[]
+  strikesAvailable: number[]
+}
+
+export interface OptionQuoteCell {
+  symbol: string
+  exists: boolean
+  ltp: number
+  prevClose: number
+  high: number
+  low: number
+  changePct: number
+}
+
+export interface ChainStrikeRow {
+  strike: number
+  offset: number
+  ce: OptionQuoteCell
+  pe: OptionQuoteCell
+}
+
 async function j<T>(res: Response): Promise<T> {
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
@@ -171,9 +210,10 @@ export const api = {
 
   placeOrder: (body: Record<string, unknown>) =>
     fetch('/api/orders', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => j<MasterOrderResult>(r)),
-  squareOffAll: (kill = false) =>
-    fetch('/api/orders/squareoff', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ killSwitch: kill }) }).then(r => j<{ ok: boolean; orders: number; filledLegs: number }>(r)),
-  cancelAll: () => fetch('/api/orders/cancel-all', { method: 'POST' }).then(r => j<{ ok: boolean; cancelled: number }>(r)),
+  squareOffAll: (kill = false, symbols?: string[]) =>
+    fetch('/api/orders/squareoff', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ killSwitch: kill, symbols }) }).then(r => j<{ ok: boolean; orders: number; filledLegs: number }>(r)),
+  cancelAll: (symbols?: string[]) =>
+    fetch('/api/orders/cancel-all', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbols }) }).then(r => j<{ ok: boolean; cancelled: number }>(r)),
   orders: () => fetch('/api/orders').then(r => j<{ orders: AggOrder[] }>(r)),
   positions: () => fetch('/api/positions').then(r => j<{ positions: AggPosition[]; bySymbol: { symbol: string; netQty: number; avgPrice: number; ltp: number; unrealizedPnl: number; accounts: number }[]; totals: { unrealizedPnl: number; realizedPnl: number; openPositions: number } }>(r)),
   trades: () => fetch('/api/trades').then(r => j<{ trades: AggTrade[]; totals: { charges: number; realized: number } }>(r)),
@@ -194,6 +234,16 @@ export const api = {
   quote: (symbol: string) =>
     fetch(`/api/market/quote?symbol=${encodeURIComponent(symbol)}`).then(r => j<{ symbol: string; ltp: number; prevClose: number; bid: number; ask: number; depth: { buys: { price: number; qty: number }[]; sells: { price: number; qty: number }[] } }>(r)),
   status: () => fetch('/api/market/status').then(r => j<{ services: Record<string, string | number>; masterContracts: { count: number; lastSync: string | null }; accounts: number; enabledStrategies: number }>(r)),
+
+  // ---- options chain (strikes panel) ----
+  optionUnderlyings: () =>
+    fetch('/api/options/underlyings').then(r => j<{ underlyings: OptionUnderlyingRow[] }>(r)),
+  optionChain: (underlying: string, expiry: string | null, strikes: number[]) =>
+    fetch(`/api/options/chain?underlying=${encodeURIComponent(underlying)}&expiry=${expiry ? encodeURIComponent(expiry) : ''}&strikes=${strikes.join(',')}`)
+      .then(r => j<{ meta: ChainMeta; rows: ChainStrikeRow[]; atmRow: ChainStrikeRow | null }>(r)),
+  ensureStrike: (underlying: string, strike: number, expiry: string | null) =>
+    fetch('/api/options/ensure-strike', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ underlying, strike, expiry }) })
+      .then(r => j<{ ok: boolean; created: number; symbols: string[] }>(r)),
 }
 
 export function fmtMoney(n: number | null | undefined, dp = 2): string {

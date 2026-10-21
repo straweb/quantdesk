@@ -82,11 +82,20 @@ function nextMonthEnds(count: number): string[] {
   return out
 }
 
-function optionPremium(base: number, strike: number, type: 'CE' | 'PE', days: number): number {
+export function optionPremium(base: number, strike: number, type: 'CE' | 'PE', days: number): number {
   const intrinsic = type === 'CE' ? Math.max(0, base - strike) : Math.max(0, strike - base)
   const moneyness = Math.abs(base - strike) / base
   const tv = base * 0.006 * Math.sqrt(Math.max(1, days) / 14) * Math.exp(-moneyness * 18)
   return Math.max(intrinsic + tv, 0.05)
+}
+
+// NSE-style strike step by underlying price level
+export function strikeStepFor(price: number): number {
+  if (price < 200) return 5
+  if (price < 500) return 10
+  if (price < 1000) return 20
+  if (price < 2500) return 50
+  return 100
 }
 
 export interface SyncResult {
@@ -158,6 +167,24 @@ export async function syncMasterContracts(source: 'SEED' | 'DAILY_SYNC' | 'MANUA
           exchange: 'NFO', instrumentType: t, expiry: exp, strike, optionType: t,
           lotSize: 30, tickSize: 0.05, underlying: 'BANKNIFTY',
           basePrice: optionPremium(base, strike, t, daysTo(exp)),
+        })
+      }
+    }
+  }
+  // --- Stock options (F&O equities): monthly expiry, ATM ±10, price-based step ---
+  for (const e of EQ_UNIVERSE.slice(0, 10)) {
+    const exp = monthly[0]
+    const step = strikeStepFor(e.base)
+    const atm = Math.round(e.base / step) * step
+    for (let k = -10; k <= 10; k++) {
+      const strike = Number((atm + k * step).toFixed(2))
+      for (const t of ['CE', 'PE'] as const) {
+        rows.push({
+          symbol: `${e.symbol}${exp.replaceAll('-', '')}${strike}${t}`,
+          name: `${e.symbol} ${strike} ${t} ${exp}`,
+          exchange: 'NFO', instrumentType: t, expiry: exp, strike, optionType: t,
+          lotSize: e.lot, tickSize: 0.05, underlying: e.symbol,
+          basePrice: optionPremium(e.base, strike, t, daysTo(exp)),
         })
       }
     }

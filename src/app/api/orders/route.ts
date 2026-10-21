@@ -45,6 +45,7 @@ export async function POST(req: NextRequest) {
     strategyId: body.strategyId,
     tag: body.tag,
     reduceOnly: Boolean(body.reduceOnly),
+    capitalPct: body.capitalPct != null ? Math.max(0.01, Math.min(100, Number(body.capitalPct))) : undefined,
   })
   return NextResponse.json(result, { status: result.status === 'FAILED' ? 422 : 200 })
 }

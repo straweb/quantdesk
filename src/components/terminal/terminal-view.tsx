@@ -1,13 +1,15 @@
 'use client'
 
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
 import { useQuery } from '@tanstack/react-query'
-import { Plus, X, Crosshair } from 'lucide-react'
+import { ListTree, FileBox, Plus, X, Crosshair } from 'lucide-react'
 import { CanvasChart } from './chart/canvas-chart'
 import { Watchlist, MarketDepth } from './panels/watchlist'
 import { OrderPad, QuickButtons } from './panels/order-pad'
 import { BottomPanel } from './panels/bottom-panel'
+import { StrikesPanel } from './panels/strikes-panel'
+import { OptionMiniCharts } from './panels/option-mini-charts'
 import { useTerminal } from './lib/store'
 import { api } from './lib/client-api'
 import { TIMEFRAMES } from '@/lib/types'
@@ -22,6 +24,17 @@ export function TerminalView() {
   const setOrderType = useTerminal(s => s.setOrderType)
 
   const { data: posData } = useQuery({ queryKey: ['positions'], queryFn: () => api.positions(), refetchInterval: 2000 })
+
+  // F&O underlyings -> enable the spot+ATM CE/PE mini charts strip
+  const { data: undData } = useQuery({
+    queryKey: ['optionUnderlyings'],
+    queryFn: () => api.optionUnderlyings(),
+    staleTime: 5 * 60_000,
+  })
+  const isFnOUnderlying = useMemo(
+    () => !!ws && (undData?.underlyings ?? []).some(u => u.underlying === ws.symbol),
+    [ws, undData],
+  )
 
   const markers = useMemo(() => {
     if (!ws || !posData) return []
@@ -64,6 +77,11 @@ export function TerminalView() {
             className={`px-1.5 py-0.5 rounded ${ws.showVolume ? 'bg-accent text-foreground' : 'bg-secondary text-muted-foreground'}`}
           >Vol</button>
           <button
+            onClick={() => patchWs(ws.id, { showOptionMinis: !ws.showOptionMinis })}
+            className={`px-1.5 py-0.5 rounded text-[10px] ${ws.showOptionMinis && isFnOUnderlying ? 'bg-accent text-foreground' : 'bg-secondary text-muted-foreground'}`}
+            title="ATM CE/PE mini charts under the spot chart (F&O underlyings)"
+          >ATM</button>
+          <button
             onClick={() => patchWs(ws.id, { showSMA20: !ws.showSMA20 })}
             className={`px-1.5 py-0.5 rounded text-[#4dd0e1] ${ws.showSMA20 ? 'bg-accent' : 'bg-secondary/60'}`}
           >MA20</button>
@@ -91,35 +109,39 @@ export function TerminalView() {
             </div>
           </Panel>
           <Handle />
-          {/* center: chart + bottom */}
+          {/* center: spot chart (+ ATM option minis for F&O) + bottom */}
           <Panel defaultSize={60} minSize={30}>
             <PanelGroup direction="vertical">
-              <Panel defaultSize={68} minSize={25}>
-                <CanvasChart
-                  symbol={ws.symbol}
-                  tf={ws.tf}
-                  chartType={ws.chartType}
-                  showVolume={ws.showVolume}
-                  showSMA20={ws.showSMA20}
-                  showSMA50={ws.showSMA50}
-                  markers={markers}
-                  onPriceClick={p => { setLimitPrice(p); setOrderType('LIMIT') }}
-                  height="h-full"
-                />
+              <Panel defaultSize={isFnOUnderlying ? 56 : 68} minSize={25}>
+                <div className="h-full flex flex-col">
+                  <div className="flex-1 min-h-0">
+                    <CanvasChart
+                      symbol={ws.symbol}
+                      tf={ws.tf}
+                      chartType={ws.chartType}
+                      showVolume={ws.showVolume}
+                      showSMA20={ws.showSMA20}
+                      showSMA50={ws.showSMA50}
+                      markers={markers}
+                      onPriceClick={p => { setLimitPrice(p); setOrderType('LIMIT') }}
+                      height="h-full"
+                    />
+                  </div>
+                  {isFnOUnderlying && ws.showOptionMinis && (
+                    <OptionMiniCharts underlying={ws.symbol} />
+                  )}
+                </div>
               </Panel>
               <Handle vertical />
-              <Panel defaultSize={32} minSize={12}>
+              <Panel defaultSize={isFnOUnderlying ? 44 : 32} minSize={12}>
                 <BottomPanel />
               </Panel>
             </PanelGroup>
           </Panel>
           <Handle />
-          {/* right: order pad */}
+          {/* right: strikes panel / order pad + quick buttons */}
           <Panel defaultSize={23} minSize={16} maxSize={34}>
-            <div className="h-full flex flex-col border-l border-border">
-              <div className="flex-1 overflow-y-auto"><OrderPad /></div>
-              <QuickButtons />
-            </div>
+            <RightDock ws={ws} />
           </Panel>
         </PanelGroup>
       </div>
@@ -164,5 +186,33 @@ function WorkspaceTabs() {
 function Handle({ vertical = false }: { vertical?: boolean }) {
   return (
     <PanelResizeHandle className={vertical ? 'h-px bg-border hover:bg-primary/50 transition-colors' : 'w-px bg-border hover:bg-primary/50 transition-colors'} />
+  )
+}
+
+// Right dock: Strikes panel | Order pad tabs + global quick buttons
+function RightDock({ ws }: { ws: NonNullable<ReturnType<typeof useTerminal.getState>['workspaces'][number]> }) {
+  const [tab, setTab] = useState<'strikes' | 'order'>('strikes')
+
+  return (
+    <div className="h-full flex flex-col border-l border-border">
+      <div className="flex items-center gap-1 px-1.5 py-1 border-b border-border bg-card/30 shrink-0">
+        <button
+          onClick={() => setTab('strikes')}
+          className={`flex items-center gap-1 px-2 py-0.5 rounded text-[10px] ${tab === 'strikes' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
+        >
+          <ListTree className="h-3 w-3" /> Strikes
+        </button>
+        <button
+          onClick={() => setTab('order')}
+          className={`flex items-center gap-1 px-2 py-0.5 rounded text-[10px] ${tab === 'order' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
+        >
+          <FileBox className="h-3 w-3" /> Order Pad
+        </button>
+      </div>
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        {tab === 'strikes' ? <StrikesPanel ws={ws} /> : <OrderPad />}
+      </div>
+      <QuickButtons />
+    </div>
   )
 }

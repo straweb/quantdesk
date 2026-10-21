@@ -44,3 +44,22 @@ Stage Summary:
 - E2E verified: fresh login admin/admin123 OK (:3000 + :81), wrong password shows "Invalid credentials", divergent localStorage reload → ZERO hydration errors, logout→login cycle OK, console clean
 - All fixes are SSR-safe; persisted workspaces rehydrate post-mount (1-frame default flash, acceptable)
 
+---
+Task ID: 3
+Agent: main (Z.ai)
+Task: F&O strikes panel — dynamic strike add (CE/PE ATM±1-5 + specific strike), quick deploy bar (Deploy CE/PE, Cancel CE, PE Swap) with % allocation sizing, strike rows (LTP, day H/L, B/S/X, edit open position), spot chart + default-open ATM CE (left) / PE (right) mini charts.
+
+Work Log:
+- symbol-service: seeded stock options for 10 F&O equities (monthly expiry, price-based strike step via strikeStepFor), exported optionPremium/strikeStepFor; resync grew universe 216→636 symbols, 2544 broker mappings
+- option-service.ts (new): listOptionUnderlyings (12 F&O underlyings), getChainMeta (spot→ATM via min-gap step, expiries, lot), getChainQuotes (batch per-strike CE/PE LTP+H/L+chg), ensureOptionContracts (dynamic master rows + broker mappings + feed universe publication for any user strike)
+- API: /api/options/underlyings, /api/options/chain (?underlying&expiry&strikes, includes atmRow for minis), /api/options/ensure-strike (POST)
+- order-router: capitalPct param → sharePct sizing (per-account % of usable capital); reduceOnly legs now CAPPED at each account's own held qty (never flips flat account short — found live in E2E); squareOffAll + cancelAllOrders accept symbols filter; routes updated
+- strikes-panel.tsx (new, right dock tab): underlying/expiry selectors, Spot/ATM/step/lot bar, CE+PE quick-add rows [-5..ATM..+5], specific-strike input (snaps to step, creates contracts on demand), rows w/ enable toggle + alloc% + strike + offset + LTP + H/L + position badge (L/S lots) + B/S/X + inline editor (position info, Δ lots/leg apply, exit full, remove, per-row alloc%); deploy bar: Deploy CE / Deploy PE (capitalPct per enabled strike), Cancel CE (filtered cancel), PE Swap (square-off CE syms → deploy PE, auto-adds ATM PE if list empty)
+- option-mini-charts.tsx (new): 132px strip under spot chart for F&O underlyings — ATM CE left, ATM PE right, mini-mode CanvasChart (1m, no volume/crosshair/time axis), header shows strike/type/expiry/lot/LTP/chg, click loads option into main chart; ATM follows spot re-keying
+- canvas-chart: added mini prop (thinner axes, fewer ticks, no crosshair/volume/time labels); terminal-view: RightDock tabs (Strikes | Order Pad, QuickButtons always visible), ATM toggle for minis, optionUnderlyings query gates the strip
+- store: WorkspaceCfg.strikes (per-workspace persisted strike list: underlying, expiry, allocPct, rows[]) + showOptionMinis; mkWs defaults
+
+Stage Summary:
+- E2E verified via browser: NIFTY chain (spot 24,499 → ATM 24500 step 50 lot 75), CE ATM + PE +1 add, Deploy CE → 34/6 lots on 2 accounts by house rules, PE Swap → CE flat + PE 1350@87.2, Δ-3/leg reduce capped per account (router fix), Exit full → all flat, dynamic 25200 contracts created+quoted, mini charts live both sides
+- Console clean, no hydration errors, FEED LIVE on gateway path (:81). FEED DOWN on :3000 direct is expected (socket.io proxies only via Caddy XTransformPort)
+

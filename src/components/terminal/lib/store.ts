@@ -6,6 +6,21 @@ import type { Timeframe, OrderSide, OrderTypeKind, ProductType } from '@/lib/typ
 
 export type AppView = 'terminal' | 'admin' | 'strategy'
 
+export interface StrikeRowCfg {
+  id: string // `${strike}:${type}`
+  strike: number
+  type: 'CE' | 'PE'
+  enabled: boolean
+  allocPct: number // % of account usable capital to deploy
+}
+
+export interface StrikesCfg {
+  underlying: string | null
+  expiry: string | null // null = nearest
+  allocPct: number // default per new strike rows
+  rows: StrikeRowCfg[]
+}
+
 export interface WorkspaceCfg {
   id: string
   name: string
@@ -15,6 +30,12 @@ export interface WorkspaceCfg {
   showVolume: boolean
   showSMA20: boolean
   showSMA50: boolean
+  showOptionMinis: boolean
+  strikes?: StrikesCfg
+}
+
+export function defaultStrikes(): StrikesCfg {
+  return { underlying: null, expiry: null, allocPct: 10, rows: [] }
 }
 
 interface TerminalState {
@@ -48,6 +69,7 @@ interface TerminalState {
 
 const mkWs = (id: string, name: string, symbol: string): WorkspaceCfg => ({
   id, name, symbol, tf: '5m', chartType: 'candles', showVolume: true, showSMA20: false, showSMA50: false,
+  showOptionMinis: true, strikes: defaultStrikes(),
 })
 
 export const useTerminal = create<TerminalState>()(

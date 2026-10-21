@@ -82,9 +82,21 @@ export async function placeMasterOrder(req: PlaceOrderRequest): Promise<MasterOr
     // --- per-account qty sizing (house capital rules) ---
     // reduceOnly legs (exits/square-offs) bypass capital checks entirely —
     // closing a position reduces risk and must never be blocked.
+    // They are also capped at each account's OWN held qty so a reduce
+    // never flips a flat/short account into an unintended position.
     let qtyUnitsOrLots = req.qty
     if (req.reduceOnly) {
-      qtyUnitsOrLots = req.qty
+      const posNow = getPositions(acc.brokerType, acc.id).find(p => p.symbol === inst.masterSymbol && p.exchange === inst.exchange && p.productType === req.productType)
+      const heldLots = posNow
+        ? (req.side === 'SELL'
+            ? (posNow.netQty > 0 ? Math.floor(posNow.netQty / inst.lotSize) : 0)
+            : (posNow.netQty < 0 ? Math.floor(-posNow.netQty / inst.lotSize) : 0))
+        : 0
+      qtyUnitsOrLots = Math.min(req.qty, heldLots)
+      if (qtyUnitsOrLots <= 0) {
+        legs.push({ accountId: acc.id, accountLabel: acc.label, brokerType: acc.brokerType, brokerOrderId: null, status: 'SKIPPED', qty: 0, message: 'No position to reduce' })
+        continue
+      }
     } else if (req.source === 'MANUAL' || req.source === 'STRATEGY' || req.source === 'API') {
       const capital = await getCapitalState(acc.id)
       if (!capital) {
@@ -94,7 +106,7 @@ export async function placeMasterOrder(req: PlaceOrderRequest): Promise<MasterOr
       const usable = computeUsableCapital(capital)
       const sized = sizeUnitsForCapital({
         usable, price: ltp, instrumentType: inst.instrumentType, productType: req.productType,
-        lotSize: inst.lotSize, sharePct: 100, absoluteAmount: req.tag?.startsWith('abs:') ? Number(req.tag.slice(4)) : undefined,
+        lotSize: inst.lotSize, sharePct: req.capitalPct ?? 100, absoluteAmount: req.tag?.startsWith('abs:') ? Number(req.tag.slice(4)) : undefined,
         roundToLot: inst.instrumentType !== 'EQ',
       })
       if (req.qty > 0) {
@@ -143,7 +155,7 @@ export async function placeMasterOrder(req: PlaceOrderRequest): Promise<MasterOr
     } else {
       const generated = adapter.mapSymbol({ symbol: inst.masterSymbol, exchange: inst.exchange, instrumentType: inst.instrumentType, expiry: null, strike: null, optionType: null })
       ctx.symbolMap.brokerSymbol = generated.brokerSymbol
-      ctx.symbolMap.brokerToken = generated.brokerToken
+      ctx.symbolMap.brokerToken = generated.brokerToken ?? undefined
     }
     const { decryptJson } = await import('../crypto')
     ctx.credentials = decryptJson(acc.credentialsEnc)
@@ -213,11 +225,15 @@ function latestTradeFor(brokerType: string, accountId: string, brokerOrderId?: s
   return getTrades(brokerType, accountId, 50).find(t => t.orderId === brokerOrderId)
 }
 
-export async function squareOffAll(source: 'SQUAREOFF' | 'KILLSWITCH' = 'SQUAREOFF'): Promise<MasterOrderResult[]> {
+export async function squareOffAll(
+  source: 'SQUAREOFF' | 'KILLSWITCH' = 'SQUAREOFF',
+  filter?: { symbols?: string[] },
+): Promise<MasterOrderResult[]> {
+  const only = filter?.symbols && filter.symbols.length > 0 ? new Set(filter.symbols) : null
   const accounts = await getExecutableAccounts()
   const results: MasterOrderResult[] = []
   for (const acc of accounts) {
-    const positions = getPositions(acc.brokerType, acc.id).filter(p => p.netQty !== 0)
+    const positions = getPositions(acc.brokerType, acc.id).filter(p => p.netQty !== 0 && (!only || only.has(p.symbol)))
     for (const p of positions) {
       const res = await placeMasterOrder({
         symbol: p.symbol,
@@ -243,7 +259,8 @@ export async function squareOffAll(source: 'SQUAREOFF' | 'KILLSWITCH' = 'SQUAREO
   return results
 }
 
-export async function cancelAllOrders(): Promise<number> {
+export async function cancelAllOrders(symbolFilter?: string[]): Promise<number> {
+  const only = symbolFilter && symbolFilter.length > 0 ? new Set(symbolFilter) : null
   const accounts = await getExecutableAccounts()
   let cancelled = 0
   for (const acc of accounts) {
@@ -251,6 +268,7 @@ export async function cancelAllOrders(): Promise<number> {
     if (!adapter) continue
     const { getOpenOrders } = await import('../../../brokers/database')
     for (const o of getOpenOrders(acc.brokerType, acc.id)) {
+      if (only && !only.has(o.symbol)) continue
       const ctx: LegContext = {
         accountId: acc.id, accountLabel: acc.label, brokerType: acc.brokerType, credentials: null,
         order: { side: o.side, qty: o.qty, orderType: o.orderType, productType: o.productType, masterOrderId: o.masterOrderId ?? '', source: 'KILLSWITCH' },
