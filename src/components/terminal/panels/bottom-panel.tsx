@@ -2,13 +2,15 @@
 
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, fmtInr, fmtTime, fmtDateTime } from '../lib/client-api'
+import type { AggOrder, AggTrade, AggPosition, FundRow } from '../lib/client-api'
 import { useTerminal } from '../lib/store'
+import { useSyncChannel, type SyncCore } from '../lib/sync'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { Pencil, RefreshCw, Repeat, Rocket, X } from 'lucide-react'
+import { Pencil, RefreshCw, Repeat, Rocket, X, ChevronsDownUp, ChevronsUpDown } from 'lucide-react'
 
 const HEAD = 'text-[9px] uppercase tracking-wide text-muted-foreground'
 
@@ -19,30 +21,83 @@ const HEAD = 'text-[9px] uppercase tracking-wide text-muted-foreground'
 //    open the opposite side) · Edit (Δ lots per account) · Exit
 //  · Orders — Edit (re-price/qty, open only) · Cancel (open) ·
 //    Repeat / Retry (filled, failed, cancelled)
+// Tab labels carry SESSION counts (open/total, e.g. "1/5").
+// Data arrives over the websocket sync hub (sync:core, 1s) — the
+// REST queries only run as a fallback when the socket is dark.
+// The whole dock collapses to a slim bar (chevron button).
 // ============================================================
+
+const isOpenOrder = (s: string) => s === 'OPEN' || s === 'PENDING'
 
 export function BottomPanel() {
   const tab = useTerminal(s => s.bottomTab)
   const setTab = useTerminal(s => s.setBottomTab)
+  const collapsed = useTerminal(s => s.bottomCollapsed)
+  const setCollapsed = useTerminal(s => s.setBottomCollapsed)
+  const core = useSyncChannel<SyncCore>('sync:core')
+
+  const openOrders = core ? core.orders.filter(o => isOpenOrder(o.status)).length : null
+  const totOrders = core?.orders.length ?? null
+  const openPos = core?.positions.filter(p => p.netQty !== 0).length ?? null
+  const totPos = core?.positions.length ?? null // open + touched today (hub includes realized rows)
+  const totTrades = core?.session.trades ?? null
+
+  const count = (n: number | null, d: number | null) =>
+    n == null ? '' : <span className="ml-1 tabular text-[9px] text-muted-foreground">{d != null ? `${n}/${d}` : n}</span>
+
+  if (collapsed) {
+    return (
+      <div className="flex h-full items-center gap-2 px-2 bg-card/60 border-t border-border text-[10px] overflow-x-auto">
+        <span className="font-bold text-[9px] uppercase tracking-wide text-muted-foreground shrink-0">Session</span>
+        <span className="tabular shrink-0">ORD {openOrders ?? '—'}{totOrders != null ? `/${totOrders}` : ''}</span>
+        <span className="tabular shrink-0">POS {openPos ?? '—'}{totPos != null ? `/${totPos}` : ''}</span>
+        {core && <span className={`tabular shrink-0 ${core.session.net >= 0 ? 'term-up' : 'term-down'}`}>{core.session.net >= 0 ? '+' : ''}{core.session.net.toFixed(0)}₹</span>}
+        {core && <span className={`tabular shrink-0 ${core.session.pts >= 0 ? 'term-up' : 'term-down'}`}>{core.session.pts >= 0 ? '+' : ''}{core.session.pts.toFixed(1)}pts</span>}
+        <div className="flex-1" />
+        {(['orders', 'trades', 'positions', 'funds', 'logs'] as const).map(k => (
+          <button
+            key={k}
+            onClick={() => { setTab(k); setCollapsed(false) }}
+            className={`px-1.5 py-0.5 rounded text-[9px] shrink-0 ${tab === k ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+          >{k === 'trades' ? 'TRD' : k === 'positions' ? 'POS' : k === 'orders' ? 'ORD' : k === 'funds' ? 'FUND' : 'LOG'}</button>
+        ))}
+        <button
+          onClick={() => setCollapsed(false)}
+          title="Expand the bottom panel"
+          className="p-1 rounded shrink-0 text-muted-foreground hover:text-foreground"
+        >
+          <ChevronsUpDown className="h-3 w-3" />
+        </button>
+      </div>
+    )
+  }
 
   return (
     <div className="flex h-full flex-col bg-card/40">
       <div className="flex items-center gap-1 px-2 pt-1 border-b border-border">
         {([
-          ['orders', 'Orders'],
-          ['trades', 'Trade Book'],
-          ['positions', 'Positions'],
-          ['funds', 'Funds'],
-          ['logs', 'Broker Logs'],
-        ] as const).map(([k, label]) => (
+          ['orders', 'Orders', count(openOrders ?? 0, totOrders) as React.ReactNode],
+          ['trades', 'Trade Book', count(totTrades, null) as React.ReactNode],
+          ['positions', 'Positions', count(openPos ?? 0, totPos) as React.ReactNode],
+          ['funds', 'Funds', null],
+          ['logs', 'Broker Logs', null],
+        ] as const).map(([k, label, cnt]) => (
           <button
             key={k}
             onClick={() => setTab(k)}
             className={`px-3 py-1.5 text-[10px] rounded-t ${tab === k ? 'bg-card text-foreground border-x border-t border-border -mb-px' : 'text-muted-foreground hover:text-foreground'}`}
           >
-            {label}
+            {label}{cnt}
           </button>
         ))}
+        <div className="flex-1" />
+        <button
+          onClick={() => setCollapsed(true)}
+          title="Collapse the bottom panel (counts stay visible in the slim bar)"
+          className="p-1 rounded text-muted-foreground hover:text-foreground mb-1"
+        >
+          <ChevronsDownUp className="h-3 w-3" />
+        </button>
       </div>
       <div className="flex-1 overflow-auto">
         {tab === 'orders' && <OrdersTable />}
@@ -99,8 +154,9 @@ function useOrderActions() {
 // ---------------- orders ----------------
 
 function OrdersTable() {
-  const { data } = useQuery({ queryKey: ['orders'], queryFn: () => api.orders(), refetchInterval: 2500 })
-  const rows = data?.orders ?? []
+  const sync = useSyncChannel<SyncCore>('sync:core')
+  const { data } = useQuery({ queryKey: ['orders'], queryFn: () => api.orders(), enabled: !sync, refetchInterval: 2500 })
+  const rows: AggOrder[] = sync ? (sync.orders as unknown as AggOrder[]) : (data?.orders ?? [])
   const { place, refresh } = useOrderActions()
   const [editing, setEditing] = useState<string | null>(null)
 
@@ -219,8 +275,9 @@ function OrderEditInline({ order, onDone, onCancelReplace }: {
 // ---------------- trades ----------------
 
 function TradesTable() {
-  const { data } = useQuery({ queryKey: ['trades'], queryFn: () => api.trades(), refetchInterval: 3000 })
-  const rows = data?.trades ?? []
+  const sync = useSyncChannel<SyncCore>('sync:core')
+  const { data } = useQuery({ queryKey: ['trades'], queryFn: () => api.trades(), enabled: !sync, refetchInterval: 3000 })
+  const rows: AggTrade[] = sync ? (sync.trades as unknown as AggTrade[]) : (data?.trades ?? [])
   if (rows.length === 0) return <Empty text="No executed trades yet" />
   return (
     <table className="w-full text-[10px] tabular">
@@ -252,9 +309,17 @@ function TradesTable() {
 // ---------------- positions ----------------
 
 function PositionsTable() {
-  const { data } = useQuery({ queryKey: ['positions'], queryFn: () => api.positions(), refetchInterval: 1500 })
-  const rows = (data?.positions ?? []).filter(p => p.netQty !== 0)
-  const totals = data?.totals
+  const sync = useSyncChannel<SyncCore>('sync:core')
+  const { data } = useQuery({ queryKey: ['positions'], queryFn: () => api.positions(), enabled: !sync, refetchInterval: 1500 })
+  const allPos: AggPosition[] = sync ? (sync.positions as unknown as AggPosition[]) : (data?.positions ?? [])
+  const rows = allPos.filter(p => p.netQty !== 0)
+  const totals = sync
+    ? {
+        openPositions: rows.length,
+        unrealizedPnl: rows.reduce((s, p) => s + p.unrealizedPnl, 0),
+        realizedPnl: rows.reduce((s, p) => s + p.realizedPnl, 0),
+      }
+    : data?.totals
   const { place, squareOff } = useOrderActions()
   const [editing, setEditing] = useState<string | null>(null)
 
@@ -373,8 +438,9 @@ function PositionEditInline({ lots, onDone, onApply }: {
 // ---------------- funds / logs ----------------
 
 function FundsTable() {
-  const { data } = useQuery({ queryKey: ['funds'], queryFn: () => api.funds(), refetchInterval: 4000 })
-  const rows = data?.funds ?? []
+  const sync = useSyncChannel<SyncCore>('sync:core')
+  const { data } = useQuery({ queryKey: ['funds'], queryFn: () => api.funds(), enabled: !sync, refetchInterval: 4000 })
+  const rows: FundRow[] = sync ? (sync.funds as unknown as FundRow[]) : (data?.funds ?? [])
   return (
     <table className="w-full text-[10px] tabular">
       <thead className={`${HEAD} sticky top-0 bg-card/95`}>

@@ -275,6 +275,69 @@ export const api = {
   // ---- live broker API access (order book of a real broker account) ----
   brokerOrderBook: (accountId: string) =>
     fetch(`/api/broker-orderbook?accountId=${encodeURIComponent(accountId)}`).then(r => j<{ orders: BrokerBookRow[]; live: boolean; message?: string }>(r)),
+
+  // ---- portfolio / GTT / margin (dashboard) ----
+  portfolio: () => fetch('/api/portfolio').then(r => j<PortfolioResp>(r)),
+  gttRules: () => fetch('/api/gtt').then(r => j<{ rules: GttRuleRow[] }>(r)),
+  createGtt: (body: Record<string, unknown>) =>
+    fetch('/api/gtt', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => j<{ ok: boolean; rule: GttRuleRow }>(r)),
+  patchGtt: (id: string, body: Record<string, unknown>) =>
+    fetch(`/api/gtt/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => j<{ ok: boolean; rule: GttRuleRow }>(r)),
+  deleteGtt: (id: string) => fetch(`/api/gtt/${id}`, { method: 'DELETE' }).then(r => j<{ ok: boolean }>(r)),
+  marginCalc: (body: { accountId: string; symbol: string; side: string; qty: number; price: number; productType?: string }) =>
+    fetch('/api/margin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => j<MarginResp>(r)),
+}
+
+// ---- dashboard types ----
+
+export interface PortfolioHolding {
+  symbol: string
+  qty: number
+  avgPrice: number
+  ltp: number
+  pnl: number
+  value: number
+}
+
+export interface PortfolioAccount {
+  accountId: string
+  accountLabel: string
+  brokerType: string
+  live: boolean
+  holdings: PortfolioHolding[]
+  message?: string
+}
+
+export interface PortfolioResp {
+  portfolio: PortfolioAccount[]
+  positions: { accountId: string; accountLabel: string; symbol: string; netQty: number; avgPrice: number; ltp: number; lotSize: number }[]
+  ts: string
+}
+
+export interface GttRuleRow {
+  id: string
+  name: string
+  symbol: string
+  exchange: string
+  side: 'BUY' | 'SELL'
+  qty: number
+  trigger: 'ABOVE' | 'BELOW'
+  triggerPrice: number
+  orderType: 'LIMIT' | 'MARKET'
+  productType: string
+  repeatDaily: boolean
+  armed: boolean
+  lastTriggeredAt?: string
+  lastStatus?: string
+  lastMessage?: string
+  createdAt: string
+}
+
+export interface MarginResp {
+  estimate?: { required: number; available?: number; span?: number; exposure?: number; leverage?: number; detail?: string } | null
+  usable?: number
+  live?: boolean
+  error?: string
 }
 
 export interface AutoRuleRow {
@@ -282,12 +345,15 @@ export interface AutoRuleRow {
   name: string
   underlying: string
   expiry: string | null
-  kind: 'INDEX' | 'INDEX_RANGE' | 'TIME'
+  kind: 'INDEX' | 'INDEX_RANGE' | 'TIME' | 'COMPOUND'
   level?: number
   cross?: 'ABOVE' | 'BELOW'
   lo?: number
   hi?: number
   time?: string
+  entryOp?: 'LTE' | 'GTE' | 'RANGE'
+  entryLo?: number
+  entryHi?: number
   action: 'BUY' | 'SELL' | 'DEPLOY' | 'CANCEL'
   optType: 'CE' | 'PE'
   offset: number

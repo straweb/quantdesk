@@ -12,6 +12,7 @@ import {
   useTerminal, defaultStrikes, pinStrikePanes,
   type StrikesCfg, type StrikeRowCfg, type WorkspaceCfg, type AllocMode,
 } from '../lib/store'
+import { useSyncChannel, useSyncData, mergeChain, type SyncCore, type SyncChainResp } from '../lib/sync'
 
 // ============================================================
 // F&O Strikes panel (right dock tab) — compact build.
@@ -78,12 +79,18 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
   const underlying = st.underlying
   const strikesParam = useMemo(() => [...new Set(st.rows.map(r => r.strike))].sort((a, b) => a - b), [st.rows])
 
-  const { data: chainData, refetch: refetchChain } = useQuery({
+  const { data: chainRest, refetch: refetchChain } = useQuery({
     queryKey: ['optionChain', underlying, st.expiry, strikesParam.join(',')],
     queryFn: () => api.optionChain(underlying!, st.expiry, strikesParam),
     enabled: !!underlying,
-    refetchInterval: 1000,
+    refetchInterval: 8000, // backup only — realtime quotes arrive via sync:chain (1s)
   })
+  const chainSync = useSyncData<SyncChainResp>(
+    'sync:chain',
+    d => !!d && (d as { meta?: { underlying?: string } }).meta?.underlying === underlying,
+    underlying ? { chains: [{ underlying, expiry: st.expiry ?? null }] } : undefined,
+  )
+  const chainData = mergeChain(chainSync, chainRest)
   const meta = chainData?.meta ?? null
   const rowByStrike = useMemo(() => {
     const m = new Map<number, ChainStrikeRow>()
@@ -105,18 +112,33 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
     })()
   }, [underlying, meta, st.rows.length]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const { data: posData } = useQuery({ queryKey: ['positions'], queryFn: () => api.positions(), refetchInterval: 2000 })
+  // positions via the sync hub (fallback REST) — aggregated per symbol
+  const core = useSyncChannel<SyncCore>('sync:core')
+  const { data: posData } = useQuery({ queryKey: ['positions'], queryFn: () => api.positions(), enabled: !core, refetchInterval: 2000 })
   const posBySymbol = useMemo(() => {
     const m = new Map<string, { netQty: number; avgPrice: number; unrealizedPnl: number; realizedPnl: number }>()
-    for (const p of posData?.bySymbol ?? []) {
-      m.set(p.symbol, { netQty: p.netQty, avgPrice: p.avgPrice, unrealizedPnl: p.unrealizedPnl, realizedPnl: (p as unknown as { realizedPnl?: number }).realizedPnl ?? 0 })
+    const put = (sym: string, netQty: number, avgPrice: number, unreal: number, realized: number) => {
+      const cur = m.get(sym)
+      if (!cur) { m.set(sym, { netQty, avgPrice, unrealizedPnl: unreal, realizedPnl: realized }); return }
+      const totQty = Math.abs(cur.netQty) + Math.abs(netQty)
+      cur.avgPrice = totQty > 0 ? (cur.avgPrice * Math.abs(cur.netQty) + avgPrice * Math.abs(netQty)) / totQty : avgPrice
+      cur.netQty += netQty
+      cur.unrealizedPnl += unreal
+      cur.realizedPnl += realized
+    }
+    if (core) {
+      for (const p of core.positions) put(p.symbol, p.netQty, p.avgPrice, p.unrealizedPnl, p.realizedPnl)
+    } else {
+      for (const p of posData?.bySymbol ?? []) {
+        put(p.symbol, p.netQty, p.avgPrice, p.unrealizedPnl, (p as unknown as { realizedPnl?: number }).realizedPnl ?? 0)
+      }
     }
     return m
-  }, [posData])
+  }, [core, posData])
 
   // ---- PnL rollup: per account / per side / total (unrealized + realized) ----
   const pnl = useMemo(() => {
-    const positions = posData?.positions ?? []
+    const positions = core ? core.positions : (posData?.positions ?? [])
     let totalU = 0, totalR = 0
     const byAccount = new Map<string, { label: string; u: number; r: number }>()
     for (const p of positions) {
@@ -128,7 +150,7 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
       byAccount.set(p.accountId, a)
     }
     return { totalU, totalR, byAccount }
-  }, [posData])
+  }, [core, posData])
   const sidePnl = (type: 'CE' | 'PE') => {
     let u = 0
     for (const row of st.rows.filter(r => r.type === type && r.enabled)) {

@@ -14,6 +14,7 @@ import {
   useTerminal, wsLayout, wsPanes, unpinPane, defaultStrikes, addDepthPanelTo,
   type PaneCfg, type WorkspaceCfg,
 } from '../lib/store'
+import { useSyncData, mergeChain, type SyncChainResp } from '../lib/sync'
 
 // ============================================================
 // Multi-pane chart region for F&O workspaces — fully resizable
@@ -111,13 +112,22 @@ export function OptionPane({ ws, kind }: { ws: WorkspaceCfg; kind: PaneCfg['key'
   const pinned = pane.strike
   const type: 'CE' | 'PE' = kind === 'pe' ? 'PE' : kind === 'ce' ? 'CE' : (pane.type ?? 'CE')
 
-  const { data, isLoading, isError } = useQuery({
+  // chain: realtime via sync:chain (1s) + REST backup merged for far strikes
+  const { data: restChain } = useQuery({
     queryKey: ['optionPane', underlying, expiry, kind, pinned ?? 0],
     queryFn: () => api.optionChain(underlying!, expiry, pinned ? [pinned] : []),
     enabled: !!underlying,
-    refetchInterval: 2000,
+    refetchInterval: 8000,
     retry: false,
   })
+  const chainSync = useSyncData<SyncChainResp>(
+    'sync:chain',
+    d => !!d && (d as { meta?: { underlying?: string } }).meta?.underlying === underlying,
+    underlying ? { chains: [{ underlying, expiry: expiry ?? null }] } : undefined,
+  )
+  const data = mergeChain(chainSync, restChain ?? null)
+  const isLoading = !data
+  const isError = !data && !!underlying && !!restChain
   const meta = data?.meta ?? null
 
   const cell: (OptionQuoteCell & { strike: number }) | null = useMemo(() => {
@@ -152,6 +162,7 @@ export function OptionPane({ ws, kind }: { ws: WorkspaceCfg; kind: PaneCfg['key'
             showEMA={ws.showEMA} showVWAP={ws.showVWAP} showBOLL={ws.showBOLL}
             showRSI={ws.showRSI} showMACD={ws.showMACD}
             showGhost={ws.showGhost} ghostStyle={ws.ghostStyle} scales={ws.scales}
+            settingsKey={`${ws.id}:extra`}
             height="h-full"
           />
         </div>
@@ -228,6 +239,7 @@ export function OptionPane({ ws, kind }: { ws: WorkspaceCfg; kind: PaneCfg['key'
         showRSI={ws.showRSI}
         showMACD={ws.showMACD}
         showGhost={ws.showGhost} ghostStyle={ws.ghostStyle} scales={ws.scales}
+        settingsKey={`${ws.id}:${kind}`}
         height="h-full"
       />
     )

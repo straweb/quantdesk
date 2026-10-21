@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { Bot, Clock3, Gauge, Trash2, Webhook } from 'lucide-react'
+import { Bot, Clock3, Gauge, Layers, Trash2, Webhook } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
@@ -11,20 +11,25 @@ import { api, fmtTime } from '../lib/client-api'
 import type { WorkspaceCfg } from '../lib/store'
 
 // ============================================================
-// Auto bot (right dock "Auto" tab) — rule builder v2.
-//  · Trigger: TIME (HH:MM:SS, seconds precision — server ticks 250ms)
-//    | INDEX (cross above/below a level) | RANGE (spot enters [lo, hi])
-//  · Action: BUY / SELL a CE/PE, DEPLOY a whole side's strike list,
-//    or CANCEL pending orders of that side
-//  · Strikes: side-ATM + offset, or a user-picked set from the
-//    workspace's strike rows (each with its own alloc %)
-//  · Optional price legs (any subset): entry (LIMIT), stop-loss
-//    (reduce-only SL-M), target (reduce-only LIMIT)
+// Auto bot (right dock "Auto" tab) — rule builder v3.
+// COMPOUND triggers: enable any mix of
+//   · TIME     — at HH:MM:SS IST (seconds precision)
+//   · RANGE    — index price inside [lo, hi]
+//   · PREMIUM  — the option's own price ≤ x / in lo–hi / ≥ x
+//   (delta/gamma move the premium even when the index is low —
+//   the premium condition is checked per strike at fire time)
+// ALL enabled conditions must be true at the same 250ms tick.
+// Time rules wait inside a 5-min grace window until the other
+// conditions align (2s when time is the only condition).
+// Actions: BUY / SELL / DEPLOY side list / CANCEL side orders.
+// Strikes: ATM ± 1..5 button row, or a picked set from the
+// workspace strike rows (each with its own alloc %).
+// Optional order legs (any subset): entry LIMIT ₹, SL, TGT.
 // Rules run server-side — they fire even when the terminal is closed.
 // ============================================================
 
-type Kind = 'TIME' | 'INDEX' | 'INDEX_RANGE'
 type Action = 'BUY' | 'SELL' | 'DEPLOY' | 'CANCEL'
+type PremiumMode = 'LTE' | 'RANGE' | 'GTE'
 
 export function AutoPanel({ ws }: { ws: WorkspaceCfg }) {
   const qc = useQueryClient()
@@ -38,14 +43,19 @@ export function AutoPanel({ ws }: { ws: WorkspaceCfg }) {
   const rules = data?.rules ?? []
   const defaultUnderlying = ws.strikes?.underlying ?? (unds.some(u => u.underlying === ws.symbol) ? ws.symbol : unds[0]?.underlying ?? '')
 
-  // create-form state
-  const [kind, setKind] = useState<Kind>('TIME')
-  const [underlying, setUnderlying] = useState(defaultUnderlying)
-  const [level, setLevel] = useState('')
-  const [cross, setCross] = useState<'ABOVE' | 'BELOW'>('ABOVE')
+  // ---- conditions (any mix — at least one) ----
+  const [useTime, setUseTime] = useState(true)
+  const [useRange, setUseRange] = useState(false)
+  const [usePremium, setUsePremium] = useState(false)
+  const [time, setTime] = useState('09:30:00')
   const [lo, setLo] = useState('')
   const [hi, setHi] = useState('')
-  const [time, setTime] = useState('09:30:00')
+  const [pmode, setPmode] = useState<PremiumMode>('LTE')
+  const [pLo, setPLo] = useState('')
+  const [pHi, setPHi] = useState('')
+
+  // ---- action + strikes ----
+  const [underlying, setUnderlying] = useState(defaultUnderlying)
   const [action, setAction] = useState<Action>('BUY')
   const [optType, setOptType] = useState<'CE' | 'PE'>('CE')
   const [offset, setOffset] = useState(0)
@@ -78,26 +88,33 @@ export function AutoPanel({ ws }: { ws: WorkspaceCfg }) {
 
   const create = async () => {
     if (!effUnderlying) { toast.error('Pick an F&O underlying'); return }
-    if (kind === 'INDEX' && !level) { toast.error('Enter the index level'); return }
-    if (kind === 'INDEX_RANGE' && (!lo || !hi)) { toast.error('Enter the range low and high'); return }
-    if (kind === 'TIME' && !/^\d{1,2}:\d{2}(:\d{2})?$/.test(time)) { toast.error('Time must be HH:MM or HH:MM:SS'); return }
+    if (!useTime && !useRange && !usePremium) { toast.error('Enable at least one condition (time / range / premium)'); return }
+    if (useTime && !/^\d{1,2}:\d{2}(:\d{2})?$/.test(time)) { toast.error('Time must be HH:MM or HH:MM:SS'); return }
+    if (useRange && (!lo || !hi)) { toast.error('Enter the index range low and high'); return }
+    if (usePremium && pmode === 'LTE' && !pHi) { toast.error('Premium ≤: enter the max price'); return }
+    if (usePremium && pmode === 'GTE' && !pLo) { toast.error('Premium ≥: enter the min price'); return }
+    if (usePremium && pmode === 'RANGE' && (!pLo || !pHi)) { toast.error('Premium range: enter lo and hi'); return }
     if (pickStrikes && Object.keys(picked).length === 0) { toast.error('Pick at least one strike (or switch to ATM mode)'); return }
     const strikes = pickStrikes ? pickedList() : undefined
-    const name = `${action} ${optType}${strikes?.length ? ` ×${strikes.length}` : offset ? (offset > 0 ? ` +${offset}` : ` ${offset}`) : ' ATM'} ${
-      kind === 'TIME' ? `@ ${time}` : kind === 'INDEX' ? `@ ${cross.toLowerCase()} ${level}` : `in ${lo}-${hi}`
-    }${entryPrice ? ` · e${entryPrice}` : ''}${stopLoss ? ` · sl${stopLoss}` : ''}${target ? ` · t${target}` : ''}`
+    const condTxt = [
+      useTime ? `@ ${time}` : null,
+      useRange ? `idx ${lo}-${hi}` : null,
+      usePremium ? `prem ${pmode === 'LTE' ? `≤${pHi}` : pmode === 'GTE' ? `≥${pLo}` : `${pLo}-${pHi}`}` : null,
+    ].filter(Boolean).join(' + ')
+    const name = `${action} ${optType}${strikes?.length ? ` ×${strikes.length}` : offset ? (offset > 0 ? ` +${offset}` : ` ${offset}`) : ' ATM'} ${condTxt}${entryPrice ? ` · e${entryPrice}` : ''}${stopLoss ? ` · sl${stopLoss}` : ''}${target ? ` · t${target}` : ''}`
     setBusy(true)
     try {
       await api.createAutoRule({
         name,
         underlying: effUnderlying,
         expiry: ws.strikes?.expiry ?? null,
-        kind,
-        level: kind === 'INDEX' ? Number(level) : undefined,
-        cross: kind === 'INDEX' ? cross : undefined,
-        lo: kind === 'INDEX_RANGE' ? Number(lo) : undefined,
-        hi: kind === 'INDEX_RANGE' ? Number(hi) : undefined,
-        time: kind === 'TIME' ? time : undefined,
+        kind: 'COMPOUND', // server derives the final kind from enabled conditions
+        time: useTime ? time : undefined,
+        lo: useRange ? Number(lo) : undefined,
+        hi: useRange ? Number(hi) : undefined,
+        entryOp: usePremium ? pmode : undefined,
+        entryLo: usePremium && (pmode === 'RANGE' || pmode === 'GTE') ? Number(pLo) : undefined,
+        entryHi: usePremium && (pmode === 'RANGE' || pmode === 'LTE') ? Number(pHi) : undefined,
         action, optType, offset, allocPct,
         strikes,
         entryPrice: entryPrice ? Number(entryPrice) : undefined,
@@ -108,7 +125,7 @@ export function AutoPanel({ ws }: { ws: WorkspaceCfg }) {
       })
       await qc.invalidateQueries({ queryKey: ['autorules'] })
       toast.success('Auto rule armed')
-      setLevel(''); setLo(''); setHi('')
+      setLo(''); setHi(''); setPLo(''); setPHi('')
     } catch (e) { toast.error(e instanceof Error ? e.message : 'Create failed') }
     setBusy(false)
   }
@@ -140,58 +157,66 @@ export function AutoPanel({ ws }: { ws: WorkspaceCfg }) {
           <Bot className="h-3 w-3 text-primary" />
           <span className="text-[10px] font-bold uppercase tracking-wide">Auto bot</span>
           <div className="flex-1" />
-          {(['TIME', 'INDEX', 'INDEX_RANGE'] as Kind[]).map(k => (
-            <button key={k} onClick={() => setKind(k)} className={btn(kind === k)}>
-              {k === 'TIME' ? 'Time' : k === 'INDEX' ? 'Index' : 'Range'}
-            </button>
-          ))}
+          {/* condition chips — any mix */}
+          <button onClick={() => setUseTime(!useTime)} className={btn(useTime)} title="At a specific time (HH:MM:SS IST)">Time</button>
+          <button onClick={() => setUseRange(!useRange)} className={btn(useRange)} title="Index price inside a range">Range</button>
+          <button onClick={() => setUsePremium(!usePremium)} className={btn(usePremium)} title="Option premium condition (delta/gamma aware)">Premium</button>
         </div>
 
-        <div className="flex gap-1">
-          <select value={effUnderlying} onChange={e => setUnderlying(e.target.value)} className={`${sel} flex-1 min-w-0`}>
+        {/* condition inputs */}
+        <div className="flex gap-1 items-center flex-wrap">
+          <select value={effUnderlying} onChange={e => setUnderlying(e.target.value)} className={`${sel} min-w-0 flex-1`} title="Underlying">
             {unds.map(u => <option key={u.underlying} value={u.underlying}>{u.underlying}</option>)}
           </select>
-          {kind === 'INDEX' && (
-            <>
-              <button onClick={() => setCross(cross === 'ABOVE' ? 'BELOW' : 'ABOVE')} className={btn(cross === 'ABOVE')} title="Cross direction">
-                {cross === 'ABOVE' ? '≥' : '≤'}
-              </button>
-              <Input
-                value={level}
-                onChange={e => setLevel(e.target.value.replace(/[^0-9.]/g, ''))}
-                placeholder="index level"
-                className="h-6 w-[68px] text-[10px] tabular bg-secondary/60"
-              />
-            </>
-          )}
-          {kind === 'INDEX_RANGE' && (
-            <>
-              <Input value={lo} onChange={e => setLo(e.target.value.replace(/[^0-9.]/g, ''))} placeholder="lo" className="h-6 w-[52px] text-[10px] tabular bg-secondary/60" />
-              <span className="text-muted-foreground text-[9px] self-center">–</span>
-              <Input value={hi} onChange={e => setHi(e.target.value.replace(/[^0-9.]/g, ''))} placeholder="hi" className="h-6 w-[52px] text-[10px] tabular bg-secondary/60" />
-            </>
-          )}
-          {kind === 'TIME' && (
+          {useTime && (
             <Input
               value={time}
               onChange={e => setTime(e.target.value.replace(/[^0-9:]/g, ''))}
               placeholder="HH:MM:SS"
-              className="h-6 w-[84px] text-[10px] tabular bg-secondary/60"
-              title="Fires at this IST time (seconds precision)"
+              className="h-6 w-[78px] text-[10px] tabular bg-secondary/60"
+              title="Fires at this IST time (seconds precision). Combined rules wait up to 5 min for the other conditions."
             />
           )}
+          {useRange && (
+            <>
+              <Input value={lo} onChange={e => setLo(e.target.value.replace(/[^0-9.]/g, ''))} placeholder="idx lo" className="h-6 w-[54px] text-[10px] tabular bg-secondary/60" />
+              <span className="text-muted-foreground text-[9px]">–</span>
+              <Input value={hi} onChange={e => setHi(e.target.value.replace(/[^0-9.]/g, ''))} placeholder="idx hi" className="h-6 w-[54px] text-[10px] tabular bg-secondary/60" />
+            </>
+          )}
         </div>
+        {usePremium && (
+          <div className="flex gap-1 items-center">
+            <span className="text-[8px] text-muted-foreground uppercase tracking-wide shrink-0" title="Option premium condition — per strike at fire time">prem</span>
+            {([['LTE', '≤'], ['RANGE', 'lo–hi'], ['GTE', '≥']] as [PremiumMode, string][]).map(([m, label]) => (
+              <button key={m} onClick={() => setPmode(m)} className={btn(pmode === m)}>{label}</button>
+            ))}
+            {pmode === 'LTE' && (
+              <Input value={pHi} onChange={e => setPHi(e.target.value.replace(/[^0-9.]/g, ''))} placeholder="≤ ₹" className="h-6 w-[58px] text-[10px] tabular bg-secondary/60" />
+            )}
+            {pmode === 'GTE' && (
+              <Input value={pLo} onChange={e => setPLo(e.target.value.replace(/[^0-9.]/g, ''))} placeholder="≥ ₹" className="h-6 w-[58px] text-[10px] tabular bg-secondary/60" />
+            )}
+            {pmode === 'RANGE' && (
+              <>
+                <Input value={pLo} onChange={e => setPLo(e.target.value.replace(/[^0-9.]/g, ''))} placeholder="lo" className="h-6 w-[50px] text-[10px] tabular bg-secondary/60" />
+                <span className="text-muted-foreground text-[9px]">–</span>
+                <Input value={pHi} onChange={e => setPHi(e.target.value.replace(/[^0-9.]/g, ''))} placeholder="hi" className="h-6 w-[50px] text-[10px] tabular bg-secondary/60" />
+              </>
+            )}
+          </div>
+        )}
 
-        {/* action + option type */}
+        {/* action + option side */}
         <div className="flex items-center gap-1">
           {(['BUY', 'SELL', 'DEPLOY', 'CANCEL'] as Action[]).map(a => (
             <button
               key={a}
               onClick={() => setAction(a)}
               title={a === 'DEPLOY' ? `Buy the full ${optType} strike list` : a === 'CANCEL' ? `Cancel pending ${optType} orders` : `Market${entryPrice ? '/LIMIT' : ''} ${a} of the ${optType}`}
-              className={`${btn(action === a)} ${a === 'BUY' || a === 'DEPLOY' ? (action === a ? '' : '') : ''}`}
+              className={btn(action === a)}
             >
-              <span className={a === 'SELL' ? 'text-[#ff4d5e]' : a === 'CANCEL' ? 'text-muted-foreground' : 'text-[#00c896]'}>{a === 'DEPLOY' ? 'DEPLOY' : a === 'CANCEL' ? 'CANCEL' : a}</span>
+              <span className={a === 'SELL' ? 'text-[#ff4d5e]' : a === 'CANCEL' ? 'text-muted-foreground' : 'text-[#00c896]'}>{a}</span>
             </button>
           ))}
           <button onClick={() => setOptType(optType === 'CE' ? 'PE' : 'CE')} title="Option side" className={`${btn(optType === 'CE')} ${optType === 'CE' ? 'text-[#00c896]' : 'text-[#ff4d5e]'}`}>
@@ -199,7 +224,7 @@ export function AutoPanel({ ws }: { ws: WorkspaceCfg }) {
           </button>
         </div>
 
-        {/* strikes: ATM+offset or picked set */}
+        {/* strikes: ATM ±5 buttons or picked set */}
         <div className="flex items-center gap-1">
           <button onClick={() => setPickStrikes(false)} className={btn(!pickStrikes)}>ATM</button>
           <button
@@ -208,20 +233,18 @@ export function AutoPanel({ ws }: { ws: WorkspaceCfg }) {
             title="Pick specific strikes from the workspace strike list (or a set of strikes)"
           >Strikes</button>
           {!pickStrikes ? (
-            <select value={offset} onChange={e => setOffset(Number(e.target.value))} className={sel} title="Offset from side ATM (steps)">
-              {[-3, -2, -1, 0, 1, 2, 3].map(o => <option key={o} value={o}>{o === 0 ? 'ATM' : o > 0 ? `+${o}` : o}</option>)}
-            </select>
+            <div className="flex items-center gap-0.5">
+              {[-5, -4, -3, -2, -1].map(o => (
+                <button key={o} onClick={() => setOffset(o)} className={`h-4.5 w-5 text-[9px] tabular rounded ${offset === o ? 'bg-primary text-primary-foreground' : 'bg-secondary/60 text-muted-foreground hover:text-foreground'}`}>{o}</button>
+              ))}
+              <button onClick={() => setOffset(0)} className={`px-1 h-4.5 text-[9px] font-bold rounded ${offset === 0 ? 'bg-primary text-primary-foreground' : 'bg-secondary/60 text-muted-foreground hover:text-foreground'}`}>ATM</button>
+              {[1, 2, 3, 4, 5].map(o => (
+                <button key={o} onClick={() => setOffset(o)} className={`h-4.5 w-5 text-[9px] tabular rounded ${offset === o ? 'bg-primary text-primary-foreground' : 'bg-secondary/60 text-muted-foreground hover:text-foreground'}`}>+{o}</button>
+              ))}
+            </div>
           ) : (
             <span className="text-[8px] text-muted-foreground">{Object.keys(picked).length} picked from {optType} rows</span>
           )}
-          <div className="flex-1" />
-          <span className="text-[9px] text-muted-foreground">alloc</span>
-          <input
-            type="range" min={5} max={100} step={5} value={allocPct}
-            onChange={e => setAllocPct(Number(e.target.value))}
-            className="h-1 w-12 accent-[#3b82f6]"
-          />
-          <span className="tabular text-[9px] w-7 text-right">{allocPct}%</span>
         </div>
 
         {pickStrikes && (
@@ -250,12 +273,22 @@ export function AutoPanel({ ws }: { ws: WorkspaceCfg }) {
           </div>
         )}
 
-        {/* optional price legs — any subset */}
+        {/* alloc + optional order legs */}
         <div className="flex items-center gap-1">
-          <span className="text-[8px] text-muted-foreground uppercase tracking-wide shrink-0">optional</span>
-          <Input value={entryPrice} onChange={e => setEntryPrice(e.target.value.replace(/[^0-9.]/g, ''))} placeholder="entry ₹" className="h-6 w-[58px] text-[9px] tabular bg-secondary/60" title="Entry — LIMIT at this price (blank = market)" />
-          <Input value={stopLoss} onChange={e => setStopLoss(e.target.value.replace(/[^0-9.]/g, ''))} placeholder="sl ₹" className="h-6 w-[52px] text-[9px] tabular bg-secondary/60" title="Stop-loss — reduce-only SL-M trigger" />
-          <Input value={target} onChange={e => setTarget(e.target.value.replace(/[^0-9.]/g, ''))} placeholder="tgt ₹" className="h-6 w-[52px] text-[9px] tabular bg-secondary/60" title="Target — reduce-only LIMIT" />
+          <span className="text-[9px] text-muted-foreground">alloc</span>
+          <input
+            type="range" min={5} max={100} step={5} value={allocPct}
+            onChange={e => setAllocPct(Number(e.target.value))}
+            className="h-1 w-12 accent-[#3b82f6]"
+          />
+          <span className="tabular text-[9px] w-7 text-right">{allocPct}%</span>
+          <span className="text-[8px] text-muted-foreground uppercase tracking-wide shrink-0">legs</span>
+          <Input value={entryPrice} onChange={e => setEntryPrice(e.target.value.replace(/[^0-9.]/g, ''))} placeholder="entry ₹" className="h-6 w-[56px] text-[9px] tabular bg-secondary/60" title="Entry — LIMIT at this price (blank = market)" />
+          <Input value={stopLoss} onChange={e => setStopLoss(e.target.value.replace(/[^0-9.]/g, ''))} placeholder="sl ₹" className="h-6 w-[50px] text-[9px] tabular bg-secondary/60" title="Stop-loss — reduce-only SL-M trigger" />
+          <Input value={target} onChange={e => setTarget(e.target.value.replace(/[^0-9.]/g, ''))} placeholder="tgt ₹" className="h-6 w-[50px] text-[9px] tabular bg-secondary/60" title="Target — reduce-only LIMIT" />
+        </div>
+
+        <div className="flex items-center gap-1">
           <label className="flex items-center gap-1 text-[9px] text-muted-foreground cursor-pointer" title="Repeat every trading day (else fires once)">
             <input type="checkbox" checked={repeatDaily} onChange={e => setRepeatDaily(e.target.checked)} className="accent-[#3b82f6] h-3 w-3" />
             daily
@@ -264,11 +297,11 @@ export function AutoPanel({ ws }: { ws: WorkspaceCfg }) {
         </div>
 
         <div className="text-[8px] text-muted-foreground leading-snug">
-          {kind === 'TIME'
-            ? `At ${time} IST${repeatDaily ? ' daily' : ' (once)'}`
-            : kind === 'INDEX'
-              ? `When ${effUnderlying || 'spot'} crosses ${cross === 'ABOVE' ? 'above' : 'below'} ${level || '—'}`
-              : `When ${effUnderlying || 'spot'} enters ${lo || '—'}–${hi || '—'}`}
+          {[
+            useTime ? `at ${time} IST${repeatDaily ? ' daily' : ' (once)'}` : null,
+            useRange ? `index in ${lo || '—'}–${hi || '—'}` : null,
+            usePremium ? `premium ${pmode === 'LTE' ? `≤ ${pHi || '—'}` : pmode === 'GTE' ? `≥ ${pLo || '—'}` : `${pLo || '—'}–${pHi || '—'}`}` : null,
+          ].filter(Boolean).join(' + ')}
           {' → '}{action} {optType}{pickStrikes ? ` ×${Object.keys(picked).length} picked` : offset ? ` side-ATM ${offset > 0 ? '+' : ''}${offset}` : ' side-ATM'} · {allocPct}%
           {entryPrice && ` · LIMIT ${entryPrice}`}{stopLoss && ` · SL ${stopLoss}`}{target && ` · TGT ${target}`}. Fires server-side.
         </div>
@@ -278,20 +311,21 @@ export function AutoPanel({ ws }: { ws: WorkspaceCfg }) {
       <div className="flex-1 overflow-y-auto">
         {rules.length === 0 && (
           <div className="p-3 text-center text-[10px] text-muted-foreground leading-relaxed">
-            No rules yet. Arm a time / index / range<br />rule above — seconds precision supported.
+            No rules yet. Arm a time / range / premium<br />rule above — compound conditions supported.
           </div>
         )}
         {rules.map(r => (
           <div key={r.id} className="px-2 py-1.5 border-b border-border/50 flex items-start gap-1.5">
             {r.kind === 'INDEX' ? <Gauge className="h-3 w-3 mt-0.5 text-[#4dd0e1] shrink-0" />
               : r.kind === 'INDEX_RANGE' ? <Webhook className="h-3 w-3 mt-0.5 text-[#a78bfa] shrink-0" />
+              : r.kind === 'COMPOUND' ? <Layers className="h-3 w-3 mt-0.5 text-[#e0a63f] shrink-0" />
               : <Clock3 className="h-3 w-3 mt-0.5 text-[#f5a623] shrink-0" />}
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1">
                 <span className="truncate text-[10px] font-semibold">{r.name}</span>
               </div>
               <div className="text-[8px] text-muted-foreground">
-                {r.underlying} · {r.action}{' '}
+                {r.underlying} · {r.kind.toLowerCase()} · {r.action}{' '}
                 <b className={r.optType === 'CE' ? 'text-[#00c896]' : 'text-[#ff4d5e]'}>{r.optType}</b>{' '}
                 {r.strikes && r.strikes.length > 0
                   ? `×${r.strikes.length} strikes`

@@ -5,6 +5,10 @@ import type { Candle, Tick } from '@/lib/types'
 import { TF_MS } from '@/lib/types'
 import { api } from '../lib/client-api'
 import { onTicks, subscribeTicks, unsubscribeTicks } from '../lib/socket'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import {
+  CandlestickChart, LineChart, AreaChart, Sigma, Ghost, Ruler, PenLine, Trash2, MousePointer2,
+} from 'lucide-react'
 
 // ============================================================
 // From-scratch canvas candlestick chart — no charting library.
@@ -16,11 +20,27 @@ import { onTicks, subscribeTicks, unsubscribeTicks } from '../lib/socket'
 //   · drag time axis              -> pan time
 //   · double-click / ▶LIVE button -> reset view to live edge
 //   · panning right shows up to 50 bars of FUTURE space
-// Legend (title + O/H/L/C/V + LTP) is ALWAYS visible; hovering
-// switches it to the hovered candle. Crosshair is SYNCED across
-// every open chart locked to the same interval (timeframe).
-// Overlays: SMA20/50, EMA9/21, VWAP (session), Bollinger(20,2).
-// Sub-panels: RSI(14), MACD(12,26,9).
+//
+// GHOST CANDLES (scalping-tool #ghostCtl):
+//   On any timeframe above 1m the chart renders the base (shell)
+//   candles translucent + hollow and draws the 1-minute candles
+//   that build each shell slot INSIDE it (alpha scales with the
+//   inner bar width — zoom in to make the ghost solid). Hovering
+//   highlights the hovered slot + the exact 1m bar under the
+//   cursor; the legend ALWAYS shows both the shell and the 1m
+//   OHLCV ("mouse over always shows 1m"). Ghost volume renders
+//   as 1m micro-bars inside the volume histogram.
+//
+// #tools — per-chart drawing layer (anchored to time+price):
+//   trend · ray · h-line · rectangle · fib retracement ·
+//   price range (measure) · long/short position box ·
+//   fixed-range VOLUME PROFILE (POC/VAH/VAL) · buy/sell
+//   imbalance (BSV net histogram). Click-click or drag to draw,
+//   click to select, drag to move/edit, Del removes, Esc cancels.
+//
+// Per-chart independence: chart type, indicator set, ghost,
+// scales and drawings are stored PER CHART (settingsKey) —
+// opening charts does not force the same config everywhere.
 // ============================================================
 
 export interface ChartMarker { price: number; label: string; color: string }
@@ -28,38 +48,77 @@ export interface ChartMarker { price: number; label: string; color: string }
 /** Blank bars the user can pan into beyond the live edge. */
 export const FUTURE_BARS = 50
 
-/** Axis scales (sample-tool "SCALES" popup): topmost enabled scale gets the
- *  right axis, the others render as a left measurement column. % / pts are
- *  relative to a baseline the user can drag or set by clicking the chart. */
+/** Axis scales: topmost enabled = right axis, others = left column. */
 export interface ScalesCfg { price: boolean; pct: boolean; inv: boolean; pts: boolean }
 
-interface Props {
-  symbol: string
-  tf: string
-  chartType: 'candles' | 'line' | 'area'
-  showVolume: boolean
-  showSMA20: boolean
-  showSMA50: boolean
-  showEMA?: boolean
-  showVWAP?: boolean
-  showBOLL?: boolean
-  showRSI?: boolean
-  showMACD?: boolean
-  // 1M ghost: overlay 1m candles on higher-timeframe charts (hollow/fade)
-  showGhost?: boolean
-  ghostStyle?: 'hollow' | 'fade'
-  scales?: ScalesCfg
-  markers?: ChartMarker[]
-  onPriceClick?: (price: number) => void
-  height: string
-  mini?: boolean // compact mode (option panes): thinner axes
+export type ChartType = 'candles' | 'line' | 'area'
+
+export interface IndicatorCfg {
+  vol: boolean
+  sma20: boolean
+  sma50: boolean
+  ema: boolean
+  vwap: boolean
+  boll: boolean
+  rsi: boolean
+  macd: boolean
 }
 
+export interface ChartSettings {
+  chartType: ChartType
+  ind: IndicatorCfg
+  ghost: boolean
+  ghostStyle: 'hollow' | 'fade'
+  scales: ScalesCfg
+}
+
+// ---------------- draw tools ----------------
+
+export type DrawTool =
+  | 'trend' | 'ray' | 'hline' | 'rect' | 'fib'
+  | 'pricerange' | 'long' | 'short' | 'vprofile' | 'vbs'
+
+interface DrawPt { t: number; p: number } // anchored to TIME + price (survives reloads/pan)
+
+interface Drawing {
+  id: string
+  type: DrawTool
+  pts: DrawPt[]
+  dir?: 1 | -1 // position box direction
+  pS?: number // position stop-loss price
+  pT?: number // position target price
+}
+
+function distSeg(px: number, py: number, x1: number, y1: number, x2: number, y2: number): number {
+  const dx = x2 - x1, dy = y2 - y1
+  const l2 = dx * dx + dy * dy
+  if (l2 === 0) return Math.hypot(px - x1, py - y1)
+  let t = ((px - x1) * dx + (py - y1) * dy) / l2
+  t = clamp(t, 0, 1)
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+}
+
+const TOOL_META: { id: DrawTool | 'cursor'; label: string; hint: string }[] = [
+  { id: 'trend', label: 'Trend line', hint: 'click start, click end' },
+  { id: 'ray', label: 'Ray', hint: 'click origin, click direction' },
+  { id: 'hline', label: 'H line', hint: 'click to place' },
+  { id: 'rect', label: 'Rectangle', hint: 'click two corners' },
+  { id: 'fib', label: 'Fib retracement', hint: 'click swing high & low' },
+  { id: 'pricerange', label: 'Price range', hint: 'click start, click end — Δ pts/%' },
+  { id: 'long', label: 'Long position', hint: 'click entry — auto SL/TGT box' },
+  { id: 'short', label: 'Short position', hint: 'click entry — auto SL/TGT box' },
+  { id: 'vprofile', label: 'Volume profile', hint: 'click range start & end — POC/VAH/VAL' },
+  { id: 'vbs', label: 'Buy/Sell imbalance', hint: 'click range start & end — net buy vs sell' },
+]
+const TWO_PT_TOOLS = new Set<DrawTool>(['trend', 'ray', 'rect', 'fib', 'pricerange', 'vprofile', 'vbs'])
+
+const FIBL = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]
 const UP = '#00c896'
 const DOWN = '#ff4d5e'
 const GRID = 'rgba(255,255,255,0.045)'
 const AXIS_TXT = '#8b949e'
 const CROSS = 'rgba(255,255,255,0.25)'
+const DCOL = { def: '#5fb0d8', fib: '#e0a63f', pos: '#e0a63f' }
 
 // ---------------- indicator math ----------------
 
@@ -185,10 +244,12 @@ function niceTicks(min: number, max: number, count: number): number[] {
   return out
 }
 
-function fmtAxisTime(t: number, tf: string): string {
+function fmtAxisTime(t: number, tf: string, withSecs = false): string {
   const d = new Date(t)
   if (tf === '1d') return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })
-  return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false })
+  return d.toLocaleTimeString('en-IN', {
+    hour: '2-digit', minute: '2-digit', ...(withSecs ? { second: '2-digit' as const } : {}), hour12: false,
+  })
 }
 
 function fmtVol(v: number): string {
@@ -219,6 +280,8 @@ function lowerBoundTime(arr: Candle[], t: number): number {
   return lo
 }
 
+function clamp(v: number, lo: number, hi: number): number { return Math.min(hi, Math.max(lo, v)) }
+
 interface DragState {
   zone: 'plot' | 'price' | 'time' | 'base'
   startX: number
@@ -230,11 +293,70 @@ interface DragState {
   moved: number
 }
 
+// ---- per-chart settings + drawings persistence ----
+
+const settingsKeyFor = (k?: string) => `zterm-chart:${k ?? 'default'}`
+const drawingsKeyFor = (k?: string) => `zterm-chart-drawings:${k ?? 'default'}`
+
+function loadSettings(key: string | undefined, fallback: ChartSettings): ChartSettings {
+  if (typeof window === 'undefined' || !key) return fallback
+  try {
+    const raw = window.localStorage.getItem(settingsKeyFor(key))
+    if (!raw) return fallback
+    const parsed = JSON.parse(raw) as Partial<ChartSettings>
+    return {
+      chartType: parsed.chartType ?? fallback.chartType,
+      ind: { ...fallback.ind, ...(parsed.ind ?? {}) },
+      ghost: parsed.ghost ?? fallback.ghost,
+      ghostStyle: parsed.ghostStyle ?? fallback.ghostStyle,
+      scales: { ...fallback.scales, ...(parsed.scales ?? {}) },
+    }
+  } catch { return fallback }
+}
+
+function loadDrawings(key: string | undefined): Drawing[] {
+  if (typeof window === 'undefined' || !key) return []
+  try {
+    const raw = window.localStorage.getItem(drawingsKeyFor(key))
+    const arr = raw ? (JSON.parse(raw) as Drawing[]) : []
+    return Array.isArray(arr) ? arr.slice(0, 120) : []
+  } catch { return [] }
+}
+
+interface Props {
+  symbol: string
+  tf: string
+  chartType: ChartType
+  showVolume: boolean
+  showSMA20: boolean
+  showSMA50: boolean
+  showEMA?: boolean
+  showVWAP?: boolean
+  showBOLL?: boolean
+  showRSI?: boolean
+  showMACD?: boolean
+  // 1M ghost: inner 1m candles on higher-timeframe charts (hollow/fade)
+  showGhost?: boolean
+  ghostStyle?: 'hollow' | 'fade'
+  scales?: ScalesCfg
+  markers?: ChartMarker[]
+  onPriceClick?: (price: number) => void
+  height: string
+  mini?: boolean // compact mode: no crosshair, thin axes, no controls
+  /** Per-chart identity — settings + drawings persist under this key so
+   *  every chart keeps its OWN indicators / type / ghost / tools. */
+  settingsKey?: string
+  /** Render the per-chart control bar (type / indicators / ghost / scales / tools). */
+  controls?: boolean
+}
+
+// ---------------- component ----------------
+
 export function CanvasChart({
   symbol, tf, chartType, showVolume, showSMA20, showSMA50,
   showEMA = false, showVWAP = false, showBOLL = false, showRSI = false, showMACD = false,
   showGhost = false, ghostStyle = 'hollow', scales,
-  markers = [], onPriceClick, height, mini = false,
+  markers = [], onPriceClick, height, mini = false, settingsKey, controls,
 }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -247,7 +369,7 @@ export function CanvasChart({
   const priceZoomRef = useRef(1)
   const priceOffRef = useRef(0)
   const [, forceRender] = useState(0)
-  const crossRef = useRef<{ x: number; y: number } | null>(null)
+  const crossRef = useRef<{ x: number; y: number; inPlot: boolean } | null>(null)
   const syncCrossRef = useRef<{ slot: number; price: number | null } | null>(null)
   const dragRef = useRef<DragState | null>(null)
   const sizeRef = useRef({ w: 0, h: 0 })
@@ -255,8 +377,66 @@ export function CanvasChart({
   const lastRangeRef = useRef({ pMin: 0, pMax: 1 }) // survives full-future views
   const lastVolRef = useRef<Record<string, number>>({})
   const chartId = useRef(++CHART_SEQ)
-  // ---- 1M ghost overlay ----
+
+  // ---- per-chart settings (chart type / indicators / ghost / scales) ----
+  const [settings, setSettings] = useState<ChartSettings>(() => ({
+    chartType,
+    ind: { vol: showVolume, sma20: showSMA20, sma50: showSMA50, ema: showEMA, vwap: showVWAP, boll: showBOLL, rsi: showRSI, macd: showMACD },
+    ghost: showGhost,
+    ghostStyle,
+    scales: scales ?? { price: true, pct: false, inv: false, pts: false },
+  }))
+  useEffect(() => {
+    const defaults: ChartSettings = {
+      chartType,
+      ind: { vol: showVolume, sma20: showSMA20, sma50: showSMA50, ema: showEMA, vwap: showVWAP, boll: showBOLL, rsi: showRSI, macd: showMACD },
+      ghost: showGhost,
+      ghostStyle,
+      scales: scales ?? { price: true, pct: false, inv: false, pts: false },
+    }
+    setSettings(loadSettings(settingsKey, defaults))
+    setDrawings(loadDrawings(settingsKey))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsKey])
+
+  const patchSettings = useCallback((p: Partial<ChartSettings>) => {
+    setSettings(prev => {
+      const next = { ...prev, ...p }
+      try { window.localStorage.setItem(settingsKeyFor(settingsKey), JSON.stringify(next)) } catch { /* private mode */ }
+      return next
+    })
+  }, [settingsKey])
+
+  // ---- per-chart drawings (#tools) ----
+  const [drawings, setDrawings] = useState<Drawing[]>([])
+  const [tool, setTool] = useState<DrawTool | 'cursor'>('cursor')
+  const toolRef = useRef<DrawTool | 'cursor'>('cursor')
+  const setToolBoth = (t: DrawTool | 'cursor') => { toolRef.current = t; setTool(t) }
+  const selIdRef = useRef<string | null>(null)
+  const [selId, setSelId] = useState<string | null>(null)
+  const pendingRef = useRef<Drawing | null>(null)
+  const dragDrawRef = useRef<{ d: Drawing; mode: 'move' | 'pt'; pi?: number; startMouse: { x: number; y: number }; orig: Drawing } | null>(null)
+
+  const setSel = (id: string | null) => { selIdRef.current = id; setSelId(id) }
+
+  const commitDrawings = useCallback((next: Drawing[]) => {
+    setDrawings(next)
+    try { window.localStorage.setItem(drawingsKeyFor(settingsKey), JSON.stringify(next.slice(-120))) } catch { /* private mode */ }
+  }, [settingsKey])
+
+  const newDrawing = useCallback((d: Omit<Drawing, 'id'>) => {
+    const full: Drawing = { ...d, id: `d${Date.now().toString(36)}${Math.floor(Math.random() * 1e4)}` }
+    commitDrawings([...drawingsRef.current, full].slice(-120))
+    return full
+  }, [commitDrawings])
+
+  // drawings mirror for RAF loop + stable access in handlers
+  const drawingsRef = useRef<Drawing[]>(drawings)
+  useEffect(() => { drawingsRef.current = drawings }, [drawings])
+
+  // ---- 1m ghost data (always fetched above 1m so hover legend can show 1m) ----
   const [ghost, setGhost] = useState<Candle[]>([])
+
   // ---- scales baseline (null = day open ref) + pick mode ----
   const baseRef = useRef<number | null>(null)
   const pickRef = useRef(false)
@@ -320,22 +500,24 @@ export function CanvasChart({
     }
   }, [symbol, tf, load])
 
-  // ---- 1m ghost data (only meaningful on higher timeframes) ----
+  // ---- 1m ghost source data (inner candles + hover 1m legend) ----
   useEffect(() => {
-    if (!showGhost || tf === '1m') { setGhost([]); return }
+    if (tf === '1m') { setGhost([]); return }
     let dead = false
     const pull = async () => {
       try {
-        const r = await api.candles(symbol, '1m' as never, 1200)
+        const need = Math.min(2400, Math.max(420, barCount * (TF_MS[tf as keyof typeof TF_MS] / 60_000) + 80))
+        const r = await api.candles(symbol, '1m' as never, need)
         if (!dead) setGhost(r.candles ?? [])
       } catch { /* ghost is best-effort */ }
     }
     pull()
     const iv = setInterval(pull, 30_000)
     return () => { dead = true; clearInterval(iv) }
-  }, [symbol, tf, showGhost])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbol, tf])
 
-  // ---- live ticks merge into the last candle ----
+  // ---- live ticks merge into the last candle (+ ghost tail) ----
   useEffect(() => {
     return onTicks(map => {
       const t: Tick | undefined = map[symbol]
@@ -359,8 +541,7 @@ export function CanvasChart({
         }
         return arr
       })
-      // ghost 1m last bar follows live ticks as well
-      if (showGhost && tf !== '1m') {
+      if (tf !== '1m') {
         setGhost(prevG => {
           if (prevG.length === 0) return prevG
           const gArr = prevG.slice()
@@ -368,7 +549,7 @@ export function CanvasChart({
           const gb = Math.floor(t.ts / 60_000) * 60_000
           if (gb > gl.t) {
             gArr.push({ t: gb, o: t.ltp, h: t.ltp, l: t.ltp, c: t.ltp, v: 0 })
-            if (gArr.length > 2400) gArr.splice(0, 200)
+            if (gArr.length > 2600) gArr.splice(0, 200)
           } else {
             gl.c = t.ltp
             gl.h = Math.max(gl.h, t.ltp)
@@ -379,7 +560,13 @@ export function CanvasChart({
         })
       }
     })
-  }, [symbol, tf, showGhost])
+  }, [symbol, tf])
+
+  // ---- geometry shared with the pointer handlers (drawings hit-testing) ----
+  const geoRef = useRef({
+    w: 0, h: 0, plotW: 0, priceH: 0, colW: 0, cw: 1, tfMs: 60_000,
+    pMin: 0, pMax: 1, t0: 0, slotStart: 0, dataLen: 0, lastT: 0, axisW: 58, axisH: 20,
+  })
 
   // ---- render loop ----
   useEffect(() => {
@@ -413,15 +600,17 @@ export function CanvasChart({
         return
       }
 
+      const ind = settings.ind
+      const chartKind = settings.chartType
       const axisW = mini ? 46 : 58
       const axisH = mini ? 12 : 20
       const plotW = w - axisW
       const availH = h - axisH
-      const volH = showVolume ? Math.round(availH * (mini ? 0.14 : 0.16)) : 0
+      const volH = ind.vol ? Math.round(availH * (mini ? 0.14 : 0.16)) : 0
       const subSlot = Math.round(availH * 0.16)
-      const rsiH = !mini && showRSI ? subSlot : 0
-      const macdH = !mini && showMACD ? subSlot : 0
-      const priceH = availH - (showVolume ? volH + 5 : 0) - rsiH - macdH
+      const rsiH = !mini && ind.rsi ? subSlot : 0
+      const macdH = !mini && ind.macd ? subSlot : 0
+      const priceH = availH - (ind.vol ? volH + 5 : 0) - rsiH - macdH
 
       // visible window — offset may be NEGATIVE (future space)
       const end = data.length - Math.round(offsetRef.current)
@@ -437,6 +626,8 @@ export function CanvasChart({
         const di = start + i
         return di < data.length ? data[di].t : lastT + (di - (data.length - 1)) * tfMs
       }
+      const t0Slot = timeOfSlot(0)
+      const xOfTime = (t: number) => ((t - t0Slot) / tfMs) * (plotW / slots) + plotW / slots / 2
 
       // day-change reference (session open) — the default scales baseline
       const dayKey = (t: number) => new Date(t + 5.5 * 3600_000).toISOString().slice(0, 10)
@@ -449,21 +640,20 @@ export function CanvasChart({
       const baseline = baseRef.current ?? dayRef
       const pctOf = (p: number) => (baseline ? ((p - baseline) / baseline) * 100 : 0)
 
-      // price range over real candles + overlays
+      // price range over real candles + overlays + ghost inner bars
       let pMin = Infinity, pMax = -Infinity
       for (const c of vis) { if (!c) continue; if (c.l < pMin) pMin = c.l; if (c.h > pMax) pMax = c.h }
-      // ghost 1m candles stretch the range too
-      if (showGhost && ghost.length > 0 && tfMs > 60_000) {
+      if (ghost.length > 0 && tfMs > 60_000) {
         const tA = timeOfSlot(0), tB = timeOfSlot(slots - 1) + tfMs
         const g0 = lowerBoundTime(ghost, tA), g1 = lowerBoundTime(ghost, tB)
         for (let gi = g0; gi < g1; gi++) { const g = ghost[gi]; if (g.l < pMin) pMin = g.l; if (g.h > pMax) pMax = g.h }
       }
-      const s20 = showSMA20 ? sma(data, 20) : null
-      const s50 = showSMA50 ? sma(data, 50) : null
-      const e9 = showEMA ? ema(data, 9) : null
-      const e21 = showEMA ? ema(data, 21) : null
-      const vw = showVWAP ? vwap(data) : null
-      const bb = showBOLL ? bollinger(data) : null
+      const s20 = ind.sma20 ? sma(data, 20) : null
+      const s50 = ind.sma50 ? sma(data, 50) : null
+      const e9 = ind.ema ? ema(data, 9) : null
+      const e21 = ind.ema ? ema(data, 21) : null
+      const vw = ind.vwap ? vwap(data) : null
+      const bb = ind.boll ? bollinger(data) : null
       const includeSeries = (arr: (number | null)[] | null | undefined, up?: (number | null)[] | null, lo?: (number | null)[] | null) => {
         if (arr) for (let i = start; i < end; i++) { const v = arr[i]; if (v != null) { if (v < pMin) pMin = v; if (v > pMax) pMax = v } }
         if (up) for (let i = start; i < end; i++) { const v = up[i]; if (v != null) { if (v < pMin) pMin = v; if (v > pMax) pMax = v } }
@@ -491,7 +681,7 @@ export function CanvasChart({
       const yOf = (p: number) => ((pMax - p) / (pMax - pMin)) * priceH
 
       // ---- scales config: topmost enabled = right axis, others = left column ----
-      const scalesCfg = scales ?? { price: true, pct: false, inv: false, pts: false }
+      const scalesCfg = settings.scales ?? { price: true, pct: false, inv: false, pts: false }
       const enabledScales = (['price', 'pct', 'inv', 'pts'] as const).filter(k => scalesCfg[k])
       const primary = enabledScales[0] ?? 'price'
       const secondaries = enabledScales.slice(1)
@@ -500,6 +690,9 @@ export function CanvasChart({
         : primary === 'inv' ? labelPct(-pctOf(p))
         : primary === 'pts' ? labelPts(p - baseline)
         : (p >= 1000 ? p.toLocaleString('en-IN', { maximumFractionDigits: 1 }) : p.toFixed(2))
+
+      // ---- shared geometry for the pointer handlers ----
+      geoRef.current = { w, h, plotW, priceH, colW: 0, cw, tfMs, pMin, pMax, t0: t0Slot, slotStart: start, dataLen: data.length, lastT, axisW, axisH }
 
       // grid + price axis (labels follow the primary scale)
       ctx.textAlign = 'left'
@@ -514,8 +707,9 @@ export function CanvasChart({
       }
 
       // ---- left measurement column (secondary scales, sample-tool style) ----
-      const colW = secondaries.length > 0 ? 10 + Math.max(34, secondaries.length * 40) : 0
-      if (colW > 0 && !mini) {
+      const colW = secondaries.length > 0 && !mini ? 10 + Math.max(34, secondaries.length * 40) : 0
+      geoRef.current.colW = colW
+      if (colW > 0) {
         ctx.fillStyle = 'rgba(11,14,17,0.66)'
         ctx.fillRect(0, 0, colW, priceH)
         ctx.strokeStyle = 'rgba(255,255,255,0.08)'
@@ -568,27 +762,39 @@ export function CanvasChart({
         }
       }
 
-      // volume histogram
-      if (showVolume && volH > 0) {
+      // ---- mouse geometry (hovered slot + hovered inner 1m bar) ----
+      const mouse = crossRef.current
+      const inPlot = !!mouse && mouse.inPlot !== false && mouse.x >= 0 && mouse.x <= plotW && mouse.y >= 0 && mouse.y <= priceH
+      const hoverSlot = inPlot ? clamp(Math.floor(mouse!.x / cw), 0, slots - 1) : -1
+      const mouseT = inPlot ? t0Slot + (mouse!.x - cw / 2) / cw * tfMs : 0
+      let gi = -1
+      if (inPlot && ghost.length > 0) {
+        const i = lowerBoundTime(ghost, Math.max(mouseT, ghost[0].t))
+        gi = i < ghost.length && ghost[i].t <= mouseT ? i : Math.max(0, i - 1)
+        if (mouseT >= ghost[ghost.length - 1].t) gi = ghost.length - 1
+      }
+
+      // volume histogram (base slots) — drawn under the candles
+      const volBot = priceH + 5 + volH
+      if (ind.vol && volH > 0) {
         let vMax = 0
         for (const c of vis) if (c && c.v > vMax) vMax = c.v
-        const vy0 = priceH + 5 + volH
         vis.forEach((c, i) => {
           if (!c || c.v <= 0) return
           const vh = (c.v / vMax) * volH
           ctx.fillStyle = c.c >= c.o ? 'rgba(0,200,150,0.35)' : 'rgba(255,77,94,0.35)'
-          ctx.fillRect(xOf(i) - bodyW / 2, vy0 - vh, bodyW, vh)
+          ctx.fillRect(xOf(i) - bodyW / 2, volBot - vh, bodyW, vh)
         })
         ctx.fillStyle = 'rgba(139,148,158,0.8)'
         ctx.textAlign = 'left'
         ctx.textBaseline = 'top'
-        ctx.fillText(`Vol ${fmtVol(vMax)}`, 4, vy0 - volH + 1)
+        ctx.fillText(`Vol ${fmtVol(vMax)}`, 4, volBot - volH + 1)
       }
 
       // RSI panel
-      const rsiArr = !mini && showRSI ? rsi(data) : null
+      const rsiArr = !mini && ind.rsi ? rsi(data) : null
       if (rsiArr && rsiH > 0) {
-        const top = priceH + (showVolume ? 5 + volH + 2 : 2)
+        const top = priceH + (ind.vol ? 5 + volH + 2 : 2)
         const yR = (v: number) => top + ((100 - v) / 100) * rsiH
         ctx.strokeStyle = GRID
         ctx.beginPath(); ctx.moveTo(0, top); ctx.lineTo(plotW, top); ctx.stroke()
@@ -615,9 +821,9 @@ export function CanvasChart({
       }
 
       // MACD panel
-      const macdArr = !mini && showMACD ? macd(data) : null
+      const macdArr = !mini && ind.macd ? macd(data) : null
       if (macdArr && macdH > 0) {
-        const top = priceH + (showVolume ? 5 + volH + 2 : 2) + (rsiH ? rsiH + 2 : 0)
+        const top = priceH + (ind.vol ? 5 + volH + 2 : 2) + (rsiH ? rsiH + 2 : 0)
         let mMin = Infinity, mMax = -Infinity
         for (let i = start; i < end; i++) {
           for (const arr of [macdArr.line, macdArr.signal, macdArr.hist]) {
@@ -630,7 +836,6 @@ export function CanvasChart({
         const yM = (v: number) => top + ((mAbs - v) / (2 * mAbs)) * macdH
         ctx.strokeStyle = GRID
         ctx.beginPath(); ctx.moveTo(0, top); ctx.lineTo(plotW, top); ctx.stroke()
-        // zero line
         ctx.strokeStyle = 'rgba(255,255,255,0.09)'
         ctx.beginPath(); ctx.moveTo(0, yM(0)); ctx.lineTo(plotW, yM(0)); ctx.stroke()
         vis.forEach((c, i) => {
@@ -660,65 +865,130 @@ export function CanvasChart({
         ctx.fillText('MACD 12·26·9', 4, top + 1)
       }
 
-      // ---- 1M ghost overlay (sample-tool #ghostCtl): 1m candles on >1m charts ----
-      if (showGhost && ghost.length > 0 && tfMs > 60_000) {
-        const tA = timeOfSlot(0), tB = timeOfSlot(slots - 1) + tfMs
-        const g0 = lowerBoundTime(ghost, tA), g1 = lowerBoundTime(ghost, tB)
-        if (g1 > g0) {
-          ctx.lineWidth = 1
-          ctx.textAlign = 'left'; ctx.textBaseline = 'top'
+      // ================= GHOST CANDLES (scalping-tool #ghostCtl) =================
+      const useGhost = settings.ghost
+      const ghostEff = useGhost && ghost.length > 0 && tfMs > 60_000
+      // inner bar width → ghost alpha (matches the sample tool: needs ~3px bars)
+      let innerW = 0
+      if (ghostEff && hoverSlot >= 0) {
+        const t0h = timeOfSlot(hoverSlot), t1h = t0h + tfMs
+        const k = Math.max(1, lowerBoundTime(ghost, t1h) - lowerBoundTime(ghost, t0h))
+        innerW = (cw / k) * 0.62
+      } else if (ghostEff) {
+        innerW = (cw / Math.max(1, tfMs / 60_000)) * 0.62
+      }
+      const la = clamp((innerW - 1.3) / 2.2, 0, 1)
+      const gw = Math.max(1.2, innerW)
+
+      if (ghostEff && la > 0.02) {
+        // ghost volume micro-bars inside the volume histogram
+        if (ind.vol && volH > 0) {
+          let vMax1 = 0
+          const tA = timeOfSlot(0), tB = timeOfSlot(slots - 1) + tfMs
+          for (let g = lowerBoundTime(ghost, tA); g < lowerBoundTime(ghost, tB); g++) if (ghost[g].v > vMax1) vMax1 = ghost[g].v
           for (let i = 0; i < slots; i++) {
-            const t0 = timeOfSlot(i)
-            if (t0 < ghost[0].t) continue
-            const t1 = t0 + tfMs
-            const lo = Math.max(g0, lowerBoundTime(ghost, t0))
-            const hi = Math.min(g1, lowerBoundTime(ghost, t1))
-            const k = hi - lo
-            if (k <= 0) continue
-            const bw = Math.max(1.5, Math.min(6, (cw / k) * 0.62))
-            for (let j = 0; j < k; j++) {
-              const g = ghost[lo + j]
-              const x = xOf(i) - cw / 2 + ((j + 0.5) / k) * cw
-              const up = g.c >= g.o
-              const col = up ? UP : DOWN
-              const yH = yOf(g.h), yL = yOf(g.l), yO = yOf(g.o), yC = yOf(g.c)
-              if (Math.max(yH, yL) < -4 || Math.min(yH, yL) > priceH + 4) continue
-              ctx.globalAlpha = ghostStyle === 'fade' ? 0.26 : 0.6
-              ctx.strokeStyle = col
-              ctx.beginPath(); ctx.moveTo(x, yH); ctx.lineTo(x, yL); ctx.stroke()
-              const top = Math.min(yO, yC)
-              const bh = Math.max(1, Math.abs(yC - yO))
-              if (ghostStyle === 'hollow') {
-                ctx.strokeRect(x - bw / 2, top, bw, bh)
-              } else {
-                ctx.fillStyle = col
-                ctx.fillRect(x - bw / 2, top, bw, bh)
-              }
-              ctx.globalAlpha = 1
+            const t0 = timeOfSlot(i), t1 = t0 + tfMs
+            const lo = lowerBoundTime(ghost, t0), hi = lowerBoundTime(ghost, t1)
+            for (let g = lo; g < hi; g++) {
+              const bar = ghost[g]
+              const x = xOfTime(bar.t)
+              if (x < -4 || x > plotW + 4) continue
+              const a = (g === gi ? 0.85 : 0.38) * la
+              if (a <= 0.015) continue
+              const vh = Math.max(1, (bar.v / Math.max(1, vMax1)) * volH)
+              ctx.globalAlpha = a
+              ctx.fillStyle = bar.c >= bar.o ? UP : DOWN
+              ctx.fillRect(x - gw / 2, volBot - vh, gw, vh)
             }
           }
-          ctx.fillStyle = 'rgba(224,166,63,0.9)'
-          ctx.fillText('1M GHOST', 4, 14)
+          ctx.globalAlpha = 1
         }
       }
 
-      // series
-      if (chartType === 'candles') {
-        vis.forEach((c, i) => {
-          if (!c) return
-          const x = xOf(i)
-          const up = c.c >= c.o
-          ctx.strokeStyle = up ? UP : DOWN
-          ctx.fillStyle = up ? UP : DOWN
-          ctx.beginPath()
-          ctx.moveTo(x, yOf(c.h)); ctx.lineTo(x, yOf(c.l))
-          ctx.stroke()
-          const yO = yOf(c.o), yC = yOf(c.c)
-          const top = Math.min(yO, yC)
-          const bh = Math.max(1, Math.abs(yC - yO))
-          ctx.fillRect(x - bodyW / 2, top, bodyW, bh)
-        })
+      // base shell + inner ghost candles
+      if (chartKind === 'candles') {
+        if (ghostEff) {
+          // shell: translucent body + outline (hovered slot emphasized)
+          vis.forEach((c, i) => {
+            if (!c) return
+            const emph = i === hoverSlot
+            const x = xOf(i)
+            const up = c.c >= c.o
+            const col = up ? UP : DOWN
+            const yH = yOf(c.h), yL = yOf(c.l)
+            const yO = yOf(c.o), yC = yOf(c.c)
+            const top = Math.min(yO, yC), bot = Math.max(yO, yC)
+            const bh = Math.max(1, bot - top)
+            const bx = x - bodyW / 2
+            ctx.strokeStyle = col; ctx.fillStyle = col
+            ctx.lineWidth = 1
+            ctx.globalAlpha = emph ? 1 : 0.85
+            if (top - yH > 0.3) { ctx.beginPath(); ctx.moveTo(x, yH); ctx.lineTo(x, top + 0.5); ctx.stroke() }
+            if (yL - bot > 0.3) { ctx.beginPath(); ctx.moveTo(x, bot - 0.5); ctx.lineTo(x, yL); ctx.stroke() }
+            ctx.globalAlpha = emph ? 0.34 : 0.17
+            ctx.fillRect(bx, top, bodyW, bh)
+            ctx.globalAlpha = emph ? 1 : 0.9
+            ctx.lineWidth = emph ? 2 : 1.5
+            ctx.strokeRect(bx, top, bodyW, bh)
+            ctx.globalAlpha = 1
+            ctx.lineWidth = 1
+          })
+          // inner 1m candles
+          if (la > 0.02) {
+            ctx.lineWidth = 1
+            for (let i = 0; i < slots; i++) {
+              const emph = i === hoverSlot
+              const t0 = timeOfSlot(i), t1 = t0 + tfMs
+              const lo = lowerBoundTime(ghost, Math.max(t0, ghost[0].t)), hi = lowerBoundTime(ghost, t1)
+              for (let g = lo; g < hi; g++) {
+                const bar = ghost[g]
+                const x = xOfTime(bar.t)
+                if (x < -6 || x > plotW + 6) continue
+                const isInner = g === gi
+                const up = bar.c >= bar.o
+                const col = up ? UP : DOWN
+                const a = (isInner ? 1 : emph ? 0.85 : 0.62) * la
+                if (a <= 0.015) continue
+                const yH = yOf(bar.h), yL = yOf(bar.l), yO = yOf(bar.o), yC = yOf(bar.c)
+                const top = Math.min(yO, yC), bot = Math.max(yO, yC), bh = Math.max(1, bot - top)
+                ctx.globalAlpha = a
+                ctx.strokeStyle = col; ctx.fillStyle = col
+                ctx.lineWidth = isInner ? 1.8 : emph ? 1.4 : 1
+                if (top - yH > 0.3) { ctx.beginPath(); ctx.moveTo(x, yH); ctx.lineTo(x, top + 0.5); ctx.stroke() }
+                if (yL - bot > 0.3) { ctx.beginPath(); ctx.moveTo(x, bot - 0.5); ctx.lineTo(x, yL); ctx.stroke() }
+                if (settings.ghostStyle === 'fade') {
+                  ctx.globalAlpha = a * 0.16
+                  ctx.fillRect(x - gw / 2, top, gw, bh)
+                  ctx.globalAlpha = a
+                }
+                ctx.strokeRect(x - gw / 2, top, gw, bh)
+              }
+            }
+            ctx.globalAlpha = 1
+            ctx.lineWidth = 1
+            ctx.fillStyle = 'rgba(224,166,63,0.9)'
+            ctx.textAlign = 'left'; ctx.textBaseline = 'top'
+            ctx.fillText('1M GHOST', 4, 14)
+          }
+        } else {
+          // plain candles (or 1m chart / ghost off)
+          vis.forEach((c, i) => {
+            if (!c) return
+            const x = xOf(i)
+            const up = c.c >= c.o
+            ctx.strokeStyle = up ? UP : DOWN
+            ctx.fillStyle = up ? UP : DOWN
+            ctx.beginPath()
+            ctx.moveTo(x, yOf(c.h)); ctx.lineTo(x, yOf(c.l))
+            ctx.stroke()
+            const yO = yOf(c.o), yC = yOf(c.c)
+            const top = Math.min(yO, yC)
+            const bh = Math.max(1, Math.abs(yC - yO))
+            ctx.fillRect(x - bodyW / 2, top, bodyW, bh)
+          })
+        }
       } else {
+        // line / area series
         ctx.beginPath()
         let started = false
         vis.forEach((c, i) => {
@@ -730,16 +1000,49 @@ export function CanvasChart({
         ctx.lineWidth = 1.5
         ctx.stroke()
         ctx.lineWidth = 1
-        if (chartType === 'area' && started) {
+        if (chartKind === 'area' && started) {
           const lastReal = Math.min(slots - 1, data.length - 1 - start)
           const grad = ctx.createLinearGradient(0, 0, 0, priceH)
           grad.addColorStop(0, 'rgba(245,166,35,0.22)')
           grad.addColorStop(1, 'rgba(245,166,35,0)')
           ctx.lineTo(xOf(lastReal), priceH)
-          ctx.lineTo(xOf(Math.max(0, data.length - 1 - start < slots ? data.length - 1 - start : 0)) || xOf(0), priceH)
+          ctx.lineTo(xOf(Math.max(0, data.length - 1 - start < slots ? data.length - 1 - start : 0)), priceH)
           ctx.closePath()
           ctx.fillStyle = grad
           ctx.fill()
+        }
+      }
+
+      // hovered slot highlight box (always on >1m charts, ghost or not)
+      if (!mini && tfMs > 60_000 && hoverSlot >= 0 && vis[hoverSlot]) {
+        const k = vis[hoverSlot]!
+        const x0 = xOf(hoverSlot) - cw / 2, x1 = xOf(hoverSlot) + cw / 2
+        const ins = (x1 - x0) * 0.17
+        ctx.strokeStyle = '#e0a63f'
+        ctx.lineWidth = 1.4
+        ctx.globalAlpha = 0.9
+        ctx.strokeRect(x0 + ins - 5, yOf(k.h) - 5, (x1 - x0 - 2 * ins) + 10, (yOf(k.l) - yOf(k.h)) + 10)
+        ctx.globalAlpha = 1
+        ctx.lineWidth = 1
+        // ghost OFF hover: amber column + emphasized inner 1m candle
+        if (!ghostEff && gi >= 0 && ghost.length > 0) {
+          const ib = ghost[gi]
+          if (ib.t >= t0Slot - 60_000 && ib.t <= timeOfSlot(slots - 1) + tfMs) {
+            const cxm = xOfTime(ib.t)
+            ctx.fillStyle = 'rgba(224,166,63,0.055)'
+            ctx.fillRect(cxm - cw / (2 * Math.max(1, tfMs / 60_000)), 0, cw / Math.max(1, tfMs / 60_000), priceH)
+            const yH = yOf(ib.h), yL = yOf(ib.l), yO = yOf(ib.o), yC = yOf(ib.c)
+            const t2 = Math.min(yO, yC), b2 = Math.max(yO, yC)
+            const wb = Math.max(3, Math.min(gw * 1.3, (cw / Math.max(1, tfMs / 60_000)) * 0.7))
+            ctx.strokeStyle = '#e0a63f'
+            ctx.globalAlpha = 0.95
+            ctx.lineWidth = 1.5
+            if (t2 - yH > 0.3) { ctx.beginPath(); ctx.moveTo(cxm, yH); ctx.lineTo(cxm, t2 + 0.5); ctx.stroke() }
+            if (yL - b2 > 0.3) { ctx.beginPath(); ctx.moveTo(cxm, b2 - 0.5); ctx.lineTo(cxm, yL); ctx.stroke() }
+            ctx.strokeRect(cxm - wb / 2, t2, wb, Math.max(1, b2 - t2))
+            ctx.globalAlpha = 1
+            ctx.lineWidth = 1
+          }
         }
       }
 
@@ -760,7 +1063,6 @@ export function CanvasChart({
         ctx.lineWidth = 1
       }
       if (bb) {
-        // band fill
         ctx.beginPath()
         let st = false
         for (let i = start; i < end; i++) {
@@ -832,15 +1134,270 @@ export function CanvasChart({
           ctx.beginPath(); ctx.moveTo(colW, yBase); ctx.lineTo(plotW, yBase); ctx.stroke()
           ctx.setLineDash([])
           ctx.lineWidth = 1
-          // zero anchors of the % / pts scales sit on the baseline
           ctx.fillStyle = 'rgba(224,166,63,0.9)'
           ctx.textAlign = 'right'; ctx.textBaseline = 'middle'
           ctx.fillText(primary === 'price' ? '0%' : '0', plotW - 4, yBase - 6)
         }
       }
 
-      // ---- legend: ALWAYS visible. Hovered candle wins over last. ----
-      const drawLegend = (c: Candle, idxTime: number, livePct: number | null) => {
+      // ================= #tools — drawings render =================
+      const cr = (v: number) => Math.round(v) + 0.5
+      const seg = (x1: number, y1: number, x2: number, y2: number) => {
+        ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke()
+      }
+      // computeVP — fixed-range volume profile (26 bins, POC / VAH / VAL @70%)
+      const computeVP = (t0: number, t1: number) => {
+        const g0 = Math.max(0, lowerBoundTime(data, t0)), g1 = Math.min(data.length - 1, lowerBoundTime(data, t1))
+        if (g1 < g0) return null
+        let lo = Infinity, hi = -Infinity, tv = 0
+        for (let g = g0; g <= g1; g++) { const b = data[g]; if (b.l < lo) lo = b.l; if (b.h > hi) hi = b.h; tv += b.v }
+        if (tv <= 0 || hi <= lo) return null
+        const N = 26, bins = new Array(N).fill(0), bh = (hi - lo) / N
+        for (let g = g0; g <= g1; g++) {
+          const b = data[g]
+          const bi = clamp(Math.floor(((b.h + b.l + b.c) / 3 - lo) / bh), 0, N - 1)
+          bins[bi] += b.v
+        }
+        let poc = 0
+        for (let i = 1; i < N; i++) if (bins[i] > bins[poc]) poc = i
+        let cum = bins[poc], a = poc, b2 = poc
+        while (cum < tv * 0.7 && (a > 0 || b2 < N - 1)) {
+          const va = a > 0 ? bins[a - 1] : -1, vb = b2 < N - 1 ? bins[b2 + 1] : -1
+          if (vb >= va) { b2++; cum += bins[b2] } else { a--; cum += bins[a] }
+        }
+        return { lo, hi, bins, N, poc, a, b2, tv }
+      }
+      // computeBSV — buy/sell split per price bin (bf = (c-l)/(h-l))
+      const computeBSV = (t0: number, t1: number) => {
+        const g0 = Math.max(0, lowerBoundTime(data, t0)), g1 = Math.min(data.length - 1, lowerBoundTime(data, t1))
+        if (g1 < g0) return null
+        let lo = Infinity, hi = -Infinity, tv = 0
+        for (let g = g0; g <= g1; g++) { const b = data[g]; if (b.l < lo) lo = b.l; if (b.h > hi) hi = b.h; tv += b.v }
+        if (tv <= 0 || hi <= lo) return null
+        const N = 28, buy = new Array(N).fill(0), sell = new Array(N).fill(0), bh = (hi - lo) / N
+        for (let g = g0; g <= g1; g++) {
+          const b = data[g], r = b.h - b.l
+          const bf = r > 0 ? (b.c - b.l) / r : 0.5
+          const bi = clamp(Math.floor(((b.h + b.l + b.c) / 3 - lo) / bh), 0, N - 1)
+          buy[bi] += b.v * bf
+          sell[bi] += b.v * (1 - bf)
+        }
+        let bt = 0, st = 0
+        for (let i = 0; i < N; i++) { bt += buy[i]; st += sell[i] }
+        return { lo, hi, N, buy, sell, bt, st }
+      }
+
+      const renderDrawing = (d: Drawing, selected: boolean) => {
+        const P = d.pts
+        if (!P.length) return
+        const X0 = xOfTime(P[0].t), Y0 = yOf(P[0].p)
+        const X1 = P.length > 1 ? xOfTime(P[1].t) : X0
+        const Y1 = P.length > 1 ? yOf(P[1].p) : Y0
+        const col = selected ? '#ffffff' : d.type === 'fib' || d.type === 'pricerange' || d.type === 'long' || d.type === 'short' || d.type === 'vprofile' || d.type === 'vbs' ? DCOL.fib : DCOL.def
+        ctx.save()
+        ctx.strokeStyle = col
+        ctx.fillStyle = col
+        ctx.lineWidth = selected ? 1.6 : 1.1
+        ctx.font = '9px ui-monospace, monospace'
+        switch (d.type) {
+          case 'trend':
+            seg(cr(X0), cr(Y0), cr(X1), cr(Y1))
+            break
+          case 'ray': {
+            // extend from P0 through P1 to the plot edge
+            const dx = X1 - X0, dy = Y1 - Y0
+            const k = dx !== 0 ? (dx > 0 ? (plotW - X0) / dx : -X0 / dx) : 1e9
+            const ke = dx !== 0 ? Math.max(0, k) : 1e9
+            seg(cr(X0), cr(Y0), cr(X0 + dx * ke), cr(Y0 + dy * ke))
+            break
+          }
+          case 'hline':
+            ctx.setLineDash([2, 3])
+            seg(0, cr(Y0), plotW, cr(Y0))
+            ctx.setLineDash([])
+            ctx.textAlign = 'left'; ctx.textBaseline = 'bottom'
+            ctx.fillText(P[0].p.toFixed(2), 4, Y0 - 2)
+            break
+          case 'rect': {
+            const x0 = Math.min(X0, X1), x1 = Math.max(X0, X1)
+            const y0 = Math.min(Y0, Y1), y1 = Math.max(Y0, Y1)
+            ctx.globalAlpha = 0.08
+            ctx.fillRect(x0, y0, x1 - x0, y1 - y0)
+            ctx.globalAlpha = 1
+            ctx.strokeRect(cr(x0), cr(y0), cr(x1) - cr(x0), cr(y1) - cr(y0))
+            break
+          }
+          case 'fib': {
+            const xa = Math.min(X0, X1), xb = Math.max(X0, X1)
+            const p0 = P[0].p, p1 = P[1].p
+            seg(cr(xa), cr(Y0), cr(xb), cr(Y1)) // the swing line
+            ctx.textAlign = 'left'; ctx.textBaseline = 'bottom'
+            for (const lv of FIBL) {
+              const pr = p1 + (p0 - p1) * lv
+              const y = cr(yOf(pr))
+              ctx.globalAlpha = lv === 0 || lv === 1 ? 0.95 : 0.7
+              ctx.setLineDash(lv === 0.5 ? [] : [4, 3])
+              seg(xa - 4, y, xb + 4, y)
+              ctx.setLineDash([])
+              ctx.fillText(`${lv}  ${pr.toFixed(2)}`, xa + 4, y - 2)
+            }
+            ctx.globalAlpha = 1
+            break
+          }
+          case 'pricerange': {
+            const x0 = Math.min(X0, X1), x1 = Math.max(X0, X1)
+            const ya = cr(Y0), yb = cr(Y1)
+            ctx.setLineDash([3, 3])
+            ctx.strokeRect(cr(x0), Math.min(ya, yb), cr(x1) - cr(x0), Math.abs(yb - ya))
+            ctx.setLineDash([])
+            const dp = P[1].p - P[0].p
+            const pct = P[0].p ? (dp / P[0].p) * 100 : 0
+            ctx.textAlign = 'right'; ctx.textBaseline = 'bottom'
+            ctx.fillText(`${dp >= 0 ? '+' : ''}${dp.toFixed(2)} (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)`, x1 - 2, (ya + yb) / 2 - 2)
+            break
+          }
+          case 'long':
+          case 'short': {
+            const dir = d.dir ?? 1
+            const pE = P[0].p
+            const pS = d.pS ?? pE * (dir > 0 ? 0.996 : 1.004)
+            const pT = d.pT ?? pE * (dir > 0 ? 1.008 : 0.992)
+            const x0 = Math.min(X0, X1), x1 = Math.max(X0, X1)
+            const yE = yOf(pE), yS = yOf(pS), yT = yOf(pT)
+            ctx.fillStyle = 'rgba(229,72,77,0.13)'
+            ctx.fillRect(x0, Math.min(yE, yS), x1 - x0, Math.abs(yS - yE))
+            ctx.fillStyle = 'rgba(47,191,127,0.13)'
+            ctx.fillRect(x0, Math.min(yE, yT), x1 - x0, Math.abs(yT - yE))
+            const yT2 = Math.min(yE, yS, yT), yB2 = Math.max(yE, yS, yT)
+            ctx.strokeStyle = 'rgba(255,255,255,0.14)'
+            seg(cr(x0), cr(yT2), cr(x0), cr(yB2))
+            seg(cr(x1), cr(yT2), cr(x1), cr(yB2))
+            ctx.lineWidth = 1.1
+            ctx.strokeStyle = DOWN; seg(x0, cr(yS), x1, cr(yS))
+            ctx.strokeStyle = UP; seg(x0, cr(yT), x1, cr(yT))
+            ctx.strokeStyle = '#d6dae0'; ctx.lineWidth = 1.3; seg(x0, cr(yE), x1, cr(yE))
+            const rrV = (d.pS ?? 0) !== (d.pT ?? 0) && pE !== pS ? Math.abs((pT - pE) / (pE - pS)) : 0
+            ctx.font = '500 9px ui-monospace, monospace'
+            ctx.textAlign = 'left'; ctx.textBaseline = 'middle'
+            ctx.fillStyle = dir > 0 ? UP : DOWN
+            ctx.fillRect(x0 + 4, yE - 14, 13, 13)
+            ctx.fillStyle = '#0c0e11'
+            ctx.textAlign = 'center'
+            ctx.fillText(dir > 0 ? 'L' : 'S', x0 + 10.5, yE - 7.4)
+            ctx.textAlign = 'left'
+            ctx.fillStyle = '#d6dae0'
+            ctx.fillText(`ENTRY ${pE.toFixed(2)}`, x0 + 21, yE - 7)
+            ctx.fillStyle = DOWN
+            ctx.fillText(`STOP ${Math.abs((pS - pE) / pE * 100).toFixed(2)}%`, x0 + 5, yS > yE ? yS + 8 : yS - 7)
+            ctx.fillStyle = UP
+            ctx.fillText(`TGT ${Math.abs((pT - pE) / pE * 100).toFixed(2)}%${rrV ? ` · 1:${rrV.toFixed(1)}` : ''}`, x0 + 5, yT < yE ? yT - 7 : yT + 8)
+            break
+          }
+          case 'vprofile': {
+            const t0 = Math.min(P[0].t, P[1].t), t1 = Math.max(P[0].t, P[1].t)
+            const vp = computeVP(t0, t1)
+            if (!vp) break
+            const x0 = Math.min(X0, X1), x1 = Math.max(X0, X1)
+            const maxW = Math.min(Math.max(40, (x1 - x0) * 0.55), 180)
+            const mb = Math.max(...vp.bins) || 1
+            const bh = (vp.hi - vp.lo) / vp.N
+            for (let i = 0; i < vp.N; i++) {
+              const wpx = (vp.bins[i] / mb) * maxW
+              if (wpx < 0.5) continue
+              const yT = yOf(vp.hi - (i + 1) * bh)
+              const hh = Math.max(1, Math.abs(yOf(vp.hi - i * bh) - yT))
+              ctx.fillStyle = i === vp.poc ? 'rgba(224,166,63,0.95)' : (i >= vp.a && i <= vp.b2) ? 'rgba(224,166,63,0.4)' : 'rgba(224,166,63,0.16)'
+              ctx.fillRect(x0, yT, wpx, hh)
+            }
+            const yVAH = cr(yOf(vp.hi - vp.b2 * bh))
+            const yVAL = cr(yOf(vp.hi - (vp.a + 1) * bh))
+            const yPOC = cr(yOf(vp.lo + (vp.poc + 0.5) * bh))
+            ctx.strokeStyle = 'rgba(224,166,63,0.75)'
+            ctx.lineWidth = 1.1
+            ctx.setLineDash([6, 4])
+            seg(x0, yVAH, x1, yVAH); seg(x0, yVAL, x1, yVAL); seg(x0, yPOC, x1, yPOC)
+            ctx.setLineDash([])
+            ctx.strokeStyle = 'rgba(255,255,255,0.2)'
+            ctx.setLineDash([3, 4])
+            seg(cr(x0), yOf(vp.hi), cr(x0), yOf(vp.lo))
+            seg(cr(x1), yOf(vp.hi), cr(x1), yOf(vp.lo))
+            ctx.setLineDash([])
+            ctx.textAlign = 'left'; ctx.textBaseline = 'bottom'
+            ctx.fillStyle = 'rgba(224,166,63,0.95)'
+            ctx.fillText(`VAH ${(vp.hi - vp.b2 * bh).toFixed(2)}`, x0 + 4, yVAH - 2)
+            ctx.fillText(`POC ${(vp.lo + (vp.poc + 0.5) * bh).toFixed(2)}`, x0 + 4, yPOC - 2)
+            ctx.textBaseline = 'top'
+            ctx.fillText(`VAL ${(vp.hi - (vp.a + 1) * bh).toFixed(2)}`, x0 + 4, yVAL + 2)
+            ctx.textAlign = 'right'; ctx.textBaseline = 'bottom'
+            ctx.fillText(`VP · ${fmtVol(vp.tv || 0)}`, x1 - 4, yOf(vp.hi) - 4)
+            break
+          }
+          case 'vbs': {
+            const t0 = Math.min(P[0].t, P[1].t), t1 = Math.max(P[0].t, P[1].t)
+            const vp = computeBSV(t0, t1)
+            if (!vp) break
+            const x0 = Math.min(X0, X1), x1 = Math.max(X0, X1)
+            const cx = (x0 + x1) / 2
+            const bh = (vp.hi - vp.lo) / vp.N
+            const yHi2 = yOf(vp.hi), yLo2 = yOf(vp.lo)
+            ctx.fillStyle = 'rgba(255,255,255,0.035)'
+            ctx.fillRect(x0, yHi2, x1 - x0, yLo2 - yHi2)
+            ctx.strokeStyle = 'rgba(255,255,255,0.2)'
+            ctx.strokeRect(cr(x0), cr(yHi2), cr(x1) - cr(x0), cr(yLo2) - cr(yHi2))
+            ctx.strokeStyle = 'rgba(255,255,255,0.32)'
+            seg(cr(x0), cr(yHi2), cr(x0), cr(yLo2))
+            seg(cr(x1), cr(yHi2), cr(x1), cr(yLo2))
+            ctx.strokeStyle = 'rgba(255,255,255,0.12)'
+            ctx.setLineDash([3, 4])
+            seg(cr(cx), cr(yHi2), cr(cx), cr(yLo2))
+            ctx.setLineDash([])
+            let mNet = 1e-9
+            for (let i = 0; i < vp.N; i++) mNet = Math.max(mNet, Math.abs(vp.buy[i] - vp.sell[i]))
+            const wMax = clamp((x1 - x0) * 0.5 - 8, 20, 150)
+            for (let i = 0; i < vp.N; i++) {
+              const net = vp.buy[i] - vp.sell[i]
+              if (Math.abs(net) < mNet * 0.05) continue
+              const wpx = (Math.abs(net) / mNet) * wMax
+              const yT = yOf(vp.hi - (i + 1) * bh)
+              const hh = Math.max(1, Math.abs(yOf(vp.hi - i * bh) - yT))
+              ctx.fillStyle = net > 0 ? 'rgba(47,191,127,0.55)' : 'rgba(229,72,77,0.55)'
+              ctx.fillRect(net > 0 ? cx : cx - wpx, yT, wpx, hh)
+            }
+            const bp2 = vp.bt + vp.st > 0 ? (vp.bt / (vp.bt + vp.st)) * 100 : 50
+            ctx.font = '600 9.5px ui-monospace, monospace'
+            ctx.textAlign = 'right'; ctx.textBaseline = 'bottom'
+            ctx.fillStyle = bp2 >= 50 ? UP : DOWN
+            ctx.fillText(`BSV · BUY ${bp2.toFixed(0)}% / SELL ${(100 - bp2).toFixed(0)}% · ${fmtVol(vp.bt)} / ${fmtVol(vp.st)}`, x1 - 4, yHi2 - 4)
+            break
+          }
+        }
+        // selection handles (endpoint dots)
+        if (selected) {
+          ctx.fillStyle = '#ffffff'
+          ctx.strokeStyle = '#0b0e11'
+          for (const pt of P) {
+            ctx.beginPath(); ctx.arc(xOfTime(pt.t), yOf(pt.p), 3.2, 0, Math.PI * 2)
+            ctx.fill(); ctx.stroke()
+          }
+        }
+        ctx.restore()
+      }
+
+      for (const d of drawingsRef.current) renderDrawing(d, d.id === selIdRef.current)
+      // pending preview (2-pt tools armed, first point set)
+      const pend = pendingRef.current
+      if (pend) {
+        const preview: Drawing = { ...pend }
+        if (pend.pts.length === 1 && inPlot) preview.pts = [pend.pts[0], { t: mouseT, p: pMax - (mouse!.y / priceH) * (pMax - pMin) }]
+        renderDrawing(preview, true)
+        if (pend.pts.length === 1 && inPlot) {
+          ctx.fillStyle = '#e0a63f'
+          ctx.beginPath(); ctx.arc(xOfTime(pend.pts[0].t), yOf(pend.pts[0].p), 3, 0, Math.PI * 2); ctx.fill()
+        }
+      }
+
+      // ================= legend + crosshair =================
+      const drawLegend = (c: Candle, idxTime: number, livePct: number | null, inner: Candle | null) => {
         const up = c.c >= c.o
         ctx.textAlign = 'left'
         ctx.textBaseline = 'top'
@@ -856,30 +1413,59 @@ export function CanvasChart({
         ctx.fillText(ltpTxt, x, 4); x += ctx.measureText(ltpTxt).width + 8
         if (livePct != null) {
           ctx.fillStyle = livePct >= 0 ? UP : DOWN
-          ctx.fillText(`${livePct >= 0 ? '+' : ''}${livePct.toFixed(2)}%`, x, 4); x += ctx.measureText(`${livePct >= 0 ? '+' : ''}${livePct.toFixed(2)}%`).width + 10
+          const pctTxt = `${livePct >= 0 ? '+' : ''}${livePct.toFixed(2)}%`
+          ctx.fillText(pctTxt, x, 4); x += ctx.measureText(pctTxt).width + 10
         }
         const parts: [string, number][] = [['O', c.o], ['H', c.h], ['L', c.l], ['C', c.c]]
         for (const [k, v] of parts) {
           ctx.fillStyle = '#8b949e'
           ctx.fillText(k, x, 4); x += 10
           ctx.fillStyle = up ? UP : DOWN
-          ctx.fillText(v.toFixed(2), x, 4); x += ctx.measureText(v.toFixed(2)).width + 8
+          const vt = v.toFixed(2)
+          ctx.fillText(vt, x, 4); x += ctx.measureText(vt).width + 8
         }
         if (c.v > 0) {
           ctx.fillStyle = '#8b949e'
-          ctx.fillText(`V ${fmtVol(c.v)}`, x, 4); x += ctx.measureText(`V ${fmtVol(c.v)}`).width + 8
+          const vTxt = `V ${fmtVol(c.v)}`
+          ctx.fillText(vTxt, x, 4); x += ctx.measureText(vTxt).width + 8
         }
         ctx.fillStyle = '#56606b'
         ctx.fillText(fmtAxisTime(idxTime, tf), x, 4)
-        // indicator readouts
         if (rsiArr) {
           const i = Math.max(0, Math.min(data.length - 1, Math.round((idxTime - data[0].t) / tfMs)))
           const v = rsiArr[i]
-          if (v != null) { ctx.fillStyle = v > 70 ? DOWN : v < 30 ? UP : '#f5a623'; ctx.fillText(`RSI ${v.toFixed(1)}`, x, 4) }
+          if (v != null) { ctx.fillStyle = v > 70 ? DOWN : v < 30 ? UP : '#f5a623'; ctx.fillText(` RSI ${v.toFixed(1)}`, x, 4) }
+        }
+        // ---- inner 1m row (always when tf > 1m: "mouse over shows 1m") ----
+        if (inner && tfMs > 60_000) {
+          const iup = inner.c >= inner.o
+          let ix = 14
+          ctx.fillStyle = '#e0a63f'
+          ctx.fillText('1m', ix, 17); ix += ctx.measureText('1m').width + 6
+          ctx.fillStyle = iup ? UP : DOWN
+          const parts1: [string, number][] = [['O', inner.o], ['H', inner.h], ['L', inner.l], ['C', inner.c]]
+          for (const [k, v] of parts1) {
+            ctx.fillStyle = '#8b949e'
+            ctx.fillText(k, ix, 17); ix += 10
+            ctx.fillStyle = iup ? UP : DOWN
+            const vt = v.toFixed(2)
+            ctx.fillText(vt, ix, 17); ix += ctx.measureText(vt).width + 7
+          }
+          if (inner.v > 0) {
+            ctx.fillStyle = '#8b949e'
+            const vTxt = `V ${fmtVol(inner.v)}`
+            ctx.fillText(vTxt, ix, 17); ix += ctx.measureText(vTxt).width + 7
+          }
+          ctx.fillStyle = '#56606b'
+          ctx.fillText(fmtAxisTime(inner.t, tf, true), ix, 17)
         }
       }
-      // focus candle: hovered > synced > last
+      // focus candle: hovered > synced > last; inner 1m follows the same time
       let focus: { c: Candle; t: number } | null = { c: lastC, t: lastT }
+      let focusInner: Candle | null = null
+      if (ghost.length > 0 && tfMs > 60_000) {
+        focusInner = ghost[Math.min(ghost.length - 1, Math.max(0, gi >= 0 ? gi : ghost.length - 1))] ?? null
+      }
       const drawCrossAt = (slotIdx: number, own: boolean, syncPrice: number | null) => {
         if (slotIdx < 0 || slotIdx >= slots) return
         const x = xOf(slotIdx)
@@ -909,7 +1495,6 @@ export function CanvasChart({
           ctx.fillText(syncPrice.toFixed(2), plotW + axisW / 2, sy)
         }
         ctx.setLineDash([])
-        // time bubble
         const t = timeOfSlot(slotIdx)
         ctx.fillStyle = '#2a3441'
         ctx.textAlign = 'center'
@@ -918,28 +1503,32 @@ export function CanvasChart({
         ctx.fillStyle = '#e6e9ec'
         ctx.fillText(fmtAxisTime(t, tf), Math.min(plotW - 24, Math.max(24, x)), h - axisH + 4)
         const c = vis[slotIdx]
-        if (c) focus = { c, t }
+        if (c) {
+          focus = { c, t }
+          if (ghost.length > 0 && tfMs > 60_000) {
+            const i = lowerBoundTime(ghost, t)
+            const j = clamp(inPlot && Math.abs(mouseT - t) < tfMs ? gi : (i > 0 ? i - 1 : 0), 0, ghost.length - 1)
+            focusInner = ghost[j] ?? null
+          }
+        }
       }
 
       // own crosshair
-      if (!mini && crossRef.current && crossRef.current.x < plotW && crossRef.current.y < h - axisH) {
-        const slotIdx = Math.min(slots - 1, Math.max(0, Math.floor(crossRef.current.x / cw)))
+      if (!mini && crossRef.current && crossRef.current.x < plotW && crossRef.current.y < h - axisH && mouse?.inPlot !== false) {
+        const slotIdx = clamp(Math.floor(crossRef.current.x / cw), 0, slots - 1)
         drawCrossAt(slotIdx, true, null)
       }
       // synced crosshair from another chart (same interval)
       const sc = syncCrossRef.current
       if (!mini && sc) {
-        // sc.slot carries the candle TIME (set by the sync bus)
-        const slot0 = timeOfSlot(0)
-        const slotIdx = Math.round((sc.slot - slot0) / tfMs)
+        const slotIdx = Math.round((sc.slot - t0Slot) / tfMs)
         drawCrossAt(slotIdx, false, sc.price)
       }
 
-      // day change reference for the legend %
       const fc = focus as { c: Candle; t: number } | null
       if (fc) {
         const pct = dayRef ? ((fc.c.c - dayRef) / dayRef) * 100 : null
-        drawLegend(fc.c, fc.t, pct)
+        drawLegend(fc.c, fc.t, pct, focusInner)
       }
     }
 
@@ -948,9 +1537,106 @@ export function CanvasChart({
     const ro = new ResizeObserver(() => forceRender(n => n + 1))
     ro.observe(wrap)
     return () => { cancelAnimationFrame(raf); ro.disconnect() }
-  }, [candles, ghost, barCount, chartType, showVolume, showSMA20, showSMA50, showEMA, showVWAP, showBOLL, showRSI, showMACD, showGhost, ghostStyle, scales, markers, symbol, tf, loading, err, mini])
+  }, [candles, ghost, barCount, settings, drawings, markers, symbol, tf, loading, err, mini, selId])
 
   // ---- interactions ----
+  const priceAtY = (y: number): number => {
+    const win = winRef.current
+    return win.pMax - (y / (win.priceH || 1)) * (win.pMax - win.pMin)
+  }
+  const timeAtX = (x: number): number => {
+    const g = geoRef.current
+    return g.t0 + ((x - g.cw / 2) / g.cw) * g.tfMs
+  }
+  const dataPt = (x: number, y: number): DrawPt => ({ t: timeAtX(x), p: priceAtY(y) })
+
+  const hitDrawing = (x: number, y: number): { d: Drawing; mode: 'move' | 'pt'; pi?: number } | null => {
+    const g = geoRef.current
+    if (x > g.plotW || y > g.priceH) return null
+    const X = (t: number) => ((t - g.t0) / g.tfMs) * g.cw + g.cw / 2
+    const Y = (p: number) => ((g.pMax - p) / (g.pMax - g.pMin)) * g.priceH
+    const list = drawingsRef.current
+    for (let i = list.length - 1; i >= 0; i--) {
+      const d = list[i]
+      const P = d.pts
+      if (!P.length) continue
+      for (let pi = 0; pi < P.length; pi++) {
+        if (Math.hypot(x - X(P[pi].t), y - Y(P[pi].p)) < 7) return { d, mode: 'pt', pi }
+      }
+      const X0 = X(P[0].t), Y0 = Y(P[0].p)
+      const X1 = P.length > 1 ? X(P[1].t) : X0
+      const Y1 = P.length > 1 ? Y(P[1].p) : Y0
+      let hit = false
+      switch (d.type) {
+        case 'trend':
+        case 'ray':
+          hit = distSeg(x, y, X0, Y0, X1, Y1) < 5
+          break
+        case 'hline':
+          hit = Math.abs(y - Y0) < 5
+          break
+        case 'rect': {
+          const xa = Math.min(X0, X1), xb = Math.max(X0, X1)
+          const ya = Math.min(Y0, Y1), yb = Math.max(Y0, Y1)
+          hit = ((Math.abs(y - ya) < 5 || Math.abs(y - yb) < 5) && x >= xa - 4 && x <= xb + 4)
+            || ((Math.abs(x - xa) < 5 || Math.abs(x - xb) < 5) && y >= ya - 4 && y <= yb + 4)
+          break
+        }
+        case 'fib': {
+          const xa = Math.min(X0, X1), xb = Math.max(X0, X1)
+          if (x < xa - 6 || x > xb + 6) break
+          const p0 = P[0].p, p1 = P[1].p
+          for (const lv of FIBL) {
+            if (Math.abs(y - Y(p1 + (p0 - p1) * lv)) < 4) { hit = true; break }
+          }
+          break
+        }
+        case 'pricerange': {
+          const xa = Math.min(X0, X1), xb = Math.max(X0, X1)
+          const ya = Math.min(Y0, Y1), yb = Math.max(Y0, Y1)
+          hit = ((Math.abs(y - ya) < 5 || Math.abs(y - yb) < 5) && x >= xa - 4 && x <= xb + 4)
+            || ((Math.abs(x - xa) < 5 || Math.abs(x - xb) < 5) && y >= ya - 4 && y <= yb + 4)
+          break
+        }
+        case 'long':
+        case 'short': {
+          const dir = d.dir ?? 1
+          const pE = P[0].p
+          const pS = d.pS ?? pE * (dir > 0 ? 0.996 : 1.004)
+          const pT = d.pT ?? pE * (dir > 0 ? 1.008 : 0.992)
+          const xa = Math.min(X0, X1), xb = Math.max(X0, X1)
+          if (x < xa - 4 || x > xb + 4) break
+          hit = Math.abs(y - Y(pE)) < 5 || Math.abs(y - Y(pS)) < 5 || Math.abs(y - Y(pT)) < 5
+          break
+        }
+        case 'vprofile':
+        case 'vbs': {
+          const xa = Math.min(X0, X1), xb = Math.max(X0, X1)
+          hit = x >= xa - 5 && x <= xb + 5
+          break
+        }
+      }
+      if (hit) return { d, mode: 'move' }
+    }
+    return null
+  }
+
+  const finishPending = (secondPt: DrawPt) => {
+    const pend = pendingRef.current
+    pendingRef.current = null
+    if (!pend) return
+    const P = [pend.pts[0], secondPt]
+    if (pend.type === 'vprofile' || pend.type === 'vbs') {
+      const bars = Math.abs(P[1].t - P[0].t) / (geoRef.current.tfMs || 1)
+      if (bars < 3) { setToolBoth('cursor'); return } // too narrow — cancel
+    } else if (pend.type === 'fib' || pend.type === 'pricerange') {
+      if (Math.abs(P[1].p - P[0].p) < 1e-9) { setToolBoth('cursor'); return }
+    } else if (Math.abs(P[1].t - P[0].t) < 1e-6 && Math.abs(P[1].p - P[0].p) < 1e-9) {
+      setToolBoth('cursor'); return
+    }
+    newDrawing({ type: pend.type, pts: P, dir: pend.dir })
+  }
+
   const onWheel = (e: React.WheelEvent) => {
     e.preventDefault()
     const rect = canvasRef.current!.getBoundingClientRect()
@@ -964,18 +1650,63 @@ export function CanvasChart({
     }
     setDirty(true)
   }
+
   const onMouseDown = (e: React.MouseEvent) => {
     const rect = canvasRef.current!.getBoundingClientRect()
     const x = e.clientX - rect.left
     const y = e.clientY - rect.top
     const win = winRef.current
+
+    // ---- draw tool armed: create/continue drawings instead of panning ----
+    if (toolRef.current !== 'cursor' && x < win.plotW && y < win.priceH) {
+      const t = toolRef.current as DrawTool
+      const pt = dataPt(x, y)
+      if (pendingRef.current && pendingRef.current.pts.length === 1) {
+        finishPending(pt)
+        return
+      }
+      if (TWO_PT_TOOLS.has(t)) {
+        pendingRef.current = { id: 'pending', type: t, pts: [pt] }
+        return
+      }
+      if (t === 'hline') {
+        newDrawing({ type: 'hline', pts: [pt] })
+        return
+      }
+      if (t === 'long' || t === 'short') {
+        const dir: 1 | -1 = t === 'long' ? 1 : -1
+        const pE = pt.p
+        const pS = dir > 0 ? pE * 0.996 : pE * 1.004
+        const pT = dir > 0 ? pE * 1.008 : pE * 0.992
+        const g = geoRef.current
+        newDrawing({
+          type: t,
+          pts: [{ t: pt.t - 40 * g.tfMs, p: pE }, { t: pt.t + 40 * g.tfMs, p: pE }],
+          dir,
+          pS,
+          pT,
+        } as Drawing)
+        return
+      }
+      return
+    }
+
+    // ---- cursor tool: drawings select first, then baseline, then pan ----
+    const hit = hitDrawing(x, y)
+    if (hit) {
+      setSel(hit.d.id)
+      dragDrawRef.current = { d: hit.d, mode: hit.mode, pi: hit.pi, startMouse: { x: e.clientX, y: e.clientY }, orig: JSON.parse(JSON.stringify(hit.d)) as Drawing }
+      return
+    }
+    setSel(null)
+
     // baseline drag zone (scales % / pts enabled): grab within 5px of the line
-    const sc = scales
+    const sc = settings.scales
     const baselineEnabled = sc && (sc.pct || sc.inv || sc.pts) && !mini
     if (baselineEnabled && x < win.plotW && y <= win.priceH) {
       const meta = drawMetaRef.current
       if (meta.yBase >= 0 && Math.abs(y - meta.yBase) <= 5) {
-        baseRef.current = meta.baseline // freeze the (possibly default) baseline
+        baseRef.current = meta.baseline
         dragRef.current = { zone: 'base', startX: e.clientX, startY: e.clientY, startOffset: 0, startPriceOff: 0, startPriceZoom: 1, pxPerPx: (win.pMax - win.pMin) / (win.priceH || 1), moved: 0 }
         return
       }
@@ -992,32 +1723,55 @@ export function CanvasChart({
       moved: 0,
     }
   }
+
   const onMouseMove = (e: React.MouseEvent) => {
     const rect = canvasRef.current!.getBoundingClientRect()
-    crossRef.current = { x: e.clientX - rect.left, y: e.clientY - rect.top }
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
     const win = winRef.current
+    crossRef.current = { x, y, inPlot: x < win.plotW && y < win.priceH }
     // publish to the sync bus (same-interval charts follow)
-    if (win.plotW > 0 && candles.length > 1) {
+    if (win.plotW > 0 && candles.length > 1 && x < win.plotW) {
       const tfMs = TF_MS[tf as keyof typeof TF_MS] ?? 60_000
       const end = candles.length - Math.round(offsetRef.current)
       const start = Math.min(end - barCount, candles.length - 2)
       const cw = win.plotW / (end - start)
-      const slotIdx = Math.floor((e.clientX - rect.left) / cw)
+      const slotIdx = Math.floor(x / cw)
       const di = start + slotIdx
       const lastT = candles[candles.length - 1].t
       const t = di < candles.length ? candles[di].t : lastT + (di - (candles.length - 1)) * tfMs
-      const price = e.clientY - rect.top <= win.priceH
-        ? win.pMax - ((e.clientY - rect.top) / win.priceH) * (win.pMax - win.pMin)
+      const price = y <= win.priceH
+        ? win.pMax - (y / win.priceH) * (win.pMax - win.pMin)
         : null
       emitCross({ src: chartId.current, tf, t, price })
     }
+
+    // live drawing edit (mutates the ref mirror so the RAF loop sees it)
+    const dd = dragDrawRef.current
+    if (dd) {
+      const dx = e.clientX - dd.startMouse.x
+      const dy = e.clientY - dd.startMouse.y
+      const g = geoRef.current
+      const pxPerPx = (g.pMax - g.pMin) / (g.priceH || 1)
+      const next: Drawing = { ...dd.orig, pts: dd.orig.pts.map(p => ({ ...p })) }
+      if (dd.mode === 'pt' && dd.pi != null) {
+        next.pts[dd.pi] = dataPt(x, y)
+      } else {
+        const dt = (dx / (g.cw || 1)) * g.tfMs
+        const dp = -dy * pxPerPx
+        next.pts = next.pts.map(p => ({ t: p.t + dt, p: p.p + dp }))
+      }
+      drawingsRef.current = drawingsRef.current.map(d => (d.id === dd.d.id ? next : d))
+      forceRender(n => n + 1)
+      return
+    }
+
     const d = dragRef.current
     if (!d) return
     d.moved = Math.max(d.moved, Math.abs(e.clientX - d.startX) + Math.abs(e.clientY - d.startY))
     if (d.zone === 'base') {
-      // drag the baseline — % and pts scales follow ("rearrange")
-      const y = Math.min(win.priceH, Math.max(0, e.clientY - rect.top))
-      baseRef.current = Number((win.pMax - (y / (win.priceH || 1)) * (win.pMax - win.pMin)).toFixed(2))
+      const yy = Math.min(win.priceH, Math.max(0, y))
+      baseRef.current = Number((win.pMax - (yy / (win.priceH || 1)) * (win.pMax - win.pMin)).toFixed(2))
       return
     }
     if (d.zone === 'price') {
@@ -1035,7 +1789,29 @@ export function CanvasChart({
     }
     setDirty(true)
   }
+
   const onMouseUp = (e: React.MouseEvent) => {
+    // finish a live drawing edit
+    if (dragDrawRef.current) {
+      dragDrawRef.current = null
+      commitDrawings(drawingsRef.current)
+      return
+    }
+    // 2-pt tool: drag-release commits when the drag covered >24px
+    const pend = pendingRef.current
+    if (pend && pend.pts.length === 1) {
+      const rect = canvasRef.current!.getBoundingClientRect()
+      const x = e.clientX - rect.left
+      const y = e.clientY - rect.top
+      const g = geoRef.current
+      const sx = g.cw / 2 + ((pend.pts[0].t - g.t0) / g.tfMs) * g.cw
+      const sy = g.priceH * ((g.pMax - pend.pts[0].p) / (g.pMax - g.pMin))
+      if (Math.hypot(x - sx, y - sy) > 24) {
+        finishPending(dataPt(x, y))
+      }
+      return // else stay pending — click-click mode
+    }
+
     const d = dragRef.current
     dragRef.current = null
     if (!d || d.moved >= 4) return
@@ -1053,43 +1829,239 @@ export function CanvasChart({
         window.dispatchEvent(new Event(BASE_SET_EVENT))
         return
       }
-      onPriceClick?.(price)
+      if (toolRef.current === 'cursor' && !pendingRef.current) onPriceClick?.(price)
     }
   }
   const onMouseLeave = () => {
     crossRef.current = null
     dragRef.current = null
+    dragDrawRef.current = null
     emitCross({ src: chartId.current, tf, t: null, price: null })
+  }
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (selIdRef.current) {
+        commitDrawings(drawingsRef.current.filter(d => d.id !== selIdRef.current))
+        setSel(null)
+        e.preventDefault()
+      }
+    } else if (e.key === 'Escape') {
+      pendingRef.current = null
+      setSel(null)
+      setToolBoth('cursor')
+    }
+  }
+  const onContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault()
+    pendingRef.current = null
+    setSel(null)
+    setToolBoth('cursor')
   }
   const resetView = () => {
     offsetRef.current = 0
     priceZoomRef.current = 1
     priceOffRef.current = 0
-    baseRef.current = null // baseline returns to the day-open ref
+    baseRef.current = null
     setBarCount(mini ? 60 : 120)
     setDirty(false)
   }
+
+  const showControls = (controls ?? !mini) && !mini
+  const ghostDisabled = tf === '1m'
 
   return (
     <div ref={wrapRef} className={`relative w-full ${height} select-none`} data-chart-root>
       <canvas
         ref={canvasRef}
-        className="absolute inset-0 cursor-crosshair"
+        tabIndex={0}
+        className="absolute inset-0 cursor-crosshair outline-none"
         onWheel={onWheel}
         onMouseDown={onMouseDown}
         onMouseMove={onMouseMove}
         onMouseUp={onMouseUp}
         onMouseLeave={onMouseLeave}
         onDoubleClick={resetView}
+        onKeyDown={onKeyDown}
+        onContextMenu={onContextMenu}
       />
-      <div className="absolute right-16 top-1.5 flex gap-2 text-[9px] text-muted-foreground pointer-events-none">
-        {showSMA20 && <span className="text-[#4dd0e1]">SMA20</span>}
-        {showSMA50 && <span className="text-[#b48ce8]">SMA50</span>}
-        {showEMA && <span className="text-[#ffd166]">EMA9/21</span>}
-        {showVWAP && <span className="text-[#4dd0e1]">VWAP</span>}
-        {showBOLL && <span className="text-muted-foreground">BB</span>}
-        {showGhost && tf !== '1m' && <span className="text-[#e0a63f]">1M GHOST</span>}
-      </div>
+
+      {/* ---- per-chart control bar (#chartbar) ---- */}
+      {showControls && (
+        <div className="absolute right-1.5 top-1 flex items-center gap-0.5 z-10">
+          {/* chart type icon — candles / line / area */}
+          <Popover>
+            <PopoverTrigger asChild>
+              <button
+                className="p-1 rounded bg-card/80 border border-border text-muted-foreground hover:text-foreground"
+                title="Chart type"
+              >
+                {settings.chartType === 'candles' ? <CandlestickChart className="h-3 w-3" />
+                  : settings.chartType === 'line' ? <LineChart className="h-3 w-3" />
+                  : <AreaChart className="h-3 w-3" />}
+              </button>
+            </PopoverTrigger>
+            <PopoverContent align="end" className="w-36 p-1 text-[10px]">
+              {([['candles', 'Candles', CandlestickChart], ['line', 'Line', LineChart], ['area', 'Area', AreaChart]] as const).map(([t, label, Icon]) => (
+                <button
+                  key={t}
+                  onClick={() => patchSettings({ chartType: t as ChartType })}
+                  className={`w-full flex items-center gap-2 px-2 py-1 rounded ${settings.chartType === t ? 'bg-primary/20 text-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
+                >
+                  <Icon className="h-3.5 w-3.5" /> {label}
+                </button>
+              ))}
+            </PopoverContent>
+          </Popover>
+
+          {/* indicators icon — per-chart list */}
+          <Popover>
+            <PopoverTrigger asChild>
+              <button
+                className={`p-1 rounded bg-card/80 border border-border ${Object.values(settings.ind).some(Boolean) ? 'text-[#4dd0e1]' : 'text-muted-foreground'} hover:text-foreground`}
+                title="Indicators — per-chart selection"
+              >
+                <Sigma className="h-3 w-3" />
+              </button>
+            </PopoverTrigger>
+            <PopoverContent align="end" className="w-44 p-2 text-[10px] space-y-1">
+              <div className="text-[8px] uppercase tracking-wide text-muted-foreground">overlays</div>
+              {([
+                ['sma20', 'MA 20'], ['sma50', 'MA 50'], ['ema', 'EMA 9/21'],
+                ['vwap', 'VWAP (session)'], ['boll', 'Bollinger 20·2'],
+              ] as [keyof IndicatorCfg, string][]).map(([k, label]) => (
+                <label key={k} className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={!!settings.ind[k]}
+                    onChange={ev => patchSettings({ ind: { ...settings.ind, [k]: ev.target.checked } })}
+                    className="accent-[#3b82f6] h-3 w-3"
+                  />
+                  <span>{label}</span>
+                </label>
+              ))}
+              <div className="text-[8px] uppercase tracking-wide text-muted-foreground pt-1">sub-panels</div>
+              {([
+                ['rsi', 'RSI 14'], ['macd', 'MACD 12·26·9'], ['vol', 'Volume'],
+              ] as [keyof IndicatorCfg, string][]).map(([k, label]) => (
+                <label key={k} className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={!!settings.ind[k]}
+                    onChange={ev => patchSettings({ ind: { ...settings.ind, [k]: ev.target.checked } })}
+                    className="accent-[#3b82f6] h-3 w-3"
+                  />
+                  <span>{label}</span>
+                </label>
+              ))}
+            </PopoverContent>
+          </Popover>
+
+          {/* ghost toggle (#ghostCtl) — only above 1m */}
+          <button
+            onClick={() => !ghostDisabled && patchSettings({ ghost: !settings.ghost })}
+            disabled={ghostDisabled}
+            title={ghostDisabled ? 'Ghost candles need a timeframe above 1m' : '1M GHOST — inner 1-minute candles inside higher-tf shells'}
+            className={`p-1 rounded bg-card/80 border border-border ${ghostDisabled ? 'opacity-40 text-muted-foreground' : settings.ghost ? 'text-[#e0a63f] border-[#e0a63f]/40' : 'text-muted-foreground hover:text-foreground'}`}
+          >
+            <Ghost className="h-3 w-3" />
+          </button>
+          {settings.ghost && !ghostDisabled && (
+            <div className="flex rounded overflow-hidden border border-border">
+              {(['hollow', 'fade'] as const).map(s => (
+                <button
+                  key={s}
+                  onClick={() => patchSettings({ ghostStyle: s })}
+                  className={`px-1 py-0.5 text-[8px] uppercase ${(settings.ghostStyle ?? 'hollow') === s ? 'bg-primary text-primary-foreground' : 'bg-card/80 text-muted-foreground'}`}
+                >{s === 'hollow' ? 'H' : 'F'}</button>
+              ))}
+            </div>
+          )}
+
+          {/* scales */}
+          <Popover>
+            <PopoverTrigger asChild>
+              <button
+                className="p-1 rounded bg-card/80 border border-border text-muted-foreground hover:text-foreground"
+                title="Axis scales — price / percent / inverted % / points + baseline"
+              >
+                <Ruler className="h-3 w-3" />
+              </button>
+            </PopoverTrigger>
+            <PopoverContent align="end" className="w-60 p-2.5 text-[10px] space-y-2">
+              <div className="text-[8px] uppercase tracking-wide text-muted-foreground">topmost enabled = right axis · others = left measurement column</div>
+              {([
+                ['price', 'Price'],
+                ['pct', 'Percent'],
+                ['inv', 'Inverted % (sellers)'],
+                ['pts', 'Points'],
+              ] as [keyof ScalesCfg, string][]).map(([k, label]) => (
+                <label key={k} className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={!!settings.scales?.[k]}
+                    onChange={ev => patchSettings({ scales: { ...(settings.scales ?? { price: true, pct: false, inv: false, pts: false }), [k]: ev.target.checked } })}
+                    className="accent-[#3b82f6]"
+                  />
+                  <span>{label}</span>
+                </label>
+              ))}
+              <button
+                onClick={() => window.dispatchEvent(new Event(BASE_PICK_EVENT))}
+                className="w-full mt-1 px-2 py-1 rounded bg-[#e0a63f]/20 border border-[#e0a63f]/40 text-[#e0a63f] font-semibold hover:bg-[#e0a63f]/30"
+              >
+                Set baseline — then click this chart
+              </button>
+            </PopoverContent>
+          </Popover>
+
+          {/* draw tools (#tools) */}
+          <Popover>
+            <PopoverTrigger asChild>
+              <button
+                className={`p-1 rounded bg-card/80 border border-border ${tool !== 'cursor' || drawings.length > 0 ? 'text-[#5fb0d8]' : 'text-muted-foreground'} hover:text-foreground`}
+                title="Draw tools — trend, ray, h-line, box, fib, measure, position, volume profile, buy/sell imbalance"
+              >
+                <PenLine className="h-3 w-3" />
+              </button>
+            </PopoverTrigger>
+            <PopoverContent align="end" className="w-64 p-1.5 text-[10px]">
+              <button
+                onClick={() => setToolBoth('cursor')}
+                className={`w-full flex items-center gap-2 px-2 py-1 rounded ${tool === 'cursor' ? 'bg-primary/20 text-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
+              >
+                <MousePointer2 className="h-3 w-3" /> Cursor / select
+              </button>
+              {TOOL_META.map(t => (
+                <button
+                  key={t.id}
+                  onClick={() => { setToolBoth(t.id); pendingRef.current = null }}
+                  className={`w-full flex items-center justify-between gap-2 px-2 py-1 rounded ${tool === t.id ? 'bg-primary/20 text-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
+                >
+                  <span>{t.label}</span>
+                  <span className="text-[8px] text-muted-foreground/70">{t.hint}</span>
+                </button>
+              ))}
+              <div className="border-t border-border mt-1 pt-1 flex items-center justify-between px-2">
+                <span className="text-[8px] text-muted-foreground">{drawings.length} object(s) · Del removes selected</span>
+                <button
+                  onClick={() => { commitDrawings([]); setSel(null) }}
+                  className="p-1 rounded text-muted-foreground hover:text-[#ff4d5e]"
+                  title="Clear all drawings on this chart"
+                >
+                  <Trash2 className="h-3 w-3" />
+                </button>
+              </div>
+            </PopoverContent>
+          </Popover>
+        </div>
+      )}
+
+      {/* active draw tool hint */}
+      {showControls && tool !== 'cursor' && (
+        <div className="absolute left-1/2 top-1 -translate-x-1/2 px-2 py-0.5 rounded bg-[#5fb0d8]/20 border border-[#5fb0d8]/40 text-[#5fb0d8] text-[9px] font-semibold pointer-events-none whitespace-nowrap">
+          {TOOL_META.find(t => t.id === tool)?.label} — {TOOL_META.find(t => t.id === tool)?.hint} · esc cancels
+        </div>
+      )}
       {baseArmed && (
         <div className="absolute left-1/2 top-1.5 -translate-x-1/2 px-2 py-0.5 rounded bg-[#e0a63f] text-black text-[9px] font-bold pointer-events-none">
           click the chart to set the scales baseline
@@ -1112,3 +2084,4 @@ export function CanvasChart({
     </div>
   )
 }
+

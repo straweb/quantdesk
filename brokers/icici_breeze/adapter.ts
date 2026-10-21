@@ -215,6 +215,43 @@ const breezeAdapter: BrokerAdapter = {
     return { cash, utilized: num(r.margin_utilized) ?? num(r.utilized_amount) ?? 0 }
   },
 
+  async getHoldings(ctx) {
+    if (!ctx.credentials?.sessionToken) return []
+    const res = await liveFetch<{ Status?: number; Result?: Record<string, unknown>[] }>(`${BASE}/portfolio/holdings`, { headers: breezeHeaders(ctx.credentials), timeoutMs: 6000 })
+    const arr = Array.isArray(res.data?.Result) ? res.data!.Result : []
+    return arr.map(h => ({
+      symbol: String(h.stock_code ?? ''),
+      isin: h.isin ? String(h.isin) : undefined,
+      qty: num(h.quantity) ?? num(h.holding_quantity) ?? 0,
+      avgPrice: num(h.average_price) ?? num(h.buy_avg_price) ?? 0,
+      ltp: num(h.ltp) ?? num(h.last_price) ?? undefined,
+      pnl: num(h.pnl) ?? undefined,
+      product: String(h.product ?? 'cash'),
+    }))
+  },
+
+  async marginCalc(ctx, params) {
+    if (!ctx.credentials?.sessionToken) return null
+    const q = new URLSearchParams({
+      action: params.side.toLowerCase(),
+      exchange_code: ctx.symbolMap.exchange === 'NFO' ? 'NFO' : 'NSE',
+      product: params.productType === 'CNC' ? 'cash' : ctx.symbolMap.instrumentType === 'FUT' ? 'futures' : 'options',
+      quantity: String(params.qty),
+      price: String(params.price),
+    })
+    const res = await liveFetch<{ Status?: number; Result?: Record<string, unknown> }>(`${BASE}/customer/margins?${q}`, { headers: breezeHeaders(ctx.credentials), timeoutMs: 5000 })
+    const r = res.data?.Result ?? {}
+    if (!res.ok || !r || Array.isArray(r)) return { required: 0, detail: 'margin API unreachable' }
+    return {
+      required: num(r.margin_required) ?? num(r.total_margin) ?? 0,
+      available: num(r.margin_available) ?? num(r.net_available_cash) ?? undefined,
+      span: num(r.span_margin) ?? undefined,
+      exposure: num(r.exposure_margin) ?? undefined,
+      brokerage: num(r.brokerage) ?? undefined,
+      detail: String(r.remarks ?? ''),
+    }
+  },
+
   async getQuote(ctx, token) {
     if (!ctx.credentials?.sessionToken) return { symbol: token, ltp: 0 }
     // token = stock_code|expiry|strike|right (see mapSymbol)

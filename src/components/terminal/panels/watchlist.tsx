@@ -6,9 +6,10 @@ import { toast } from 'sonner'
 import { ChevronDown, ChevronRight, GripHorizontal, Layers, Plus, Search, Star, X } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { api, fmtMoney, type SymbolRow } from '../lib/client-api'
-import type { IndexComponentRow } from '../lib/client-api'
+import type { IndexComponentRow, IndexComponentsResp } from '../lib/client-api'
 import { useTerminal, defaultDepthPanels, addDepthPanelTo, type DepthPanelCfg, type WorkspaceCfg } from '../lib/store'
 import { onTicks, subscribeTicks, unsubscribeTicks } from '../lib/socket'
+import { useSyncData } from '../lib/sync'
 import type { Tick } from '@/lib/types'
 
 // ============================================================
@@ -283,12 +284,20 @@ function IndexRow({ symbol, name, lotSize, tick, active, starred, onStar, onOpen
 
 /** Constituents of an expanded index: H / LTP / L / Vol / chg% / +pts contribution. */
 function ConstituentList({ symbol, onOpenSymbol }: { symbol: string; onOpenSymbol: (s: string) => void }) {
-  const { data, isLoading, error } = useQuery({
+  // realtime via sync:index (2s) — REST fallback when the hub has no payload yet
+  const sync = useSyncData<IndexComponentsResp>(
+    'sync:index',
+    d => !!d && (d as { index?: { symbol?: string } }).index?.symbol === symbol,
+    { index: [symbol] },
+  )
+  const { data: rest, isLoading, error } = useQuery({
     queryKey: ['index-components', symbol],
     queryFn: () => api.indexComponents(symbol),
-    refetchInterval: 3000,
+    enabled: !sync,
+    refetchInterval: 5000,
     retry: false,
   })
+  const data = sync ?? rest
 
   const rows: (IndexComponentRow & { key: string })[] = useMemo(
     () => (data?.constituents ?? []).map(c => ({ ...c, key: c.symbol })),

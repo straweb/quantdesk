@@ -4,7 +4,7 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type { Timeframe, OrderSide, OrderTypeKind, ProductType } from '@/lib/types'
 
-export type AppView = 'terminal' | 'admin' | 'strategy'
+export type AppView = 'terminal' | 'admin' | 'strategy' | 'dashboard'
 
 export interface StrikeRowCfg {
   id: string // `${strike}:${type}`
@@ -144,6 +144,8 @@ interface TerminalState {
   qtyMode: 'AUTO' | 'MANUAL'
   limitPrice: number | null
   bottomTab: 'orders' | 'trades' | 'positions' | 'funds' | 'logs'
+  // bottom dock collapsed to a slim bar (expand button floats in its place)
+  bottomCollapsed: boolean
   // actions
   setView: (v: AppView) => void
   setSymbol: (s: string) => void
@@ -158,6 +160,7 @@ interface TerminalState {
   setQtyMode: (m: 'AUTO' | 'MANUAL') => void
   setLimitPrice: (p: number | null) => void
   setBottomTab: (t: 'orders' | 'trades' | 'positions' | 'funds' | 'logs') => void
+  setBottomCollapsed: (c: boolean) => void
   toggleWatch: (s: string) => void
   /** Open (or re-activate) a per-symbol workspace; FNO ones get the
    *  spot+ATM layout and the strikes panel auto-bound to the symbol. */
@@ -168,7 +171,8 @@ const mkWs = (id: string, name: string, symbol: string): WorkspaceCfg => ({
   id, name, symbol, tf: '5m', chartType: 'candles', showVolume: true, showSMA20: false, showSMA50: false,
   allocMode: 'PCT', showOptionMinis: true, layout: 'spot-atm', panes: defaultPanes(), strikes: defaultStrikes(),
   depthPanels: defaultDepthPanels(symbol),
-  showGhost: false, ghostStyle: 'hollow', scales: { price: true, pct: false, inv: false, pts: false },
+  // default live view = 5m shell + 1m ghost candles (scalping-tool #ghostCtl)
+  showGhost: true, ghostStyle: 'hollow', scales: { price: true, pct: false, inv: false, pts: false },
 })
 
 export const useTerminal = create<TerminalState>()(
@@ -186,6 +190,7 @@ export const useTerminal = create<TerminalState>()(
       qtyMode: 'AUTO',
       limitPrice: null,
       bottomTab: 'orders',
+      bottomCollapsed: false,
       setView: v => set({ view: v }),
       setSymbol: s => {
         const { activeWs, workspaces } = get()
@@ -216,6 +221,7 @@ export const useTerminal = create<TerminalState>()(
       setQtyMode: m => set({ qtyMode: m }),
       setLimitPrice: p => set({ limitPrice: p }),
       setBottomTab: t => set({ bottomTab: t }),
+      setBottomCollapsed: c => set({ bottomCollapsed: c }),
       toggleWatch: s => {
         const cur = get().watchSymbols
         set({ watchSymbols: cur.includes(s) ? cur.filter(x => x !== s) : [...cur, s] })
@@ -235,7 +241,17 @@ export const useTerminal = create<TerminalState>()(
     }),
     {
       name: 'zterm-workspaces',
-      partialize: s => ({ workspaces: s.workspaces, activeWs: s.activeWs, productType: s.productType, qtyMode: s.qtyMode, watchSymbols: s.watchSymbols }),
+      partialize: s => ({ workspaces: s.workspaces, activeWs: s.activeWs, productType: s.productType, qtyMode: s.qtyMode, watchSymbols: s.watchSymbols, bottomCollapsed: s.bottomCollapsed }),
+      version: 2,
+      // v2: default the ghost overlay ON for every workspace (5m shell + 1m
+      // ghost is the house default live view) unless the user had it on.
+      migrate: (state: unknown) => {
+        const st = state as { workspaces?: WorkspaceCfg[]; bottomCollapsed?: boolean }
+        if (Array.isArray(st.workspaces)) {
+          st.workspaces = st.workspaces.map(w => ({ ...w, showGhost: w.showGhost ?? true }))
+        }
+        return st
+      },
       // Avoid SSR/CSR hydration mismatch: server renders defaults, client
       // must not rehydrate synchronously before the first render.
       // We call useTerminal.persist.rehydrate() inside a useEffect after mount.

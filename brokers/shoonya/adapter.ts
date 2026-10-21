@@ -196,6 +196,43 @@ const shoonyaAdapter: BrokerAdapter = {
     return { cash, available: num(d.marginavailable) ?? cash, utilized: num(d.marginused) ?? 0 }
   },
 
+  async getHoldings(ctx) {
+    if (!ctx.credentials?.sessionId) return []
+    const res = await norenPost<Record<string, unknown>[] | { emsg?: string }>('Holdings', norenBody(ctx), 6000)
+    const arr = Array.isArray(res.data) ? res.data : []
+    return arr.map(h => ({
+      symbol: String(h.exchTsym?.[0]?.tsym ?? h.exch_tsym?.[0]?.tsym ?? ''),
+      isin: h.isin ? String(h.isin) : undefined,
+      qty: num(h.qty) ?? num(h.holdqty) ?? 0,
+      avgPrice: num(h.uprice) ?? num(h.avgPrice) ?? 0,
+      ltp: num(h.lp) ?? undefined,
+      pnl: num(h.pnl) ?? undefined,
+      product: String(h.product ?? 'CNC'),
+    }))
+  },
+
+  async marginCalc(ctx, params) {
+    if (!ctx.credentials?.sessionId) return null
+    const res = await norenPost<Record<string, unknown> | { emsg?: string }>('GetMargin', norenBody(ctx, {
+      prd: params.productType === 'CNC' ? 'CNC' : 'I',
+      exch: ctx.symbolMap.exchange === 'NFO' ? 'NFO' : 'NSE',
+      tsym: ctx.symbolMap.brokerSymbol,
+      qty: params.qty,
+      prc: params.price,
+      trantype: params.side === 'BUY' ? 'B' : 'S',
+      prctyp: 'LMT',
+      price: params.price,
+    }), 5000)
+    const d = (res.data && !Array.isArray(res.data) ? res.data : {}) as Record<string, unknown>
+    if (d.emsg || !res.data) return { required: 0, detail: String(d.emsg ?? 'margin API unreachable') }
+    return {
+      required: num(d.totmargin) ?? num(d.marginrequired) ?? num(d.tot_margin) ?? 0,
+      span: num(d.span) ?? undefined,
+      exposure: num(d.exposure) ?? num(d.expmargin) ?? undefined,
+      leverage: num(d.leverage) ?? undefined,
+    }
+  },
+
   async getQuote(ctx, token) {
     if (!ctx.credentials?.sessionId) return { symbol: token, ltp: 0 }
     const [exch, tsym] = token.includes('|') ? token.split('|') : [ctx.symbolMap.exchange, token]

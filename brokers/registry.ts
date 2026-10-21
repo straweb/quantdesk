@@ -91,6 +91,26 @@ export interface BrokerQuoteRow {
   volume?: number
 }
 
+export interface BrokerHoldingRow {
+  symbol: string
+  isin?: string
+  qty: number
+  avgPrice: number
+  ltp?: number
+  pnl?: number
+  product?: string
+}
+
+export interface BrokerMarginRow {
+  required: number
+  available?: number
+  span?: number
+  exposure?: number
+  brokerage?: number
+  leverage?: number
+  detail?: string
+}
+
 export interface ModifyPatch {
   qty?: number // lots
   limitPrice?: number
@@ -122,6 +142,10 @@ export interface BrokerAdapter {
   getFunds?(ctx: LegContext): Promise<BrokerFundsRow>
   /** L1 quote (LTP + bid/ask + OHLC) for one broker symbol */
   getQuote?(ctx: LegContext, token: string): Promise<BrokerQuoteRow>
+  /** Demat / portfolio holdings */
+  getHoldings?(ctx: LegContext): Promise<BrokerHoldingRow[]>
+  /** Order margin requirement estimate (per one order) */
+  marginCalc?(ctx: LegContext, params: { side: 'BUY' | 'SELL'; qty: number; price: number; productType: string }): Promise<BrokerMarginRow | null>
   /** Single order status lookup */
   getOrderStatus?(ctx: LegContext, brokerOrderId: string): Promise<BrokerBookRow | null>
   /** Session token expiry hints (per broker): 'fixed' | 'daily' | 'none' */

@@ -210,6 +210,46 @@ const dhanAdapter: BrokerAdapter = {
     return { cash, available: num(res.data.withdrawableBalance) ?? cash, utilized: num(res.data.utilizedAmount) ?? 0 }
   },
 
+  async getHoldings(ctx) {
+    if (!ctx.credentials?.accessToken) return []
+    const res = await liveFetch<{ data?: Record<string, unknown>[] }>(`${BASE}/holdings`, { headers: headers(ctx.credentials), timeoutMs: 6000 })
+    if (!res.ok || !Array.isArray(res.data?.data)) return []
+    return res.data!.data.map(h => ({
+      symbol: String(h.tradingSymbol ?? h.displayName ?? h.securityId ?? ''),
+      isin: h.isin ? String(h.isin) : undefined,
+      qty: num(h.totalQty) ?? num(h.quantity) ?? 0,
+      avgPrice: num(h.averagePrice) ?? num(h.avgPrice) ?? 0,
+      ltp: num(h.lastPrice) ?? num(h.convertedAvgPrice) ?? undefined,
+      pnl: num(h.unrealizedProfit) ?? undefined,
+      product: String(h.productType ?? 'CNC'),
+    }))
+  },
+
+  async marginCalc(ctx, params) {
+    if (!ctx.credentials?.accessToken) return null
+    const funds = await this.getFunds!(ctx)
+    const res = await liveFetch<Record<string, unknown>>(`${BASE}/margincalculator`, {
+      method: 'POST', headers: headers(ctx.credentials), timeoutMs: 5000,
+      body: JSON.stringify({
+        dhanClientId: ctx.credentials.clientId ?? '',
+        exchangeSegment: mapSegment(ctx.symbolMap.exchange),
+        transactionType: params.side,
+        quantity: params.qty,
+        productType: params.productType === 'MIS' ? 'INTRADAY' : 'CNC',
+        securityId: ctx.symbolMap.brokerToken ?? '',
+        price: params.price,
+        triggerPrice: 0,
+      }),
+    })
+    if (!res.ok || !res.data) return { required: 0, available: funds.cash, detail: 'margin API unreachable — using funds snapshot' }
+    const d = res.data as Record<string, unknown>
+    const varMargin = num(d.varMargin) ?? 0
+    const span = num(d.spanMargin) ?? 0
+    const exposure = num(d.exposureMargin) ?? 0
+    const leverage = num(d.leverage) ?? num(d.marginFractionDenominator) ?? undefined
+    return { required: varMargin + span + exposure, available: funds.cash, span, exposure, leverage }
+  },
+
   async getQuote(ctx, token) {
     if (!ctx.credentials?.accessToken) return { symbol: token, ltp: 0 }
     const segment = mapSegment(ctx.symbolMap.exchange)

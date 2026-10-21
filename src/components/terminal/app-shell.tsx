@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Activity, SquareTerminal, Settings2, Bot, LogOut, CircleDot, Trophy } from 'lucide-react'
+import { Activity, SquareTerminal, Settings2, Bot, LogOut, CircleDot, Trophy, LayoutDashboard } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
@@ -13,9 +13,11 @@ import { api } from './lib/client-api'
 import type { AccountRow } from './lib/client-api'
 import { useTerminal, type AppView } from './lib/store'
 import { onFeedStatus, ensureSocket } from './lib/socket'
+import { useSyncChannel, type SyncCore } from './lib/sync'
 import { TerminalView } from './terminal-view'
 import { AdminView } from './admin/admin-view'
 import { StrategyView } from './strategy/strategy-view'
+import { DashboardView } from './dashboard/dashboard-view'
 import { CAPITAL_MODES } from '@/lib/types'
 import type { CapitalMode } from '@/lib/types'
 
@@ -101,6 +103,7 @@ function Shell() {
         <nav className="flex items-center gap-1 ml-4">
           {([
             ['terminal', 'Terminal', SquareTerminal],
+            ['dashboard', 'Dashboard', LayoutDashboard],
             ['strategy', 'Strategy Builder', Bot],
             ['admin', 'Admin', Settings2],
           ] as [AppView, string, typeof SquareTerminal][]).map(([v, label, Icon]) => (
@@ -136,6 +139,7 @@ function Shell() {
         {view === 'terminal' && <TerminalView />}
         {view === 'admin' && <AdminView />}
         {view === 'strategy' && <StrategyView />}
+        {view === 'dashboard' && <DashboardView />}
       </main>
     </div>
   )
@@ -147,8 +151,18 @@ function Shell() {
 // account's capital sizing (initial capital + house mode).
 // ------------------------------------------------------------
 function CapitalChips() {
-  const { data } = useQuery({ queryKey: ['accounts'], queryFn: () => api.accounts(), refetchInterval: 3000 })
-  const accounts = data?.accounts ?? []
+  // realtime: sync:core pushes accounts every 1s (fallback: REST when the
+  // feed socket has never delivered a payload)
+  const sync = useSyncChannel<SyncCore>('sync:core')
+  const { data } = useQuery({
+    queryKey: ['accounts'],
+    queryFn: () => api.accounts(),
+    enabled: !sync,
+    refetchInterval: 3000,
+  })
+  const accounts: AccountRow[] = sync?.accounts
+    ? (sync.accounts as unknown as AccountRow[])
+    : (data?.accounts ?? [])
   if (accounts.length === 0) return null
   return (
     <div className="flex items-center gap-1 max-w-[44vw] overflow-x-auto py-0.5">
@@ -277,7 +291,16 @@ interface SessionStats {
 }
 
 function SessionStatsChip() {
-  const { data } = useQuery({ queryKey: ['session-stats'], queryFn: () => api.sessionStats(), refetchInterval: 6000 })
+  // realtime: sync:core carries the same session payload computed in the
+  // feed service (win rate / pts / per-account) — REST fallback if absent
+  const sync = useSyncChannel<SyncCore>('sync:core')
+  const { data: rest } = useQuery({
+    queryKey: ['session-stats'],
+    queryFn: () => api.sessionStats(),
+    enabled: !sync,
+    refetchInterval: 6000,
+  })
+  const data = sync?.session ?? rest
   if (!data) return null
   const wr = data.winRate
   const pos = data.pts >= 0

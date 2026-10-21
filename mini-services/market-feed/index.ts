@@ -619,6 +619,14 @@ io.on('connection', socket => {
     if (set) for (const s of symbols || []) set.delete(s)
   })
 
+  // ---- realtime sync hub subscription (replaces N polling REST calls) ----
+  socket.on('sync:sub', (p: { chains?: { underlying: string; expiry?: string | null }[]; index?: string[] }) => {
+    ;(socket as unknown as { __syncSubs?: { chains: { underlying: string; expiry: string | null }[]; index: string[] } }).__syncSubs = {
+      chains: (p?.chains ?? []).map(c => ({ underlying: c.underlying, expiry: c.expiry ?? null })),
+      index: p?.index ?? [],
+    }
+  })
+
   socket.on('disconnect', () => S.subs.delete(socket.id))
 })
 
@@ -626,7 +634,7 @@ loadUniverse(DEFAULT_UNIVERSE)
 
 // ---- timers: bun --hot stacks intervals across reloads — deregister the
 // previous module's loops first (globalThis survives hot reloads) ----
-interface HotTimers { tick?: ReturnType<typeof setInterval>; stream?: ReturnType<typeof setInterval>; watch?: ReturnType<typeof setInterval>; tickRec?: ReturnType<typeof setInterval> }
+interface HotTimers { tick?: ReturnType<typeof setInterval>; stream?: ReturnType<typeof setInterval>; watch?: ReturnType<typeof setInterval>; tickRec?: ReturnType<typeof setInterval>; sync?: ReturnType<typeof setInterval> }
 const hot = g as unknown as { __feedTimers?: HotTimers }
 if (hot.__feedTimers) {
   if (hot.__feedTimers.tick) clearInterval(hot.__feedTimers.tick)
@@ -674,4 +682,407 @@ socketServer.listen(PORT, () => {
 
 process.on('SIGTERM', () => { httpServer.close(() => process.exit(0)); socketServer.close(() => process.exit(0)) })
 process.on('SIGINT', () => { httpServer.close(() => process.exit(0)); socketServer.close(() => process.exit(0)) })
+
+// ============================================================
+// REALTIME SYNC HUB — the browser subscribes ONCE ('sync:sub')
+// and receives everything over the existing socket.io feed link:
+//   sync:core  (1s)  accounts + positions + orders + trades +
+//                    funds + session stats — read DIRECTLY from
+//                    the SQLite files (master db/custom.db +
+//                    db/brokers/{type}/{account}.db, read-only)
+//                    so there is NO Next.js HTTP hop and no API lag
+//   sync:chain (1s)  option chain quotes per subscribed
+//                    underlying/expiry (CE floor / PE ceil ATM)
+//   sync:index (2s)  index constituents + pts contribution
+// The Next.js REST routes stay available as a fallback (auth,
+// order placement and CRUD still go through HTTP — commands are
+// rare; data flows over the websocket).
+// ============================================================
+
+const FEED_PROJECT_ROOT = path.resolve(process.cwd(), '../..') // service always runs from mini-services/market-feed
+const MASTER_DB_PATH = path.join(FEED_PROJECT_ROOT, 'db', 'custom.db')
+
+// index weights (mirror of symbol-service INDEX_CONSTITUENTS)
+const INDEX_WEIGHTS: Record<string, { symbol: string; weight: number }[]> = {
+  NIFTY: [
+    { symbol: 'RELIANCE', weight: 9.5 }, { symbol: 'HDFCBANK', weight: 8.6 },
+    { symbol: 'ICICIBANK', weight: 7.4 }, { symbol: 'INFY', weight: 5.9 },
+    { symbol: 'TCS', weight: 4.6 }, { symbol: 'ITC', weight: 4.4 },
+    { symbol: 'LT', weight: 4.0 }, { symbol: 'KOTAKBANK', weight: 3.4 },
+    { symbol: 'BHARTIARTL', weight: 3.4 }, { symbol: 'SBIN', weight: 3.1 },
+    { symbol: 'AXISBANK', weight: 2.9 }, { symbol: 'M&M', weight: 2.6 },
+    { symbol: 'MARUTI', weight: 2.4 }, { symbol: 'SUNPHARMA', weight: 2.0 },
+    { symbol: 'TATAMOTORS', weight: 1.9 }, { symbol: 'NTPC', weight: 1.7 },
+    { symbol: 'POWERGRID', weight: 1.6 }, { symbol: 'HINDUNILVR', weight: 1.6 },
+    { symbol: 'ULTRACEMCO', weight: 1.5 }, { symbol: 'BAJFINANCE', weight: 1.5 },
+    { symbol: 'ASIANPAINT', weight: 1.1 }, { symbol: 'TITAN', weight: 1.1 },
+    { symbol: 'WIPRO', weight: 1.0 }, { symbol: 'HCLTECH', weight: 1.0 },
+    { symbol: 'TECHM', weight: 1.0 }, { symbol: 'TATASTEEL', weight: 0.9 },
+    { symbol: 'JSWSTEEL', weight: 0.9 }, { symbol: 'COALINDIA', weight: 0.8 },
+    { symbol: 'ADANIENT', weight: 0.8 }, { symbol: 'ONGC', weight: 0.8 },
+  ],
+  BANKNIFTY: [
+    { symbol: 'HDFCBANK', weight: 27.1 }, { symbol: 'ICICIBANK', weight: 23.3 },
+    { symbol: 'SBIN', weight: 10.2 }, { symbol: 'KOTAKBANK', weight: 9.4 },
+    { symbol: 'AXISBANK', weight: 8.4 }, { symbol: 'INDUSINDBK', weight: 5.0 },
+  ],
+  FINNIFTY: [
+    { symbol: 'HDFCBANK', weight: 24.9 }, { symbol: 'ICICIBANK', weight: 20.4 },
+    { symbol: 'KOTAKBANK', weight: 9.6 }, { symbol: 'AXISBANK', weight: 7.7 },
+    { symbol: 'BAJFINANCE', weight: 7.6 }, { symbol: 'SBIN', weight: 6.2 },
+  ],
+  MIDCPNIFTY: [
+    { symbol: 'TATASTEEL', weight: 6.4 }, { symbol: 'JSWSTEEL', weight: 5.9 },
+    { symbol: 'COALINDIA', weight: 5.1 }, { symbol: 'ASIANPAINT', weight: 4.7 },
+    { symbol: 'TITAN', weight: 4.4 }, { symbol: 'MARUTI', weight: 4.2 },
+  ],
+  SENSEX: [
+    { symbol: 'RELIANCE', weight: 9.9 }, { symbol: 'HDFCBANK', weight: 9.3 },
+    { symbol: 'ICICIBANK', weight: 8.2 }, { symbol: 'INFY', weight: 6.1 },
+    { symbol: 'TCS', weight: 4.5 }, { symbol: 'BHARTIARTL', weight: 4.1 },
+    { symbol: 'ITC', weight: 3.9 }, { symbol: 'LT', weight: 3.6 },
+    { symbol: 'KOTAKBANK', weight: 3.1 }, { symbol: 'SBIN', weight: 3.0 },
+    { symbol: 'AXISBANK', weight: 2.8 }, { symbol: 'M&M', weight: 2.7 },
+    { symbol: 'MARUTI', weight: 2.6 }, { symbol: 'SUNPHARMA', weight: 2.1 },
+  ],
+}
+
+function openRO(p: string): Database | null {
+  try {
+    if (!existsSync(p)) return null
+    return new Database(p, { readonly: true })
+  } catch { return null }
+}
+
+function istDayStartMs(): number {
+  const d = new Date(Date.now() + 5.5 * 3600_000)
+  d.setUTCHours(0, 0, 0, 0)
+  return d.getTime() - 5.5 * 3600_000
+}
+
+interface SyncCoreRow { [k: string]: unknown }
+
+function buildCorePayload(): SyncCoreRow | null {
+  const master = openRO(MASTER_DB_PATH)
+  if (!master) return null
+  let accounts: SyncCoreRow[] = []
+  try {
+    accounts = master.prepare(`
+      SELECT ba.id, ba.label, ba.brokerType, ba.status, ba.isActive, ba.isOrderEnabled,
+             ba.isLiveDataSource, ba.isCopyMaster, ba.clientId,
+             cc.initialCapital, cc.mode, cc.realizedPnl, cc.chargesPaid, cc.deployed, cc.firstTradeDone
+      FROM BrokerAccount ba LEFT JOIN CapitalConfig cc ON cc.accountId = ba.id
+      ORDER BY ba.sortOrder ASC
+    `).all() as SyncCoreRow[]
+  } catch { master.close(); return null }
+  master.close()
+
+  const sessionStart = istDayStartMs()
+  const accRows: SyncCoreRow[] = []
+  const posRows: SyncCoreRow[] = []
+  const orderRows: SyncCoreRow[] = []
+  const tradeRows: SyncCoreRow[] = []
+  const fundRows: SyncCoreRow[] = []
+  const perAccount: SyncCoreRow[] = []
+  const symbolPts = new Map<string, number>()
+  let closes = 0, wins = 0, pts = 0, realizedTot = 0, chargesTot = 0
+
+  for (const a of accounts) {
+    const mode = String(a.mode ?? 'INITIAL_PLUS_PNL')
+    const initialCapital = Number(a.initialCapital ?? 0)
+    const realizedPnl = Number(a.realizedPnl ?? 0)
+    const deployed = Number(a.deployed ?? 0)
+    let base: number
+    if (mode === 'PROFIT_ONLY') base = a.firstTradeDone ? realizedPnl : initialCapital
+    else if (mode === 'INITIAL_WITH_LOSS_REDUCTION') base = initialCapital + Math.min(0, realizedPnl)
+    else base = initialCapital + realizedPnl
+    const usable = r2(Math.max(0, base - deployed))
+
+    const brokerDb = openRO(path.join(FEED_PROJECT_ROOT, 'db', 'brokers', String(a.brokerType).toLowerCase(), `${a.id}.db`))
+    let openPos = 0, openOrd = 0
+    let aUnreal = 0
+    if (brokerDb) {
+      // positions (live mark from the feed's own quote engine)
+      let pos: SyncCoreRow[] = []
+      try { pos = brokerDb.prepare('SELECT * FROM positions').all() as SyncCoreRow[] } catch { pos = [] }
+      for (const p of pos) {
+        const netQty = Number(p.net_qty ?? 0)
+        const sym = String(p.symbol)
+        const st = S.states.get(sym)
+        const ltp = st?.ltp ?? Number(p.ltp ?? 0)
+        const unreal = (ltp - Number(p.avg_price ?? 0)) * netQty
+        aUnreal += unreal
+        // push open positions AND positions touched this session (realized
+        // rows power the "1/5 open/total" session counts in the UI)
+        if (netQty !== 0) openPos++
+        if (netQty !== 0 || Number(p.realized_pnl ?? 0) !== 0) {
+          posRows.push({
+            accountId: a.id, accountLabel: a.label, brokerType: a.brokerType,
+            symbol: sym, exchange: p.exchange, productType: p.product_type,
+            netQty, buyQty: p.buy_qty, sellQty: p.sell_qty,
+            avgPrice: p.avg_price, realizedPnl: p.realized_pnl, ltp,
+            unrealizedPnl: r2(unreal), lotSize: p.lot_size, updatedAt: p.updated_at,
+          })
+        }
+      }
+      // orders (recent first)
+      let ords: SyncCoreRow[] = []
+      try { ords = brokerDb.prepare('SELECT * FROM orders ORDER BY created_at DESC LIMIT 60').all() as SyncCoreRow[] } catch { ords = [] }
+      for (const o of ords) {
+        if (o.status === 'OPEN' || o.status === 'PENDING') openOrd++
+        orderRows.push({
+          id: o.id, masterOrderId: o.master_order_id ?? undefined, symbol: o.symbol, exchange: o.exchange,
+          side: o.side, qty: o.qty, filledQty: o.filled_qty, orderType: o.order_type, productType: o.product_type,
+          status: o.status, avgPrice: o.avg_price ?? undefined, message: o.message ?? undefined,
+          createdAt: o.created_at, updatedAt: o.updated_at,
+          accountId: a.id, accountLabel: a.label, brokerType: a.brokerType,
+        })
+      }
+      // trades (session subset for stats; recent 60 pushed)
+      let trs: SyncCoreRow[] = []
+      try { trs = brokerDb.prepare('SELECT * FROM trades ORDER BY ts DESC LIMIT 400').all() as SyncCoreRow[] } catch { trs = [] }
+      let aCloses = 0, aWins = 0, aPts = 0, aReal = 0, aChg = 0, aTradesN = 0
+      for (const t of trs) {
+        const tsMs = new Date(String(t.ts)).getTime()
+        if (tsMs < sessionStart) continue
+        aTradesN++
+        aChg += Number(t.charges_total ?? 0)
+        const rp = t.realized_pnl
+        if (rp === null || rp === undefined) continue
+        aCloses++
+        aReal += Number(rp)
+        if (Number(rp) > 0) aWins++
+        const unitPts = Number(t.qty) > 0 ? Number(rp) / Number(t.qty) : 0
+        aPts += unitPts
+        symbolPts.set(String(t.symbol), (symbolPts.get(String(t.symbol)) ?? 0) + unitPts)
+      }
+      for (const t of trs.slice(0, 60)) {
+        let charges: unknown = null
+        try { charges = t.charges_json ? JSON.parse(String(t.charges_json)) : null } catch { charges = null }
+        tradeRows.push({
+          id: t.id, orderId: t.order_id, symbol: t.symbol, exchange: t.exchange, side: t.side,
+          qty: t.qty, price: t.price, value: t.value, chargesTotal: t.charges_total, charges,
+          realizedPnl: t.realized_pnl ?? undefined, ts: t.ts,
+          accountId: a.id, accountLabel: a.label, brokerType: a.brokerType,
+        })
+      }
+      closes += aCloses; wins += aWins; pts += aPts; realizedTot += aReal; chargesTot += aChg
+      perAccount.push({
+        accountId: a.id, label: a.label, brokerType: a.brokerType,
+        trades: aTradesN, closes: aCloses, wins: aWins, pts: r2(aPts),
+        realized: r2(aReal), unrealized: r2(aUnreal), charges: r2(aChg),
+      })
+      brokerDb.close()
+    }
+
+    accRows.push({
+      id: a.id, label: a.label, brokerType: a.brokerType, status: a.status,
+      isActive: !!a.isActive, isLiveDataSource: !!a.isLiveDataSource, isOrderEnabled: !!a.isOrderEnabled,
+      isCopyMaster: !!a.isCopyMaster, clientId: a.clientId ?? null,
+      usableCapital: usable, initialCapital: r2(initialCapital), realizedPnl: r2(realizedPnl),
+      chargesPaid: r2(Number(a.chargesPaid ?? 0)), deployed: r2(deployed),
+      mode, modeLabel: mode, firstTradeDone: !!a.firstTradeDone,
+      openPositions: openPos, openOrders: openOrd,
+    })
+    fundRows.push({
+      accountId: a.id, label: a.label, brokerType: a.brokerType,
+      cash: r2(initialCapital + realizedPnl - chargesTot * 0), // cash ≈ initial + realized (deployed tracked separately)
+      initialCapital: r2(initialCapital), realizedPnl: r2(realizedPnl),
+      chargesPaid: r2(Number(a.chargesPaid ?? 0)), deployed: r2(deployed),
+    })
+  }
+
+  const unrealTotal = r2(perAccount.reduce((s: number, a) => s + Number(a.unrealized ?? 0), 0))
+  const topSymbols = [...symbolPts.entries()]
+    .map(([symbol, p]) => ({ symbol, pts: r2(p) }))
+    .sort((x, y) => Math.abs(y.pts) - Math.abs(x.pts))
+    .slice(0, 6)
+
+  return {
+    accounts: accRows,
+    positions: posRows,
+    orders: orderRows,
+    trades: tradeRows,
+    funds: fundRows,
+    session: {
+      winRate: closes > 0 ? r2((wins / closes) * 100) : null,
+      pts: r2(pts),
+      realized: r2(realizedTot),
+      unrealized: unrealTotal,
+      net: r2(realizedTot + unrealTotal),
+      closes, wins,
+      trades: perAccount.reduce((s: number, a) => s + Number(a.trades ?? 0), 0),
+      charges: r2(chargesTot),
+      perAccount,
+      topSymbols,
+    },
+    sessionStart: new Date(istDayStartMs()).toISOString(),
+    ts: Date.now(),
+  }
+}
+
+function inferStep(strikes: number[]): number {
+  if (strikes.length < 3) return 50
+  const diffs = new Map<number, number>()
+  for (let i = 1; i < strikes.length; i++) {
+    const d = Math.round(strikes[i] - strikes[i - 1])
+    if (d > 0) diffs.set(d, (diffs.get(d) ?? 0) + 1)
+  }
+  let best = 50, bestN = 0
+  for (const [d, n] of diffs) if (n > bestN) { best = d; bestN = n }
+  return best || 50
+}
+
+function optionCell(sym: string): SyncCoreRow {
+  const st = S.states.get(sym)
+  const ltp = st?.ltp ?? 0
+  const prev = st?.prevClose ?? 0
+  return {
+    symbol: sym,
+    exists: !!st,
+    ltp: r2(ltp),
+    prevClose: r2(prev),
+    high: r2(st?.high ?? 0),
+    low: r2(st?.low ?? 0),
+    changePct: prev ? r2(((ltp - prev) / prev) * 100) : 0,
+  }
+}
+
+function buildChainPayload(underlying: string, expiry: string | null): SyncCoreRow | null {
+  const master = openRO(MASTER_DB_PATH)
+  if (!master) return null
+  let exp = expiry
+  try {
+    if (!exp) {
+      const row = master.prepare(`
+        SELECT MIN(expiry) AS e FROM SymbolMaster
+        WHERE underlying = ? AND exchange = 'NFO' AND instrumentType IN ('CE','PE') AND expiry >= ?
+      `).get(underlying, istDateStr()) as { e?: string | null } | undefined
+      exp = row?.e ?? null
+    }
+    if (!exp) { master.close(); return null }
+    const rows = master.prepare(`
+      SELECT symbol, strike, optionType, lotSize FROM SymbolMaster
+      WHERE underlying = ? AND exchange = 'NFO' AND instrumentType IN ('CE','PE') AND expiry = ?
+      ORDER BY strike ASC
+    `).all(underlying, exp) as { symbol: string; strike: number; optionType: string; lotSize: number }[]
+    master.close()
+    if (rows.length === 0) return null
+
+    const spotState = S.states.get(underlying)
+    const spot = spotState?.ltp ?? 0
+    const prevClose = spotState?.prevClose ?? 0
+    const strikes = [...new Set(rows.map(r => Number(r.strike)))]
+    const step = inferStep(strikes)
+    const ceAtm = Math.floor(spot / step) * step
+    const peAtm = Math.ceil(spot / step) * step
+    const lotSize = rows[0]?.lotSize ?? 1
+
+    // payload budget: ATM ± 15 steps each side
+    const lo = Math.min(ceAtm, peAtm) - 15 * step
+    const hi = Math.max(ceAtm, peAtm) + 15 * step
+    const byStrike = new Map<number, { ce?: SyncCoreRow; pe?: SyncCoreRow; lot: number }>()
+    for (const r of rows) {
+      const k = Number(r.strike)
+      if (k < lo || k > hi) continue
+      const e = byStrike.get(k) ?? { lot: r.lotSize }
+      if (r.optionType === 'CE') e.ce = optionCell(r.symbol)
+      else e.pe = optionCell(r.symbol)
+      byStrike.set(k, e)
+    }
+    const outRows = [...byStrike.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([strike, e]) => ({
+        strike,
+        offset: 0,
+        offsetCe: Math.round((strike - ceAtm) / step),
+        offsetPe: Math.round((strike - peAtm) / step),
+        ce: e.ce ?? { symbol: `${underlying}${exp!.replaceAll('-', '')}${strike}CE`, exists: false, ltp: 0, prevClose: 0, high: 0, low: 0, changePct: 0 },
+        pe: e.pe ?? { symbol: `${underlying}${exp!.replaceAll('-', '')}${strike}PE`, exists: false, ltp: 0, prevClose: 0, high: 0, low: 0, changePct: 0 },
+      }))
+
+    return {
+      meta: {
+        underlying, exchange: 'NFO', spot: r2(spot), prevClose: r2(prevClose),
+        atm: ceAtm, ceAtm, peAtm, step, lotSize, expiry: exp, expiries: [exp],
+        strikesAvailable: strikes,
+      },
+      rows: outRows,
+      atmCe: (() => { const r = outRows.find(o => o.strike === ceAtm); return r ? { ...r.ce, strike: r.strike } : null })(),
+      atmPe: (() => { const r = outRows.find(o => o.strike === peAtm); return r ? { ...r.pe, strike: r.strike } : null })(),
+      ts: Date.now(),
+    }
+  } catch {
+    try { master.close() } catch { /* already closed */ }
+    return null
+  }
+}
+
+function buildIndexPayload(name: string): SyncCoreRow | null {
+  const weights = INDEX_WEIGHTS[name]
+  const base = S.states.get(name)
+  if (!weights || !base) return null
+  const constituents = weights.map(w => {
+    const st = S.states.get(w.symbol)
+    if (!st) return null
+    const prev = st.prevClose
+    const chgPts = prev ? r2(st.ltp - prev) : 0
+    return {
+      symbol: w.symbol, weight: w.weight,
+      ltp: r2(st.ltp), high: r2(st.high), low: r2(st.low), vol: st.vol,
+      chgPct: prev ? r2(((st.ltp - prev) / prev) * 100) : 0,
+      pts: r2(chgPts * (w.weight / 100)),
+    }
+  }).filter(Boolean) as SyncCoreRow[]
+  const totalPts = r2(constituents.reduce((s: number, c) => s + Number((c as { pts: number }).pts), 0))
+  return {
+    index: {
+      symbol: name, name, ltp: r2(base.ltp), prevClose: r2(base.prevClose),
+      high: r2(base.high), low: r2(base.low), vol: base.vol,
+      chgPts: r2(base.ltp - base.prevClose),
+      chgPct: base.prevClose ? r2(((base.ltp - base.prevClose) / base.prevClose) * 100) : 0,
+    },
+    constituents,
+    totalPts,
+    ts: Date.now(),
+  }
+}
+
+// 1s sync loop — computes the core payload ONCE per tick and fans it out
+// with per-socket chain/index payloads (based on each socket's sync:sub)
+if (!hot.__feedTimers.sync) {
+  let lastIdxAt = 0
+  let lastIndexCache = new Map<string, SyncCoreRow | null>()
+  hot.__feedTimers.sync = setInterval(() => {
+    const sockets = [...io.sockets.sockets.values()] as unknown as { __syncSubs?: { chains: { underlying: string; expiry: string | null }[]; index: string[] }; emit: (ev: string, d: unknown) => void; id: string }[]
+    if (sockets.length === 0) return
+    const core = buildCorePayload()
+    const idxFresh = Date.now() - lastIdxAt > 2000
+    if (idxFresh) { lastIdxAt = Date.now(); lastIndexCache = new Map() }
+    for (const s of sockets) {
+      if (core) s.emit('sync:core', core)
+      const subs = s.__syncSubs
+      if (!subs) continue
+      if (subs.chains) {
+        for (const c of subs.chains) {
+          const p = buildChainPayload(c.underlying, c.expiry)
+          if (p) s.emit('sync:chain', p)
+        }
+      }
+      if (subs.index) {
+        for (const ix of subs.index) {
+          if (!idxFresh && lastIndexCache.has(ix)) {
+            const cached = lastIndexCache.get(ix)
+            if (cached) s.emit('sync:index', cached)
+            continue
+          }
+          const p = buildIndexPayload(ix)
+          lastIndexCache.set(ix, p)
+          if (p) s.emit('sync:index', p)
+        }
+      }
+    }
+  }, 1000)
+}
+
 // reload-probe 1792602789

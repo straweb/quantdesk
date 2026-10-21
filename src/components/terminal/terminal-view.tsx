@@ -3,7 +3,7 @@
 import { useMemo, useState } from 'react'
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
 import { useQuery } from '@tanstack/react-query'
-import { ListTree, FileBox, Plus, X, Crosshair, Layers, Bot, Ghost, Ruler } from 'lucide-react'
+import { ListTree, FileBox, Plus, X, Crosshair, Layers, Bot } from 'lucide-react'
 import { toast } from 'sonner'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { CanvasChart } from './chart/canvas-chart'
@@ -13,8 +13,9 @@ import { BottomPanel } from './panels/bottom-panel'
 import { StrikesPanel } from './panels/strikes-panel'
 import { AutoPanel } from './panels/auto-panel'
 import { WorkspacePanes } from './panels/option-panes'
-import { useTerminal, wsLayout, addDepthPanelTo, type WsLayout, type WorkspaceCfgFlags } from './lib/store'
+import { useTerminal, wsLayout, addDepthPanelTo, type WsLayout } from './lib/store'
 import { api } from './lib/client-api'
+import { useSyncChannel, type SyncCore } from './lib/sync'
 import { TIMEFRAMES } from '@/lib/types'
 import type { Timeframe } from '@/lib/types'
 
@@ -25,8 +26,16 @@ export function TerminalView() {
   const patchWs = useTerminal(s => s.patchWs)
   const setLimitPrice = useTerminal(s => s.setLimitPrice)
   const setOrderType = useTerminal(s => s.setOrderType)
+  const bottomCollapsed = useTerminal(s => s.bottomCollapsed)
 
-  const { data: posData } = useQuery({ queryKey: ['positions'], queryFn: () => api.positions(), refetchInterval: 2000 })
+  // positions for the spot-chart L/S markers — websocket sync (fallback REST)
+  const core = useSyncChannel<SyncCore>('sync:core')
+  const { data: posData } = useQuery({
+    queryKey: ['positions'],
+    queryFn: () => api.positions(),
+    enabled: !core,
+    refetchInterval: 2000,
+  })
 
   // F&O underlyings -> enable the spot+ATM CE/PE mini charts strip
   const { data: undData } = useQuery({
@@ -41,15 +50,15 @@ export function TerminalView() {
   )
 
   const markers = useMemo(() => {
-    if (!ws || !posData) return []
-    return posData.positions
-      .filter(p => p.symbol === ws.symbol && p.netQty !== 0 && p.avgPrice > 0)
-      .map(p => ({
-        price: p.avgPrice,
-        label: p.netQty > 0 ? 'L' : 'S',
-        color: p.netQty > 0 ? '#00c896' : '#ff4d5e',
-      }))
-  }, [ws, posData])
+    const rows = core
+      ? core.positions.filter(p => p.symbol === ws?.symbol && p.netQty !== 0 && p.avgPrice > 0)
+      : (posData?.positions ?? []).filter(p => p.symbol === ws?.symbol && p.netQty !== 0 && p.avgPrice > 0)
+    return rows.map(p => ({
+      price: p.avgPrice,
+      label: p.netQty > 0 ? 'L' : 'S',
+      color: p.netQty > 0 ? '#00c896' : '#ff4d5e',
+    }))
+  }, [ws, core, posData])
 
   if (!ws) return null
 
@@ -68,16 +77,9 @@ export function TerminalView() {
             >{tf}</button>
           ))}
           <span className="w-px h-4 bg-border mx-1" />
-          {(['candles', 'line', 'area'] as const).map(t => (
-            <button
-              key={t}
-              onClick={() => patchWs(ws.id, { chartType: t })}
-              className={`px-1.5 py-0.5 rounded capitalize ${ws.chartType === t ? 'bg-primary text-primary-foreground' : 'bg-secondary text-muted-foreground hover:text-foreground'}`}
-            >{t}</button>
-          ))}
-          <span className="w-px h-4 bg-border mx-1" />
           <button
             onClick={() => patchWs(ws.id, { showVolume: !ws.showVolume })}
+            title="Default volume state for NEW charts of this workspace (each chart has its own controls)"
             className={`px-1.5 py-0.5 rounded ${ws.showVolume ? 'bg-accent text-foreground' : 'bg-secondary text-muted-foreground'}`}
           >Vol</button>
           <span className="w-px h-4 bg-border mx-0.5" />
@@ -94,89 +96,12 @@ export function TerminalView() {
             >{label}</button>
           ))}
           <span className="w-px h-4 bg-border mx-0.5" />
-          {([
-            ['showSMA20', 'MA20', 'text-[#4dd0e1]'],
-            ['showSMA50', 'MA50', 'text-[#b48ce8]'],
-            ['showEMA', 'EMA', 'text-[#ffd166]'],
-            ['showVWAP', 'VWAP', 'text-[#4dd0e1]'],
-            ['showBOLL', 'BB', 'text-muted-foreground'],
-          ] as [keyof WorkspaceCfgFlags, string, string][]).map(([key, label, tint]) => (
-            <button
-              key={label}
-              onClick={() => patchWs(ws.id, { [key]: !ws[key] })}
-              title={`${label} overlay`}
-              className={`px-1.5 py-0.5 rounded text-[10px] ${tint} ${ws[key] ? 'bg-accent' : 'bg-secondary/60 text-muted-foreground'}`}
-            >{label}</button>
-          ))}
-          {([
-            ['showRSI', 'RSI'],
-            ['showMACD', 'MACD'],
-          ] as [keyof WorkspaceCfgFlags, string][]).map(([key, label]) => (
-            <button
-              key={label}
-              onClick={() => patchWs(ws.id, { [key]: !ws[key] })}
-              title={`${label} sub-panel`}
-              className={`px-1.5 py-0.5 rounded text-[10px] text-[#f5a623] ${ws[key] ? 'bg-accent' : 'bg-secondary/60 text-muted-foreground'}`}
-            >{label}</button>
-          ))}
-          <span className="w-px h-4 bg-border mx-0.5" />
-          {/* 1M ghost (#ghostCtl) + scales popover */}
-          <button
-            onClick={() => patchWs(ws.id, { showGhost: !ws.showGhost })}
-            title="1M GHOST — overlay 1-minute candles on higher-timeframe charts"
-            className={`flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] text-[#e0a63f] ${ws.showGhost ? 'bg-accent' : 'bg-secondary/60 text-muted-foreground'}`}
+          <span
+            className="px-1.5 py-0.5 rounded bg-secondary text-muted-foreground text-[9px]"
+            title="Each chart has its own controls: type, indicators, 1m ghost, scales and draw tools — top-right of the chart"
           >
-            <Ghost className="h-3 w-3" /> 1m
-          </button>
-          {ws.showGhost && (
-            <div className="flex rounded overflow-hidden border border-border">
-              {(['hollow', 'fade'] as const).map(s => (
-                <button
-                  key={s}
-                  onClick={() => patchWs(ws.id, { ghostStyle: s })}
-                  className={`px-1 py-0.5 text-[8px] uppercase ${(ws.ghostStyle ?? 'hollow') === s ? 'bg-primary text-primary-foreground' : 'bg-secondary text-muted-foreground'}`}
-                >{s}</button>
-              ))}
-            </div>
-          )}
-          <Popover>
-            <PopoverTrigger asChild>
-              <button
-                title="Axis scales — topmost enabled = right axis, others = left measurement column. % / pts are relative to the baseline (drag it, or set by clicking the chart)."
-                className="flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] text-muted-foreground hover:text-foreground bg-secondary/60"
-              >
-                <Ruler className="h-3 w-3" /> scales
-              </button>
-            </PopoverTrigger>
-            <PopoverContent align="end" className="w-60 p-2.5 text-[10px] space-y-2">
-              <div className="text-[8px] uppercase tracking-wide text-muted-foreground">topmost enabled = right axis · others = left measurement column</div>
-              {([
-                ['price', 'Price'],
-                ['pct', 'Percent'],
-                ['inv', 'Inverted % (sellers)'],
-                ['pts', 'Points'],
-              ] as [keyof NonNullable<typeof ws.scales>, string][]).map(([k, label]) => (
-                <label key={k} className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={!!ws.scales?.[k]}
-                    onChange={e => patchWs(ws.id, { scales: { price: true, pct: false, inv: false, pts: false, ...(ws.scales ?? {}), [k]: e.target.checked } })}
-                    className="accent-[#3b82f6]"
-                  />
-                  <span>{label}</span>
-                </label>
-              ))}
-              <button
-                onClick={() => window.dispatchEvent(new Event('qd-chart-set-base'))}
-                className="w-full mt-1 px-2 py-1 rounded bg-[#e0a63f]/20 border border-[#e0a63f]/40 text-[#e0a63f] font-semibold hover:bg-[#e0a63f]/30"
-              >
-                Set baseline — then click a chart
-              </button>
-              <div className="text-[8px] text-muted-foreground leading-snug">
-                The baseline is the amber dashed line: drag it to rearrange, double-click the chart to reset it to the session open.
-              </div>
-            </PopoverContent>
-          </Popover>
+            per-chart: type · indicators · ghost · scales · tools
+          </span>
           <span className="w-px h-4 bg-border mx-0.5" />
           <button
             onClick={() => {
@@ -235,6 +160,7 @@ export function TerminalView() {
                         scales={ws.scales}
                         markers={markers}
                         onPriceClick={p => { setLimitPrice(p); setOrderType('LIMIT') }}
+                        settingsKey={`${ws.id}:spot`}
                         height="h-full"
                       />
                     }
@@ -242,9 +168,15 @@ export function TerminalView() {
                 </div>
               </Panel>
               <Handle vertical />
-              <Panel defaultSize={isFnOUnderlying ? 44 : 32} minSize={12}>
-                <BottomPanel />
-              </Panel>
+              {bottomCollapsed ? (
+                <Panel key="bottom-mini" defaultSize={5} minSize={4}>
+                  <BottomPanel />
+                </Panel>
+              ) : (
+                <Panel key="bottom-full" defaultSize={isFnOUnderlying ? 44 : 32} minSize={12}>
+                  <BottomPanel />
+                </Panel>
+              )}
             </PanelGroup>
           </Panel>
           <Handle />

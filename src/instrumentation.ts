@@ -8,6 +8,7 @@ export async function register() {
   const { ensureStrategyScheduler } = await import('./lib/services/strategy-engine')
   const { ensureOrderMonitor } = await import('./lib/services/order-monitor')
   const { ensureAutoRuleEngine } = await import('./lib/services/auto-rules-service')
+  const { ensureGttEngine } = await import('./lib/services/gtt-service')
 
   bootstrap()
     .then(() => console.log('[instrumentation] bootstrap complete'))
@@ -16,6 +17,7 @@ export async function register() {
   ensureStrategyScheduler()
   ensureOrderMonitor()
   ensureAutoRuleEngine()
+  ensureGttEngine()
   ensureLiveOrderSync()
   ensureFeedWatchdog()
 }
@@ -45,6 +47,23 @@ function ensureFeedWatchdog() {
   g.__feedWatchTimer = setInterval(() => {
     if (g.__feedWatchBusy) return
     void (async () => {
+      // universe guard: a manually/restarted feed only knows the default
+      // 9-symbol universe — republish the master contracts when it shrinks
+      try {
+        const h = await fetch(`${FEED_URL}/health`, { signal: AbortSignal.timeout(1500), cache: 'no-store' })
+        if (h.ok) {
+          const j = (await h.json()) as { symbols?: number }
+          if ((j.symbols ?? 0) > 0 && (j.symbols ?? 0) < 400 && !g.__feedWatchBusy) {
+            const { db } = await import('./lib/db')
+            const { publishUniverseToFeed } = await import('./lib/services/symbol-service')
+            const rows = await db.symbolMaster.findMany({
+              select: { symbol: true, basePrice: true, lotSize: true, instrumentType: true },
+            })
+            await publishUniverseToFeed(rows)
+            console.log(`[instrumentation] feed universe republished (${rows.length} symbols — was ${j.symbols})`)
+          }
+        }
+      } catch { /* health check failed — respawn path handles it */ }
       if (await feedHealthy()) return
       g.__feedWatchBusy = true
       console.warn('[instrumentation] market-feed :3004 down — respawning…')
