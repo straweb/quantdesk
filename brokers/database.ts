@@ -144,6 +144,7 @@ export function getOrders(brokerType: string, accountId: string, limit = 200): B
   return rows.map(r => ({
     id: r.id as string,
     masterOrderId: (r.master_order_id as string) ?? undefined,
+    strategyId: (r.strategy_id as string) ?? undefined,
     symbol: r.symbol as string,
     exchange: r.exchange as string,
     side: r.side as BrokerOrderRecord['side'],

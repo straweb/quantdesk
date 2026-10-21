@@ -1,11 +1,12 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Search } from 'lucide-react'
+import { toast } from 'sonner'
+import { GripHorizontal, Layers, Plus, Search, X } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { api, type SymbolRow } from '../lib/client-api'
-import { useTerminal } from '../lib/store'
+import { useTerminal, defaultDepthPanels, type DepthPanelCfg, type WorkspaceCfg } from '../lib/store'
 import { onTicks, subscribeTicks, unsubscribeTicks } from '../lib/socket'
 import type { Tick } from '@/lib/types'
 
@@ -112,11 +113,78 @@ export function Watchlist() {
   )
 }
 
-export function MarketDepth() {
-  const symbol = useTerminal(s => s.selectedSymbol)
+// ------------------------------------------------------------
+// Depth panel stack (bottom-left dock).
+// N market-depth panels stacked top-to-bottom:
+//  · [+] adds a depth panel for the currently selected symbol
+//  · X removes a panel
+//  · drag the top edge of a panel to adjust its height
+//  · the stack scrolls when panels exceed the space, so the
+//    watchlist (search panel) above shrinks as depth grows
+// ------------------------------------------------------------
+
+const DEPTH_MIN_H = 96
+const DEPTH_MAX_H = 460
+const MAX_PANELS = 6
+
+export function DepthStack({ ws }: { ws: WorkspaceCfg }) {
+  const patchWs = useTerminal(s => s.patchWs)
+  const selectedSymbol = useTerminal(s => s.selectedSymbol)
+  // persisted cfg; fall back to a single panel for the workspace symbol
+  const panels: DepthPanelCfg[] = ws.depthPanels ?? defaultDepthPanels(ws.symbol)
+
+  const setPanels = (next: DepthPanelCfg[]) => patchWs(ws.id, { depthPanels: next })
+
+  const addPanel = () => {
+    const cur = useTerminal.getState().workspaces.find(w => w.id === ws.id)?.depthPanels ?? panels
+    const sym = selectedSymbol || ws.symbol
+    if (cur.some(p => p.symbol === sym)) { toast.info(`${sym} depth is already open`); return }
+    if (cur.length >= MAX_PANELS) { toast.error(`Max ${MAX_PANELS} depth panels`); return }
+    setPanels([...cur, { id: `dp${Date.now().toString(36)}`, symbol: sym, height: 170 }])
+  }
+
+  const removePanel = (id: string) => setPanels(panels.filter(p => p.id !== id))
+
+  const resizePanel = (id: string, height: number) =>
+    setPanels(panels.map(p => (p.id === id ? { ...p, height } : p)))
+
+  return (
+    <div className="border-t border-border flex flex-col min-h-0 max-h-[72%] shrink-0">
+      <div className="flex items-center gap-1 px-2 py-1 bg-card/30 shrink-0">
+        <Layers className="h-3 w-3 text-muted-foreground" />
+        <span className="text-[9px] font-semibold text-muted-foreground uppercase tracking-wide">Depth</span>
+        <span className="text-[9px] text-muted-foreground">{panels.length}</span>
+        <div className="flex-1" />
+        <button
+          onClick={addPanel}
+          title={`Add depth panel for ${selectedSymbol || ws.symbol}`}
+          className="p-0.5 rounded text-muted-foreground hover:text-foreground hover:bg-secondary"
+        >
+          <Plus className="h-3 w-3" />
+        </button>
+      </div>
+      <div className="overflow-y-auto min-h-0">
+        {panels.map(p => (
+          <DepthPanel key={p.id} cfg={p} onRemove={() => removePanel(p.id)} onResize={h => resizePanel(p.id, h)} />
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function DepthPanel({ cfg, onRemove, onResize }: {
+  cfg: DepthPanelCfg
+  onRemove: () => void
+  onResize: (height: number) => void
+}) {
+  const symbol = cfg.symbol
+  const [height, setHeight] = useState(cfg.height)
   const [quote, setQuote] = useState<Awaited<ReturnType<typeof api.quote>> | null>(null)
   const [ltp, setLtp] = useState(0)
   const [prev, setPrev] = useState(0)
+  const dragRef = useRef<{ startY: number; startH: number; h: number } | null>(null)
+
+  useEffect(() => setHeight(cfg.height), [cfg.height])
 
   useEffect(() => {
     let dead = false
@@ -136,53 +204,90 @@ export function MarketDepth() {
     if (t) { setLtp(t.ltp); setPrev(t.prevClose) }
   }), [symbol])
 
+  // drag the top edge to resize (local during drag, committed on release)
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault()
+    dragRef.current = { startY: e.clientY, startH: height, h: height }
+    const move = (ev: MouseEvent) => {
+      const d = dragRef.current
+      if (!d) return
+      const next = Math.max(DEPTH_MIN_H, Math.min(DEPTH_MAX_H, Math.round(d.startH + (d.startY - ev.clientY))))
+      d.h = next
+      setHeight(next)
+    }
+    const up = () => {
+      const d = dragRef.current
+      dragRef.current = null
+      window.removeEventListener('mousemove', move)
+      window.removeEventListener('mouseup', up)
+      if (d && d.h !== d.startH) onResize(d.h)
+    }
+    window.addEventListener('mousemove', move)
+    window.addEventListener('mouseup', up)
+  }
+
   const chg = ltp && prev ? ltp - prev : 0
   const chgPct = ltp && prev ? (chg / prev) * 100 : 0
   const up = chg >= 0
 
   return (
-    <div className="p-2 space-y-2">
-      <div className="flex items-center justify-between">
-        <div className="text-[11px] font-semibold">{symbol}</div>
-        <div className="text-right">
-          <div className={`text-sm font-bold tabular ${up ? 'term-up' : 'term-down'}`}>{ltp ? ltp.toFixed(2) : quote?.ltp?.toFixed(2) ?? '—'}</div>
-          <div className={`text-[9px] tabular ${up ? 'term-up' : 'term-down'}`}>
-            {ltp ? `${up ? '+' : ''}${chg.toFixed(2)} (${chgPct.toFixed(2)}%)` : ''}
-          </div>
-        </div>
+    <div className="border-b border-border/60" style={{ height }} data-depth-panel={symbol}>
+      {/* resize handle (top edge) */}
+      <div
+        onMouseDown={startResize}
+        title="Drag to resize this depth panel"
+        className="h-2 flex items-center justify-center cursor-row-resize text-muted-foreground/40 hover:text-muted-foreground hover:bg-secondary/40"
+      >
+        <GripHorizontal className="h-2.5 w-2.5" />
       </div>
-      <div className="grid grid-cols-2 gap-1 text-[10px] tabular">
-        <div className="bg-up rounded px-1.5 py-1 flex justify-between">
-          <span className="text-muted-foreground">Bid</span>
-          <span className="term-up">{quote?.bid?.toFixed(2) ?? '—'}</span>
+      <div className="px-2 pb-1.5 space-y-1.5 flex flex-col h-[calc(100%-8px)]">
+        <div className="flex items-center justify-between shrink-0">
+          <div className="text-[11px] font-semibold truncate">{symbol}</div>
+          <div className="flex items-center gap-1.5">
+            <div className="text-right">
+              <div className={`text-xs font-bold tabular leading-none ${up ? 'term-up' : 'term-down'}`}>{ltp ? ltp.toFixed(2) : quote?.ltp?.toFixed(2) ?? '—'}</div>
+              <div className={`text-[9px] tabular ${up ? 'term-up' : 'term-down'}`}>
+                {ltp ? `${up ? '+' : ''}${chg.toFixed(2)} (${chgPct.toFixed(2)}%)` : ''}
+              </div>
+            </div>
+            <button onClick={onRemove} title="Remove this depth panel" className="p-0.5 rounded text-muted-foreground hover:text-[#ff4d5e]">
+              <X className="h-3 w-3" />
+            </button>
+          </div>
         </div>
-        <div className="bg-down rounded px-1.5 py-1 flex justify-between">
-          <span className="text-muted-foreground">Ask</span>
-          <span className="term-down">{quote?.ask?.toFixed(2) ?? '—'}</span>
+        <div className="grid grid-cols-2 gap-1 text-[10px] tabular shrink-0">
+          <div className="bg-up rounded px-1.5 py-0.5 flex justify-between">
+            <span className="text-muted-foreground">Bid</span>
+            <span className="term-up">{quote?.bid?.toFixed(2) ?? '—'}</span>
+          </div>
+          <div className="bg-down rounded px-1.5 py-0.5 flex justify-between">
+            <span className="text-muted-foreground">Ask</span>
+            <span className="term-down">{quote?.ask?.toFixed(2) ?? '—'}</span>
+          </div>
         </div>
+        {quote?.depth && (
+          <div className="grid grid-cols-2 gap-x-3 text-[10px] tabular flex-1 min-h-0 overflow-hidden">
+            <div>
+              <div className="text-muted-foreground text-[9px] mb-0.5 flex justify-between"><span>BID</span><span>QTY</span></div>
+              {quote.depth.buys.slice(0, 5).map((b, i) => (
+                <div key={i} className="flex justify-between py-[1px]">
+                  <span className="term-up">{b.price.toFixed(2)}</span>
+                  <span className="text-muted-foreground">{b.qty}</span>
+                </div>
+              ))}
+            </div>
+            <div>
+              <div className="text-muted-foreground text-[9px] mb-0.5 flex justify-between"><span>ASK</span><span>QTY</span></div>
+              {quote.depth.sells.slice(0, 5).map((b, i) => (
+                <div key={i} className="flex justify-between py-[1px]">
+                  <span className="term-down">{b.price.toFixed(2)}</span>
+                  <span className="text-muted-foreground">{b.qty}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
-      {quote?.depth && (
-        <div className="grid grid-cols-2 gap-x-3 text-[10px] tabular">
-          <div>
-            <div className="text-muted-foreground text-[9px] mb-0.5 flex justify-between"><span>BID</span><span>QTY</span></div>
-            {quote.depth.buys.slice(0, 5).map((b, i) => (
-              <div key={i} className="flex justify-between py-[1px]">
-                <span className="term-up">{b.price.toFixed(2)}</span>
-                <span className="text-muted-foreground">{b.qty}</span>
-              </div>
-            ))}
-          </div>
-          <div>
-            <div className="text-muted-foreground text-[9px] mb-0.5 flex justify-between"><span>ASK</span><span>QTY</span></div>
-            {quote.depth.sells.slice(0, 5).map((b, i) => (
-              <div key={i} className="flex justify-between py-[1px]">
-                <span className="term-down">{b.price.toFixed(2)}</span>
-                <span className="text-muted-foreground">{b.qty}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
     </div>
   )
 }

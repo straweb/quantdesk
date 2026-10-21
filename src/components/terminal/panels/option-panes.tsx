@@ -2,6 +2,7 @@
 
 import { useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
 import { ExternalLink, RotateCcw } from 'lucide-react'
 import { CanvasChart } from '../chart/canvas-chart'
 import { api, fmtMoney } from '../lib/client-api'
@@ -9,9 +10,10 @@ import type { OptionQuoteCell } from '../lib/client-api'
 import { useTerminal, wsLayout, wsPanes, unpinPane, defaultStrikes, type PaneCfg, type WorkspaceCfg } from '../lib/store'
 
 // ============================================================
-// Multi-pane chart region for F&O workspaces.
-// - 'spot-atm': spot chart on top (full width), ATM CE (left) +
-//   ATM PE (right) panes below — default open for FNO.
+// Multi-pane chart region for F&O workspaces — fully resizable
+// (drag the dividers between panes).
+// - 'spot-atm': spot chart on top, ATM CE (left) + ATM PE (right)
+//   panes below — default open for FNO.
 // - 'grid4': 2x2 — spot, CE, PE + a scratch pane that mirrors
 //   the most recent strike-row click.
 // Panes follow the live side-ATM (hedge convention: CE ATM =
@@ -72,7 +74,7 @@ export function OptionPane({ ws, kind }: { ws: WorkspaceCfg; kind: PaneCfg['key'
           <span className="text-muted-foreground truncate px-1">{ws.symbol} · click a strike row to pin it here</span>
         </div>
         <div className="flex-1 min-h-0">
-          <CanvasChart symbol={ws.symbol} tf={ws.tf} chartType={ws.chartType} showVolume={false} showSMA20={false} showSMA50={false} height="h-full" />
+          <CanvasChart symbol={ws.symbol} tf={ws.tf} chartType={ws.chartType} showVolume={ws.showVolume} showSMA20={false} showSMA50={false} height="h-full" />
         </div>
       </div>
     )
@@ -137,7 +139,7 @@ export function OptionPane({ ws, kind }: { ws: WorkspaceCfg; kind: PaneCfg['key'
         symbol={cell.symbol}
         tf="1m"
         chartType="candles"
-        showVolume={false}
+        showVolume={ws.showVolume}
         showSMA20={false}
         showSMA50={false}
         height="h-full"
@@ -161,28 +163,52 @@ function Placeholder({ text }: { text: string }) {
   )
 }
 
-/** Full multi-pane region for a workspace (spot + option panes). */
+/** Divider between chart panes (drag to resize). */
+function PaneHandle({ horizontal = false }: { horizontal?: boolean }) {
+  return (
+    <PanelResizeHandle
+      className={horizontal ? 'w-px bg-border hover:bg-primary/60 transition-colors' : 'h-px bg-border hover:bg-primary/60 transition-colors'}
+    />
+  )
+}
+
+/** Full multi-pane region for a workspace (spot + option panes) — all panes resizable. */
 export function WorkspacePanes({ ws, spot }: { ws: WorkspaceCfg; spot: React.ReactNode }) {
   const layout = wsLayout(ws)
   if (layout === 'single') return <>{spot}</>
   if (layout === 'grid4') {
     return (
-      <div className="h-full grid grid-cols-2 grid-rows-2 gap-px bg-border/70">
-        <div className="bg-card min-w-0 min-h-0">{spot}</div>
-        <div className="bg-card min-w-0 min-h-0"><OptionPane ws={ws} kind="ce" /></div>
-        <div className="bg-card min-w-0 min-h-0"><OptionPane ws={ws} kind="pe" /></div>
-        <div className="bg-card min-w-0 min-h-0"><OptionPane ws={ws} kind="extra" /></div>
-      </div>
+      <PanelGroup direction="vertical" className="h-full">
+        <Panel defaultSize={50} minSize={15}>
+          <PanelGroup direction="horizontal" className="h-full">
+            <Panel defaultSize={50} minSize={15}><div className="h-full min-w-0">{spot}</div></Panel>
+            <PaneHandle horizontal />
+            <Panel defaultSize={50} minSize={15}><div className="h-full min-w-0"><OptionPane ws={ws} kind="ce" /></div></Panel>
+          </PanelGroup>
+        </Panel>
+        <PaneHandle />
+        <Panel defaultSize={50} minSize={15}>
+          <PanelGroup direction="horizontal" className="h-full">
+            <Panel defaultSize={50} minSize={15}><div className="h-full min-w-0"><OptionPane ws={ws} kind="pe" /></div></Panel>
+            <PaneHandle horizontal />
+            <Panel defaultSize={50} minSize={15}><div className="h-full min-w-0"><OptionPane ws={ws} kind="extra" /></div></Panel>
+          </PanelGroup>
+        </Panel>
+      </PanelGroup>
     )
   }
-  // 'spot-atm' (default): spot on top, ATM CE left + PE right below
+  // 'spot-atm' (default): spot on top, ATM CE left + PE right below — all resizable
   return (
-    <div className="h-full flex flex-col">
-      <div className="flex-1 min-h-0">{spot}</div>
-      <div className="h-[34%] min-h-[150px] shrink-0 border-t border-border grid grid-cols-2 gap-px bg-border/70">
-        <div className="bg-card min-w-0 min-h-0"><OptionPane ws={ws} kind="ce" /></div>
-        <div className="bg-card min-w-0 min-h-0"><OptionPane ws={ws} kind="pe" /></div>
-      </div>
-    </div>
+    <PanelGroup direction="vertical" className="h-full">
+      <Panel defaultSize={58} minSize={20}><div className="h-full min-w-0">{spot}</div></Panel>
+      <PaneHandle />
+      <Panel defaultSize={42} minSize={15}>
+        <PanelGroup direction="horizontal" className="h-full">
+          <Panel defaultSize={50} minSize={15}><div className="h-full min-w-0"><OptionPane ws={ws} kind="ce" /></div></Panel>
+          <PaneHandle horizontal />
+          <Panel defaultSize={50} minSize={15}><div className="h-full min-w-0"><OptionPane ws={ws} kind="pe" /></div></Panel>
+        </PanelGroup>
+      </Panel>
+    </PanelGroup>
   )
 }

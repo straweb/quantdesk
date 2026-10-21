@@ -196,6 +196,11 @@ export const api = {
   logout: () => fetch('/api/auth/logout', { method: 'POST' }),
   me: () => fetchJson<{ user: string | null; feed: string }>('/api/auth/me'),
 
+  feedSource: () =>
+    fetchJson<{ source: string; sources: { id: string; label: string; brokerType: string | null }[] }>('/api/feed'),
+  setFeedSource: (source: string) =>
+    fetch('/api/feed', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source }) }).then(r => j<{ ok: boolean; source: string }>(r)),
+
   accounts: () => fetch('/api/accounts').then(r => j<{ accounts: AccountRow[] }>(r)),
   createAccount: (body: Record<string, unknown>) =>
     fetch('/api/accounts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => j<{ ok: boolean; id: string }>(r)),

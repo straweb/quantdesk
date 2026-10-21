@@ -34,7 +34,7 @@ export const CAPITAL_MODES: Record<CapitalMode, { label: string; detail: string 
 export type OrderSide = 'BUY' | 'SELL'
 export type OrderTypeKind = 'MARKET' | 'LIMIT' | 'SL' | 'SL-M'
 export type ProductType = 'MIS' | 'CNC' | 'NRML'
-export type OrderSource = 'MANUAL' | 'STRATEGY' | 'API' | 'SQUAREOFF' | 'KILLSWITCH'
+export type OrderSource = 'MANUAL' | 'STRATEGY' | 'API' | 'SQUAREOFF' | 'KILLSWITCH' | 'SYSTEM'
 
 export interface PlaceOrderRequest {
   symbol: string // canonical master symbol

@@ -5,8 +5,8 @@ import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
 import { useQuery } from '@tanstack/react-query'
 import { ListTree, FileBox, Plus, X, Crosshair } from 'lucide-react'
 import { CanvasChart } from './chart/canvas-chart'
-import { Watchlist, MarketDepth } from './panels/watchlist'
-import { OrderPad, QuickButtons } from './panels/order-pad'
+import { Watchlist, DepthStack } from './panels/watchlist'
+import { OrderPad } from './panels/order-pad'
 import { BottomPanel } from './panels/bottom-panel'
 import { StrikesPanel } from './panels/strikes-panel'
 import { WorkspacePanes } from './panels/option-panes'
@@ -101,7 +101,7 @@ export function TerminalView() {
           >MA50</button>
           <span
             className="px-1.5 py-0.5 rounded bg-secondary text-muted-foreground flex items-center gap-1"
-            title="Scroll: zoom · Drag: pan · Double-click: reset · Click price: set limit"
+            title="Wheel: time zoom · Wheel on price axis / Shift+wheel: price zoom · Drag: free pan (all directions) · Drag price axis: squeeze/stretch · Double-click: reset · Click price: set limit"
           >
             <Crosshair className="h-3 w-3" /> zoom/pan
           </span>
@@ -111,11 +111,11 @@ export function TerminalView() {
       {/* main grid */}
       <div className="flex-1 min-h-0">
         <PanelGroup direction="horizontal">
-          {/* left: watchlist + depth */}
+          {/* left: watchlist + depth panel stack */}
           <Panel defaultSize={17} minSize={12} maxSize={28}>
             <div className="h-full flex flex-col border-r border-border">
               <div className="flex-1 min-h-0"><Watchlist /></div>
-              <div className="border-t border-border"><MarketDepth /></div>
+              <DepthStack ws={ws} />
             </div>
           </Panel>
           <Handle />
@@ -222,7 +222,6 @@ function RightDock({ ws }: { ws: NonNullable<ReturnType<typeof useTerminal.getSt
       <div className="flex-1 min-h-0 overflow-y-auto">
         {tab === 'strikes' ? <StrikesPanel ws={ws} /> : <OrderPad />}
       </div>
-      <QuickButtons />
     </div>
   )
 }

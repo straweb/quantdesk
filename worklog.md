@@ -85,3 +85,25 @@ Stage Summary:
 - Default FNO workspace = S+2 layout: spot top, live side-ATM CE (left) / PE (right) panes below; strike rows load into panes on click
 - Alloc semantics: each side independently auto-normalizes to 100% of per-account usable capital; deploy/cancel/swap per side unchanged
 - Capital chips give one-click account enable/disable + capital sizing without leaving the terminal
+
+---
+Task ID: 5
+Agent: main (Z.ai)
+Task: User-reported fixes + features — chart volume everywhere, independent price/time axis zoom, free 4-way chart drag, remove bottom-right quick buttons, resizable chart panes, N stacked depth panels bottom-left, deploy-enabled-only toast clarity, plain market B/S on strike rows, Entry/Target/StopLoss price inputs (+ resting-order monitor so they actually fire), feed chip with switchable source account.
+
+Work Log:
+- canvas-chart rework: shared window calc (winRef) for accurate px->price mapping; wheel on price axis / Shift+wheel = price-scale-only zoom (0.15-10x), wheel elsewhere = time zoom; drag plot = free pan left/right/top/bottom (priceOffRef), drag price axis = squeeze/stretch, drag time axis = time pan; dbl-click resets; volume histogram in ALL modes (mini panes get 14% band) + Vol vMax label
+- option-panes: spot-atm + grid4 layouts rebuilt on react-resizable-panels (all pane dividers draggable); pane charts now follow ws.showVolume (volume was hard-disabled before — the "missing volume" report)
+- terminal-view: removed QuickButtons bar (B/S, Positions, Orders, Copy ON, Cancel All, Square Off All) from right dock; deleted QuickButtons component
+- store: DepthPanelCfg {id,symbol,height} per workspace; watchlist: DepthStack — [+] adds depth panel for selected symbol (max 6), X removes, drag top grip resizes 96-460px (committed on mouseup), stack scrolls with max-h 72% so watchlist shrinks
+- strikes-panel: deploy toast now "Deploy CE: N/M enabled strikes · X account fills" (was ambiguous per-leg count); rowSell de-hijacked — S = plain market SELL of that strike (old code silently exited longs); row mutations (toggle/alloc/remove) read fresh store state (stale-closure fix)
+- StrikeRowEditor: "orders at price" desk — Entry (B@/S@ LIMIT at price, alloc%-sized), Target (reduce-only LIMIT, auto side), StopLoss (reduce-only SL-M trigger); resting orders return master status FAILED (0 fills) so toasts count OPEN legs as success
+- order-monitor.ts (new): 1s loop executes resting LIMIT/SL/SL-M legs on sim-feed crossing via placeMasterOrder(source SYSTEM); 'reduce'-tagged exits (strategyId marker) cap qty at held lots and auto-cancel when the position flattens; wired in instrumentation.ts
+- feed-source: market-feed /feed-source GET/POST persisting db/feed-source.json; /api/feed (auth'd) proxies + mirrors onto BrokerAccount.isLiveDataSource; FeedChip popover in top bar — radio list (Sim + every account), one active at a time, chip shows live source label
+- sim feed: synthetic index volume (separate PRNG stream so price paths are byte-identical) + per-tick volume accumulation into live candles (was v+=0 forever) calibrated to history scale; timer dedup via g.__feedTimers (bun --hot was stacking intervals across reloads)
+- sandbox infra: mutual watchdogs — feed service respawns `bun run dev` when :3000 is dark; instrumentation respawns the feed when :3004 is dark + re-publishes the 638-symbol universe; spawn envs pin PORT/REST_PORT (Next dev env carries PORT=3000 which hijacked the feed socket port -> :3003 silently missing, frozen ticks)
+
+Stage Summary:
+- E2E verified: deploy with 1 of 2 CE enabled -> exactly 1 master order + "1/1 enabled strikes · 3 account fills"; plain row SELL routes as new order (no exit hijack); Entry LIMIT @30 rested OPEN (auto-sized per account), Target/SL armed per-account at held qty; monitor fired an SL-M trigger within 1s (3 SYSTEM fills) and auto-cancelled orphaned exits when flat; feed chip switched source to an account and back (persisted to db/feed-source.json); pane dividers resized (CE 120->200px, CE/PE widths re-split); depth panel added/resized/removed; free chart drag + price-axis zoom verified on-canvas; console clean
+- Infra: dev server + feed service now self-heal across sandbox process reaping (tool-session boundaries); verify with curl :3000/api/auth/me, :3004/health, :3003 socket
+- tsc: zero new errors (18 pre-existing in untouched files)

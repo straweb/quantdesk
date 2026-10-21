@@ -1,5 +1,8 @@
 import { createServer } from 'http'
 import { Server } from 'socket.io'
+import { readFileSync, writeFileSync, mkdirSync } from 'fs'
+import path from 'path'
+import { spawn } from 'child_process'
 
 // ============================================================
 // Market Feed Mini-Service (port 3003, bun runtime)
@@ -8,9 +11,10 @@ import { Server } from 'socket.io'
 // - Deterministic historical backfill (3 sessions of 1m bars)
 // - Socket.io streaming for subscribed symbols
 // - REST: health / universe / candles / ltp / quote / depth
+//         /feed-source (active feed account — one at a time)
 // In production this service hosts pluggable feed adapters
 // (Dhan WebSocket, Shoonya WebSocket, ICICI Breeze stream);
-// the sim feed is the default source.
+// the sim feed is the default source and the sandbox fallback.
 // ============================================================
 
 interface UniverseEntry {
@@ -105,6 +109,55 @@ if (!g.__feedState) {
 }
 const S = g.__feedState
 
+// ---------- active feed source (persisted; one at a time) ----------
+const FEED_SRC_FILE = process.env.FEED_SRC_FILE || path.resolve(process.cwd(), '../../db/feed-source.json')
+let feedSource = 'sim'
+try {
+  const raw = readFileSync(FEED_SRC_FILE, 'utf8')
+  feedSource = (JSON.parse(raw) as { source?: string }).source ?? 'sim'
+} catch { /* first boot — default 'sim' */ }
+
+// ---------- sidecar supervisor: keep the Next.js dev server alive ----------
+// This service is boot-spawned and outlives agent tool sessions (whose spawned
+// processes get reaped at session boundaries), so it doubles as the dev-server
+// watchdog: whenever :3000 stops answering, respawn `bun run dev` detached.
+const PROJECT_ROOT = path.resolve(process.cwd(), '../..')
+let devStarting = false
+
+async function devHealthy(): Promise<boolean> {
+  try {
+    const r = await fetch('http://localhost:3000/api/auth/me', { signal: AbortSignal.timeout(2500) })
+    return r.status < 500 // any HTTP response means the server is up
+  } catch {
+    return false
+  }
+}
+
+function spawnDevServer() {
+  if (devStarting) return
+  devStarting = true
+  console.log('[market-feed] :3000 down — spawning Next.js dev server…')
+  try {
+    const child = spawn('bun', ['run', 'dev'], {
+      cwd: PROJECT_ROOT,
+      detached: true,
+      stdio: 'ignore',
+      // our own env may carry PORT=3003 — the dev script binds :3000 via -p
+      env: { ...process.env, PORT: '3000' },
+    })
+    child.unref()
+    child.on('error', e => console.error('[market-feed] dev spawn error:', e.message))
+  } catch (e) {
+    console.error('[market-feed] dev spawn failed:', e)
+  } finally {
+    // cooldown so a crashing server cannot trigger a tight respawn loop
+    setTimeout(() => { devStarting = false }, 20_000)
+  }
+}
+
+// watchdog itself is registered in the single-owner timer block at the bottom
+// of this file (survives hot reloads without stacking)
+
 const DAYS_BACK = 3
 
 function bucketStart(ts: number, tf: string): number {
@@ -114,6 +167,9 @@ function bucketStart(ts: number, tf: string): number {
 
 function buildHistory(entry: UniverseEntry) {
   const rnd = mulberry32(hashStr(entry.symbol) % 2 ** 31)
+  // independent stream for volume so adding index volume never perturbs the
+  // deterministic price path (same rnd() call sequence as before)
+  const vrnd = mulberry32((hashStr(entry.symbol) ^ 0x9e3779b9) >>> 0)
   const vola = volaHist(entry.instrumentType)
   const now = Date.now()
   const oneMin = TF_MS['1m']
@@ -132,7 +188,7 @@ function buildHistory(entry: UniverseEntry) {
       h = Math.max(h, c)
       l = Math.min(l, c)
     }
-    const v = Math.round((entry.instrumentType === 'INDEX' ? 0 : 400 + rnd() * 2600) * (entry.lotSize > 1 ? 1 : 8))
+    const v = Math.round((entry.instrumentType === 'INDEX' ? 2200 + vrnd() * 19000 : 400 + vrnd() * 2600) * (entry.lotSize > 1 ? 1 : 8))
     bars.push({ t, o: r2(o), h: r2(h), l: r2(l), c: r2(c), v })
     price = c
   }
@@ -212,7 +268,13 @@ function tickOnce() {
     st.low = Math.min(st.low, st.ltp)
     st.bid = r2(st.ltp - Math.max(0.05, st.ltp * 0.0004))
     st.ask = r2(st.ltp + Math.max(0.05, st.ltp * 0.0004))
-    if (st.instrumentType !== 'INDEX') st.vol += Math.round(Math.random() * st.lotSize * 2)
+    // per-tick traded volume — EQ/FUT/OPT scale with lot size, indices get a
+    // synthetic flow calibrated to match the historical per-minute volumes
+    // (history: ~2200-21000/min for INDEX, ~3200-24000/min for lot>1 EQ)
+    const dv = st.instrumentType !== 'INDEX'
+      ? Math.round(Math.random() * st.lotSize * 2)
+      : Math.round(10 + Math.random() * 60)
+    st.vol += dv
 
     // update 1m candle
     const key = `${st.symbol}|1m`
@@ -221,7 +283,7 @@ function tickOnce() {
       const bs = bucketStart(now, '1m')
       let cur = bars[bars.length - 1]
       if (!cur || cur.t !== bs) {
-        cur = { t: bs, o: st.ltp, h: st.ltp, l: st.ltp, c: st.ltp, v: 0 }
+        cur = { t: bs, o: st.ltp, h: st.ltp, l: st.ltp, c: st.ltp, v: dv }
         bars.push(cur)
         // keep memory bounded
         if (bars.length > DAYS_BACK * 1440 + 500) bars.splice(0, 200)
@@ -237,9 +299,9 @@ function tickOnce() {
               last2.h = Math.max(last2.h, st.ltp)
               last2.l = Math.min(last2.l, st.ltp)
               last2.c = st.ltp
-              last2.v += 0
+              last2.v += dv
             } else {
-              series.push({ t: b2, o: st.ltp, h: st.ltp, l: st.ltp, c: st.ltp, v: 0 })
+              series.push({ t: b2, o: st.ltp, h: st.ltp, l: st.ltp, c: st.ltp, v: dv })
             }
           }
         }
@@ -247,7 +309,7 @@ function tickOnce() {
         cur.h = Math.max(cur.h, st.ltp)
         cur.l = Math.min(cur.l, st.ltp)
         cur.c = st.ltp
-        cur.v += 0
+        cur.v += dv
       }
     }
   }
@@ -271,6 +333,36 @@ const httpServer = createServer((req, res) => {
   }
 
   if (url.pathname === '/health') return json(200, { ok: true, symbols: S.states.size, ts: Date.now() })
+
+  // ---- active feed source (which account the terminal pulls data from) ----
+  // Persisted to a shared JSON file so the Next.js API can read/write it too.
+  // 'sim' = built-in simulated feed; otherwise a BrokerAccount id whose
+  // adapter websocket is used when that broker feed is connected.
+  if (url.pathname === '/feed-source') {
+    if (req.method === 'POST') {
+      let body = ''
+      req.on('data', c => (body += c))
+      req.on('end', () => {
+        try {
+          const { source } = JSON.parse(body) as { source?: string }
+          if (!source || typeof source !== 'string') return json(400, { ok: false, error: 'source required' })
+          feedSource = source
+          try {
+            mkdirSync(path.dirname(FEED_SRC_FILE), { recursive: true })
+            writeFileSync(FEED_SRC_FILE, JSON.stringify({ source: feedSource, updatedAt: new Date().toISOString() }, null, 2))
+          } catch (e) {
+            console.error('[market-feed] feed-source persist failed:', e)
+          }
+          console.log(`[market-feed] feed source -> ${feedSource}`)
+          json(200, { ok: true, source: feedSource })
+        } catch (e) {
+          json(400, { ok: false, error: String(e) })
+        }
+      })
+      return
+    }
+    return json(200, { source: feedSource })
+  }
 
   if (url.pathname === '/universe') {
     if (req.method === 'POST') {
@@ -358,9 +450,20 @@ io.on('connection', socket => {
 
 loadUniverse(DEFAULT_UNIVERSE)
 
+// ---- timers: bun --hot stacks intervals across reloads — deregister the
+// previous module's loops first (globalThis survives hot reloads) ----
+interface HotTimers { tick?: ReturnType<typeof setInterval>; stream?: ReturnType<typeof setInterval>; watch?: ReturnType<typeof setInterval> }
+const hot = g as unknown as { __feedTimers?: HotTimers }
+if (hot.__feedTimers) {
+  if (hot.__feedTimers.tick) clearInterval(hot.__feedTimers.tick)
+  if (hot.__feedTimers.stream) clearInterval(hot.__feedTimers.stream)
+  if (hot.__feedTimers.watch) clearInterval(hot.__feedTimers.watch)
+}
+hot.__feedTimers = {}
+
 // tick loop 250ms — streams subscribed symbols
-setInterval(tickOnce, 250)
-setInterval(() => {
+hot.__feedTimers.tick = setInterval(tickOnce, 250)
+hot.__feedTimers.stream = setInterval(() => {
   const syms = subscribedSymbols()
   if (syms.size === 0) return
   const ticks: unknown[] = []
@@ -373,12 +476,20 @@ setInterval(() => {
   if (ticks.length) io.emit('ticks', ticks)
 }, 250)
 
+// dev-server watchdog — every 10s, respawn `bun run dev` when :3000 is dark
+hot.__feedTimers.watch = setInterval(() => {
+  void devHealthy().then(up => { if (!up) spawnDevServer() })
+}, 10_000)
+
 httpServer.listen(REST_PORT, () => {
   console.log(`[market-feed] REST listening on :${REST_PORT} with ${S.states.size} symbols`)
 })
+socketServer.on('error', e => console.error('[market-feed] socket.io error:', (e as Error).message))
+httpServer.on('error', e => console.error('[market-feed] REST error:', (e as Error).message))
 socketServer.listen(PORT, () => {
   console.log(`[market-feed] socket.io listening on :${PORT}`)
 })
 
 process.on('SIGTERM', () => { httpServer.close(() => process.exit(0)); socketServer.close(() => process.exit(0)) })
 process.on('SIGINT', () => { httpServer.close(() => process.exit(0)); socketServer.close(() => process.exit(0)) })
+// reload-probe 1792602789

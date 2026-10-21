@@ -108,10 +108,7 @@ function Shell() {
         <CapitalChips />
 
         <div className="flex items-center gap-2 text-[10px]">
-          <span className={`flex items-center gap-1 ${feedUp ? 'text-[#00c896]' : 'text-[#ff4d5e]'}`}>
-            <CircleDot className={`h-3 w-3 ${feedUp ? 'pulse-dot' : ''}`} />
-            {feedUp ? 'FEED LIVE' : 'FEED DOWN'}
-          </span>
+          <FeedChip up={feedUp} />
           <span className="tabular text-muted-foreground">{now} IST</span>
           <Button variant="ghost" size="sm" className="h-6 px-2 text-[10px]" onClick={() => api.logout().then(() => setUser(null))}>
             <LogOut className="h-3 w-3" /> admin
@@ -238,6 +235,82 @@ function CapitalChip({ acc }: { acc: AccountRow }) {
           <Button size="sm" className="h-7 px-3 text-[10px]" onClick={save} disabled={busy}>
             {busy ? 'Saving…' : 'Apply'}
           </Button>
+        </div>
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+// ------------------------------------------------------------
+// Feed status chip — click to see / switch the market-data
+// source. Radio semantics: exactly ONE feed source is active
+// (Sim built-in or one broker account's feed adapter).
+// ------------------------------------------------------------
+function FeedChip({ up }: { up: boolean }) {
+  const qc = useQueryClient()
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const { data } = useQuery({ queryKey: ['feed-source'], queryFn: () => api.feedSource(), refetchInterval: 8000 })
+  const source = data?.source ?? 'sim'
+  const sources = data?.sources ?? []
+  const current = sources.find(s => s.id === source)
+
+  const pick = async (id: string) => {
+    if (id === source || busy) return
+    setBusy(true)
+    try {
+      await api.setFeedSource(id)
+      await qc.invalidateQueries({ queryKey: ['feed-source'] })
+      const label = sources.find(s => s.id === id)?.label ?? id
+      toast.success(`Market data source → ${label}`)
+      setOpen(false)
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Switch failed')
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          className={`flex items-center gap-1 px-1.5 py-1 rounded border transition-colors ${
+            up ? 'border-[#00c896]/30 bg-up/40 text-[#00c896] hover:bg-up/60' : 'border-[#ff4d5e]/30 bg-down/40 text-[#ff4d5e] hover:bg-down/60'
+          }`}
+          title="Market data source — click to view / switch (one active at a time)"
+        >
+          <CircleDot className={`h-3 w-3 ${up ? 'pulse-dot' : ''}`} />
+          <span className="font-bold">FEED {up ? 'LIVE' : 'DOWN'}</span>
+          <span className="text-muted-foreground">·</span>
+          <span className="max-w-[110px] truncate text-foreground/80">{current?.label ?? 'Sim Feed'}</span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-64 p-2 text-[11px] space-y-1">
+        <div className="px-1 pb-1 text-[9px] text-muted-foreground leading-snug">
+          Market data source — only one feed is active at a time. Selecting an account routes ticks through that broker's feed adapter.
+        </div>
+        {sources.map(s => (
+          <button
+            key={s.id}
+            onClick={() => pick(s.id)}
+            disabled={busy}
+            className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-left transition-colors ${
+              s.id === source ? 'bg-primary/20 border border-primary/50' : 'hover:bg-secondary border border-transparent'
+            }`}
+          >
+            <span className={`h-2.5 w-2.5 rounded-full border shrink-0 flex items-center justify-center ${
+              s.id === source ? 'border-primary' : 'border-muted-foreground/40'
+            }`}>
+              {s.id === source && <span className="h-1.5 w-1.5 rounded-full bg-primary" />}
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block truncate font-medium">{s.label}</span>
+              {s.brokerType && <span className="block text-[8px] text-muted-foreground uppercase tracking-wide">{s.brokerType}</span>}
+            </span>
+            {s.id === source && <span className="text-[8px] font-bold text-primary shrink-0">ACTIVE</span>}
+          </button>
+        ))}
+        <div className="px-1 pt-1 text-[8px] text-muted-foreground leading-snug">
+          Broker feeds stream via their adapter websocket when connected; the sandbox falls back to sim ticks so charts never go dark.
         </div>
       </PopoverContent>
     </Popover>

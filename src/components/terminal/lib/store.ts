@@ -20,6 +20,17 @@ export interface StrikesCfg {
   rows: StrikeRowCfg[]
 }
 
+// ---- depth panel stack (left dock bottom) ----
+export interface DepthPanelCfg {
+  id: string
+  symbol: string
+  height: number // px, adjustable by dragging the panel's top edge
+}
+
+export function defaultDepthPanels(symbol: string): DepthPanelCfg[] {
+  return [{ id: `dp-${symbol.toLowerCase()}`, symbol, height: 190 }]
+}
+
 // ---- multi-pane chart layouts ----
 export type WsLayout = 'single' | 'spot-atm' | 'grid4'
 
@@ -76,6 +87,7 @@ export interface WorkspaceCfg {
   layout?: WsLayout
   panes?: PaneCfg[]
   strikes?: StrikesCfg
+  depthPanels?: DepthPanelCfg[]
 }
 
 export function defaultStrikes(): StrikesCfg {
@@ -114,6 +126,7 @@ interface TerminalState {
 const mkWs = (id: string, name: string, symbol: string): WorkspaceCfg => ({
   id, name, symbol, tf: '5m', chartType: 'candles', showVolume: true, showSMA20: false, showSMA50: false,
   showOptionMinis: true, layout: 'spot-atm', panes: defaultPanes(), strikes: defaultStrikes(),
+  depthPanels: defaultDepthPanels(symbol),
 })
 
 export const useTerminal = create<TerminalState>()(

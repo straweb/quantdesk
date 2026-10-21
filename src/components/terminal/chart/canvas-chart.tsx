@@ -9,9 +9,15 @@ import { onTicks, subscribeTicks, unsubscribeTicks } from '../lib/socket'
 // ============================================================
 // From-scratch canvas candlestick chart — no charting library.
 // Candles / line / area + volume histogram, crosshair with
-// OHLCV legend, price/time axes, wheel zoom (around cursor),
-// drag pan, SMA overlays, live tick streaming, position
-// average-price lines, last-price pulse label.
+// OHLCV legend, price/time axes, independent axis zoom + pan:
+//   · wheel on plot / time axis  -> time zoom (bars)
+//   · wheel on price axis / +Shift -> price-scale-only zoom
+//   · drag plot                   -> free pan (left/right/top/bottom)
+//   · drag price axis             -> squeeze/stretch price scale
+//   · drag time axis              -> pan time
+//   · double-click                -> reset view
+// SMA overlays, live tick streaming, position avg-price markers,
+// last-price label, click-to-set-limit.
 // ============================================================
 
 export interface ChartMarker { price: number; label: string; color: string }
@@ -26,7 +32,7 @@ interface Props {
   markers?: ChartMarker[]
   onPriceClick?: (price: number) => void
   height: string
-  mini?: boolean // compact mode (ATM option mini charts): thinner axes, no crosshair legend/time axis
+  mini?: boolean // compact mode (option panes): thinner axes, no crosshair legend/time axis
 }
 
 const UP = '#00c896'
@@ -65,6 +71,24 @@ function fmtAxisTime(t: number, tf: string): string {
   return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false })
 }
 
+function fmtVol(v: number): string {
+  if (v >= 1e7) return `${(v / 1e7).toFixed(1)}Cr`
+  if (v >= 1e5) return `${(v / 1e5).toFixed(1)}L`
+  if (v >= 1000) return `${(v / 1000).toFixed(1)}k`
+  return String(Math.round(v))
+}
+
+interface DragState {
+  zone: 'plot' | 'price' | 'time'
+  startX: number
+  startY: number
+  startOffset: number
+  startPriceOff: number
+  startPriceZoom: number
+  pxPerPx: number // price units per vertical pixel at drag start
+  moved: number
+}
+
 export function CanvasChart({ symbol, tf, chartType, showVolume, showSMA20, showSMA50, markers = [], onPriceClick, height, mini = false }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -72,11 +96,15 @@ export function CanvasChart({ symbol, tf, chartType, showVolume, showSMA20, show
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState<string | null>(null)
   const [barCount, setBarCount] = useState(mini ? 60 : 120)
-  const offsetRef = useRef(0)
+  const offsetRef = useRef(0) // time pan (bars from the right edge)
+  const priceZoomRef = useRef(1) // 1 = fit data; >1 zoomed out, <1 zoomed in
+  const priceOffRef = useRef(0) // free vertical pan (price units)
   const [, forceRender] = useState(0)
   const crossRef = useRef<{ x: number; y: number } | null>(null)
-  const dragRef = useRef<{ startX: number; startOffset: number } | null>(null)
+  const dragRef = useRef<DragState | null>(null)
   const sizeRef = useRef({ w: 0, h: 0 })
+  // last drawn window — lets event handlers hit-test axes and map px->price accurately
+  const winRef = useRef({ w: 0, h: 0, plotW: 0, priceH: 0, axisH: mini ? 12 : 20, pMin: 0, pMax: 1 })
   const lastVolRef = useRef<Record<string, number>>({})
 
   // ---- data loading ----
@@ -99,6 +127,8 @@ export function CanvasChart({ symbol, tf, chartType, showVolume, showSMA20, show
   useEffect(() => {
     setLoading(true)
     offsetRef.current = 0
+    priceZoomRef.current = 1
+    priceOffRef.current = 0
     load()
     subscribeTicks([symbol])
     const iv = setInterval(load, 30_000) // periodic authoritative resync
@@ -170,8 +200,8 @@ export function CanvasChart({ symbol, tf, chartType, showVolume, showSMA20, show
       const axisW = mini ? 46 : 58
       const axisH = mini ? 12 : 20
       const plotW = w - axisW
-      const volH = showVolume && !mini ? Math.round((h - axisH) * 0.18) : 0
-      const priceH = h - axisH - volH - (showVolume && !mini ? 6 : 0)
+      const volH = showVolume ? Math.round((h - axisH) * (mini ? 0.14 : 0.18)) : 0
+      const priceH = h - axisH - volH - (showVolume ? 5 : 0)
 
       // visible window
       const end = Math.max(2, data.length - offsetRef.current)
@@ -192,6 +222,15 @@ export function CanvasChart({ symbol, tf, chartType, showVolume, showSMA20, show
       for (const m of markers) { if (m.price < pMin) pMin = m.price; if (m.price > pMax) pMax = m.price }
       const pad = (pMax - pMin) * 0.08 || pMax * 0.001 || 1
       pMin -= pad; pMax += pad
+
+      // price-scale zoom (around window centre) + free vertical pan
+      const zoom = priceZoomRef.current
+      const center = (pMin + pMax) / 2
+      const half = ((pMax - pMin) / 2) * zoom
+      pMin = center - half + priceOffRef.current
+      pMax = center + half + priceOffRef.current
+
+      winRef.current = { w, h, plotW, priceH, axisH, pMin, pMax }
 
       const cw = plotW / vis.length // candle slot width
       const bodyW = Math.max(1, Math.min(14, cw * 0.68))
@@ -224,17 +263,21 @@ export function CanvasChart({ symbol, tf, chartType, showVolume, showSMA20, show
       })
       }
 
-      // volume
-      if (showVolume && !mini && volH > 0) {
+      // volume histogram
+      if (showVolume && volH > 0) {
         let vMax = 0
         for (const c of vis) if (c.v > vMax) vMax = c.v
-        const vy0 = priceH + 6 + volH
+        const vy0 = priceH + 5 + volH
         vis.forEach((c, i) => {
           if (c.v <= 0) return
           const vh = (c.v / vMax) * volH
           ctx.fillStyle = c.c >= c.o ? 'rgba(0,200,150,0.35)' : 'rgba(255,77,94,0.35)'
           ctx.fillRect(xOf(i) - bodyW / 2, vy0 - vh, bodyW, vh)
         })
+        ctx.fillStyle = 'rgba(139,148,158,0.8)'
+        ctx.textAlign = 'left'
+        ctx.textBaseline = 'top'
+        ctx.fillText(`Vol ${fmtVol(vMax)}`, 4, vy0 - volH + 1)
       }
 
       // series
@@ -294,6 +337,7 @@ export function CanvasChart({ symbol, tf, chartType, showVolume, showSMA20, show
       // markers (position avg prices)
       for (const m of markers) {
         const y = yOf(m.price)
+        if (y < -8 || y > priceH + 8) continue
         ctx.setLineDash([4, 3])
         ctx.strokeStyle = m.color
         ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke()
@@ -379,51 +423,83 @@ export function CanvasChart({ symbol, tf, chartType, showVolume, showSMA20, show
     const ro = new ResizeObserver(() => forceRender(n => n + 1))
     ro.observe(wrap)
     return () => { cancelAnimationFrame(raf); ro.disconnect() }
-  }, [candles, barCount, chartType, showVolume, showSMA20, showSMA50, markers, symbol, tf, loading, err])
+  }, [candles, barCount, chartType, showVolume, showSMA20, showSMA50, markers, symbol, tf, loading, err, mini])
 
   // ---- interactions ----
   const onWheel = (e: React.WheelEvent) => {
     e.preventDefault()
-    const factor = e.deltaY > 0 ? 1.15 : 0.87
-    setBarCount(b => Math.max(25, Math.min(900, Math.round(b * factor))))
+    const rect = canvasRef.current!.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const win = winRef.current
+    const f = e.deltaY > 0 ? 1.15 : 0.87
+    if ((win.plotW > 0 && x >= win.plotW) || e.shiftKey) {
+      // price-scale-only zoom (wheel over the price axis, or Shift+wheel anywhere)
+      priceZoomRef.current = Math.max(0.15, Math.min(10, priceZoomRef.current * f))
+    } else {
+      // time zoom (bars visible)
+      setBarCount(b => Math.max(25, Math.min(900, Math.round(b * f))))
+    }
   }
   const onMouseDown = (e: React.MouseEvent) => {
-    dragRef.current = { startX: e.clientX, startOffset: offsetRef.current }
+    const rect = canvasRef.current!.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+    const win = winRef.current
+    const zone: DragState['zone'] = x >= win.plotW ? 'price' : y >= win.h - win.axisH ? 'time' : 'plot'
+    dragRef.current = {
+      zone,
+      startX: e.clientX,
+      startY: e.clientY,
+      startOffset: offsetRef.current,
+      startPriceOff: priceOffRef.current,
+      startPriceZoom: priceZoomRef.current,
+      pxPerPx: win.priceH > 0 ? (win.pMax - win.pMin) / win.priceH : 1,
+      moved: 0,
+    }
   }
   const onMouseMove = (e: React.MouseEvent) => {
     const rect = canvasRef.current!.getBoundingClientRect()
     crossRef.current = { x: e.clientX - rect.left, y: e.clientY - rect.top }
-    if (dragRef.current) {
-      const dataLen = candles.length
-      const cwAvg = (sizeRef.current.w - 58) / barCount
-      const barsMoved = Math.round((e.clientX - dragRef.current.startX) / cwAvg)
-      offsetRef.current = Math.max(0, Math.min(dataLen - 25, dragRef.current.startOffset + barsMoved))
+    const d = dragRef.current
+    if (!d) return
+    d.moved = Math.max(d.moved, Math.abs(e.clientX - d.startX) + Math.abs(e.clientY - d.startY))
+    if (d.zone === 'price') {
+      // drag up on the price axis = zoom in (compress), down = zoom out (stretch)
+      const f = Math.exp((d.startY - e.clientY) / 180)
+      priceZoomRef.current = Math.max(0.15, Math.min(10, d.startPriceZoom * f))
+      return
+    }
+    // plot / time axis: horizontal pan (time)
+    const dataLen = candles.length
+    const cwAvg = Math.max(0.5, (sizeRef.current.w - (mini ? 46 : 58)) / barCount)
+    const barsMoved = Math.round((e.clientX - d.startX) / cwAvg)
+    offsetRef.current = Math.max(0, Math.min(dataLen - 25, d.startOffset + barsMoved))
+    // plot only: free vertical pan (price follows the cursor)
+    if (d.zone === 'plot') {
+      priceOffRef.current = d.startPriceOff + (e.clientY - d.startY) * d.pxPerPx
     }
   }
   const onMouseUp = (e: React.MouseEvent) => {
-    // click without drag -> price click (sync limit price to order pad)
-    if (mini) { dragRef.current = null; return }
-    const moved = dragRef.current ? Math.abs(e.clientX - dragRef.current.startX) : 99
-    if (moved < 4 && onPriceClick) {
-      const rect = canvasRef.current!.getBoundingClientRect()
-      const y = e.clientY - rect.top
-      const priceH = sizeRef.current.h - 20
-      const data = candles
-      if (data.length >= 2 && y < priceH) {
-        const end = Math.max(2, data.length - offsetRef.current)
-        const start = Math.max(0, end - barCount)
-        const vis = data.slice(start, end)
-        let pMin = Infinity, pMax = -Infinity
-        for (const c of vis) { if (c.l < pMin) pMin = c.l; if (c.h > pMax) pMax = c.h }
-        const pad = (pMax - pMin) * 0.08 || 1
-        pMin -= pad; pMax += pad
-        const price = pMax - (y / priceH) * (pMax - pMin)
-        onPriceClick(Number(price.toFixed(2)))
-      }
-    }
+    const d = dragRef.current
     dragRef.current = null
+    // click without drag -> price click (sync limit price to order pad)
+    if (!d || d.moved >= 4 || !onPriceClick) return
+    const rect = canvasRef.current!.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+    const win = winRef.current
+    if (x < win.plotW && y < win.priceH && win.pMax > win.pMin) {
+      const price = win.pMax - (y / win.priceH) * (win.pMax - win.pMin)
+      onPriceClick(Number(price.toFixed(2)))
+    }
   }
   const onMouseLeave = () => { crossRef.current = null; dragRef.current = null }
+  const resetView = () => {
+    offsetRef.current = 0
+    priceZoomRef.current = 1
+    priceOffRef.current = 0
+    setBarCount(mini ? 60 : 120)
+  }
 
   return (
     <div ref={wrapRef} className={`relative w-full ${height} select-none`} data-chart-root>
@@ -435,7 +511,7 @@ export function CanvasChart({ symbol, tf, chartType, showVolume, showSMA20, show
         onMouseMove={onMouseMove}
         onMouseUp={onMouseUp}
         onMouseLeave={onMouseLeave}
-        onDoubleClick={() => { offsetRef.current = 0; setBarCount(120) }}
+        onDoubleClick={resetView}
       />
       <div className="absolute right-16 top-1.5 flex gap-2 text-[9px] text-muted-foreground pointer-events-none">
         {showSMA20 && <span className="text-[#4dd0e1]">SMA20</span>}
