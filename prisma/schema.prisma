@@ -1,0 +1,197 @@
+// ============================================================
+// Master Control DB — OpenAlgo-style multi-broker trading terminal
+// Per-broker trade/order/position DBs live in db/brokers/{type}/{accountId}.db
+// (node:sqlite), this schema holds admin/master/copy-trading state.
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Auth ----------
+model AdminUser {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  role         String   @default("admin")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+// ---------- Broker accounts ----------
+model BrokerAccount {
+  id               String   @id @default(cuid())
+  label            String
+  brokerType       String // SIMFEED | DHAN | SHOONYA | ICICI_BREEZE
+  clientId         String?
+  credentialsEnc   String? // AES-256-GCM encrypted JSON credentials
+  status           String   @default("ACTIVE") // ACTIVE | DISABLED | ERROR
+  isActive         Boolean  @default(true)
+  isLiveDataSource Boolean  @default(false) // exactly one feeds the terminal market data
+  isOrderEnabled   Boolean  @default(false) // admin enables this account to receive orders
+  isCopyMaster     Boolean  @default(false) // mirror source / primary leg
+  sortOrder        Int      @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  capital       CapitalConfig?
+  orderAudits   OrderAudit[]
+  strategies    Strategy[]
+}
+
+// ---------- Capital sizing (house concept) ----------
+// PROFIT_ONLY                  : first trade uses full initial capital; afterwards only accumulated profit is deployable
+// INITIAL_PLUS_PNL             : initial capital + realized PnL (compounding) is deployable
+// INITIAL_WITH_LOSS_REDUCTION  : only initial capital; losses (incl. brokerage/charges/tax) permanently reduce it; profits do not add
+model CapitalConfig {
+  id             String   @id @default(cuid())
+  accountId      String   @unique
+  account        BrokerAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  initialCapital Float
+  mode           String   @default("INITIAL_PLUS_PNL")
+  realizedPnl    Float    @default(0) // net realized pnl (trades only)
+  chargesPaid    Float    @default(0) // cumulative brokerage+taxes+charges
+  deployed       Float    @default(0) // margin locked in open positions
+  firstTradeDone Boolean  @default(false)
+  updatedAt      DateTime @updatedAt
+}
+
+// ---------- Master contracts (symbols) ----------
+model SymbolMaster {
+  id             String   @id @default(cuid())
+  symbol         String // canonical tradable symbol e.g. NIFTY, RELIANCE, NIFTY29OCT2524600CE
+  name           String
+  exchange       String // NSE | NFO | BSE
+  instrumentType String // INDEX | EQ | FUT | CE | PE
+  expiry         String? // YYYY-MM-DD
+  strike         Float?
+  optionType     String? // CE | PE
+  lotSize        Int      @default(1)
+  tickSize       Float    @default(0.05)
+  underlying     String?
+  basePrice      Float? // seed price for sim feed
+  version        String // contract-file version (sync date)
+  updatedAt      DateTime @updatedAt
+
+  mappings SymbolMapping[]
+
+  @@unique([symbol, exchange])
+  @@index([exchange, instrumentType])
+  @@index([symbol])
+}
+
+model SymbolMapping {
+  id           String  @id @default(cuid())
+  masterId     String
+  master       SymbolMaster @relation(fields: [masterId], references: [id], onDelete: Cascade)
+  brokerType   String
+  brokerSymbol String // broker-specific trading symbol
+  brokerToken  String? // broker token / security id / instrument id
+  multiplier   Int     @default(1)
+
+  @@unique([masterId, brokerType])
+  @@index([brokerType])
+}
+
+// ---------- Copy trading config ----------
+model CopyTradeConfig {
+  id               String  @id @default(cuid())
+  enabled          Boolean @default(true)
+  masterAccountId  String?
+  capitalSharePct  Float   @default(100) // % of usable capital deployed per signal
+  slippagePct      Float   @default(0.05)
+  roundToLot       Boolean @default(true)
+  skipFailedLegs   Boolean @default(true)
+  killSwitch       Boolean @default(false)
+  updatedAt        DateTime @updatedAt
+}
+
+// ---------- Python strategy builder ----------
+model Strategy {
+  id             String   @id @default(cuid())
+  name           String
+  enabled        Boolean  @default(false)
+  status         String   @default("IDLE") // IDLE | WAITING_ENTRY | IN_POSITION | EXITED | STOPPED | ERROR
+  exchange       String   @default("NSE")
+  symbol         String // canonical master symbol
+  direction      String   @default("LONG") // LONG | SHORT
+  productType    String   @default("MIS")
+  orderType      String   @default("MARKET")
+  limitPrice     Float?
+  qtyMode        String   @default("CAPITAL") // FIXED | CAPITAL
+  fixedQty       Int      @default(1)
+  capitalAmount  Float? // absolute rupee allocation per run (from account usable capital)
+  capitalMode    String   @default("INITIAL_PLUS_PNL")
+  entryTime      String // "09:20"
+  entryWindowMin Int      @default(10)
+  exitTime       String // "15:10"
+  repeatDays     String   @default("1,2,3,4,5")
+  stopLossPct    Float?
+  targetPct      Float?
+  trailingSlPct  Float?
+  accountId      String?
+  account        BrokerAccount? @relation(fields: [accountId], references: [id])
+  lastRunDate    String?
+  entryOrderId   String?
+  entryPrice     Float?
+  exitOrderId    String?
+  realizedPnl    Float    @default(0)
+  pythonCode     String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  logs StrategyLog[]
+}
+
+model StrategyLog {
+  id         String   @id @default(cuid())
+  strategyId String
+  strategy   Strategy @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+  ts         DateTime @default(now())
+  level      String   @default("INFO")
+  message    String
+
+  @@index([strategyId, ts])
+}
+
+// ---------- Sync + audit ----------
+model SyncLog {
+  id           String   @id @default(cuid())
+  source       String // SEED | DAILY_SYNC | MANUAL
+  exchange     String
+  symbolCount  Int
+  mappedCount  Int
+  status       String // SUCCESS | FAILED
+  message      String?
+  version      String?
+  createdAt    DateTime @default(now())
+}
+
+model OrderAudit {
+  id           String   @id
+  ts           DateTime @default(now())
+  source       String // MANUAL | STRATEGY | API | SQUAREOFF | KILLSWITCH
+  action       String // PLACE | CANCEL | MODIFY | SQUAREOFF_ALL | CANCEL_ALL
+  masterSymbol String
+  exchange     String
+  side         String
+  qty          Int
+  price        Float?
+  legsJson     String? // per-account fan-out results
+  status       String // SUCCESS | PARTIAL | FAILED
+  message      String?
+  account      BrokerAccount? @relation(fields: [accountId], references: [id])
+  accountId    String?
+}
+
+// ---------- Sessions / settings ----------
+model SystemSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
