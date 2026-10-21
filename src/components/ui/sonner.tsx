@@ -1,14 +1,15 @@
 "use client"
 
-import { useTheme } from "next-themes"
 import { Toaster as Sonner, ToasterProps } from "sonner"
 
+// NOTE: intentionally NOT using next-themes' useTheme() here — there is no
+// ThemeProvider mounted in the root layout (the app is forced dark via
+// <html className="dark">), and useTheme() without a provider is a known
+// source of React hydration mismatches. Theme is pinned to "dark".
 const Toaster = ({ ...props }: ToasterProps) => {
-  const { theme = "system" } = useTheme()
-
   return (
     <Sonner
-      theme={theme as ToasterProps["theme"]}
+      theme="dark"
       className="toaster group"
       style={
         {

@@ -26,3 +26,21 @@ Stage Summary:
 - Verified: PROFIT_ONLY acct = 0 usable after losses (skips legs), loss-reducing acct = initial − losses incl charges, initial+PnL acct compounds; exits always bypass capital checks
 - Default login: admin / admin123
 
+---
+Task ID: 2
+Agent: main (Z.ai)
+Task: Fix user-reported issues in preview tab — React hydration error + login with admin/admin123 failing.
+
+Work Log:
+- Diagnosed: backend auth fine (login 200 via :3000 and :81), admin user seeded; failure was client-side
+- Root causes found: (a) zustand persist rehydrated synchronously from localStorage before first client render → hydration mismatch when logged-in tab had divergent persisted workspaces; (b) sonner Toaster used next-themes useTheme() without a mounted ThemeProvider (hydration risk); (c) stale preview tab after dev-server restart → dead HMR chunks + hardening gaps (gateway HTML error pages returned unparseable responses to login fetch)
+- Fixed store.ts: persist skipHydration:true + manual useTerminal.persist.rehydrate() in Shell useEffect
+- Fixed sonner.tsx: pinned theme="dark" (no next-themes useTheme)
+- Fixed layout.tsx: suppressHydrationWarning on <body> (browser-extension attribute injection guard)
+- Hardened client-api.ts: fetchJson wrapper — cache:'no-store', readable gateway-502 errors, 1 auto-retry on transient 5xx/network errors
+- Hardened auth routes: login/me now force-dynamic + nodejs runtime, always-JSON error responses (503 fallback), cookie secure flag set protocol-aware (x-forwarded-proto) so HTTPS preview and HTTP localhost both work
+
+Stage Summary:
+- E2E verified: fresh login admin/admin123 OK (:3000 + :81), wrong password shows "Invalid credentials", divergent localStorage reload → ZERO hydration errors, logout→login cycle OK, console clean
+- All fixes are SSR-safe; persisted workspaces rehydrate post-mount (1-frame default flash, acceptable)
+

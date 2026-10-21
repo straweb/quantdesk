@@ -32,6 +32,11 @@ function Shell() {
   const view = useTerminal(s => s.view)
 
   useEffect(() => {
+    // rehydrate persisted workspaces AFTER first render — prevents the
+    // React hydration mismatch ("attributes of the server rendered HTML
+    // didn't match the client properties") caused by localStorage state
+    // diverging from server-rendered defaults.
+    void useTerminal.persist.rehydrate()
     api.me().then(r => setUser(r.user)).catch(() => setUser(null))
     ensureSocket()
     return onFeedStatus(setFeedUp)

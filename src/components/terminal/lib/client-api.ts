@@ -118,15 +118,40 @@ export interface CopyTradeCfg {
 
 async function j<T>(res: Response): Promise<T> {
   const data = await res.json().catch(() => ({}))
-  if (!res.ok) throw new Error((data as { error?: string }).error || `HTTP ${res.status}`)
+  if (!res.ok) {
+    const apiErr = (data as { error?: string }).error
+    // Gateway/proxy error pages return HTML (not JSON) — surface a readable message
+    if (!apiErr && res.status >= 502) throw new Error(`Server unreachable (HTTP ${res.status}) — try again in a few seconds`)
+    throw new Error(apiErr || `HTTP ${res.status}`)
+  }
   return data as T
+}
+
+async function fetchJson<T>(input: string, init?: RequestInit, retries = 1): Promise<T> {
+  let lastErr: unknown
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await j<T>(await fetch(input, { cache: 'no-store', ...init }))
+    } catch (e) {
+      lastErr = e
+      const msg = e instanceof Error ? e.message : ''
+      const transient = /Server unreachable|HTTP 5|Failed to fetch|NetworkError|Load failed/i.test(msg)
+      if (!transient || attempt === retries) break
+      await new Promise(r => setTimeout(r, 800))
+    }
+  }
+  throw lastErr
 }
 
 export const api = {
   login: (username: string, password: string) =>
-    fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) }).then(r => j<{ ok: boolean }>(r)),
+    fetchJson<{ ok: boolean }>('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    }, 1),
   logout: () => fetch('/api/auth/logout', { method: 'POST' }),
-  me: () => fetch('/api/auth/me').then(r => j<{ user: string | null; feed: string }>(r)),
+  me: () => fetchJson<{ user: string | null; feed: string }>('/api/auth/me'),
 
   accounts: () => fetch('/api/accounts').then(r => j<{ accounts: AccountRow[] }>(r)),
   createAccount: (body: Record<string, unknown>) =>

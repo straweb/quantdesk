@@ -98,6 +98,10 @@ export const useTerminal = create<TerminalState>()(
     {
       name: 'zterm-workspaces',
       partialize: s => ({ workspaces: s.workspaces, activeWs: s.activeWs, productType: s.productType, qtyMode: s.qtyMode }),
+      // Avoid SSR/CSR hydration mismatch: server renders defaults, client
+      // must not rehydrate synchronously before the first render.
+      // We call useTerminal.persist.rehydrate() inside a useEffect after mount.
+      skipHydration: true,
     },
   ),
 )
