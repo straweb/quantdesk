@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { Play, Pause, Trash2, FileCode2, Plus, Clock } from 'lucide-react'
+import { Play, Pause, Trash2, FileCode2, Plus, Clock, TerminalSquare } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
@@ -27,6 +27,7 @@ export function StrategyView() {
   const strategies = data?.strategies ?? []
   const [dlg, setDlg] = useState(false)
   const [pyId, setPyId] = useState<string | null>(null)
+  const [runner, setRunner] = useState(false)
 
   const patch = async (id: string, body: Record<string, unknown>) => {
     await api.patchStrategy(id, body).catch(e => toast.error(e.message))
@@ -47,14 +48,21 @@ export function StrategyView() {
             entries fan out to all enabled accounts with capital house sizing · every strategy exports as runnable Python.
           </p>
         </div>
-        <Dialog open={dlg} onOpenChange={setDlg}>
-          <DialogTrigger asChild><Button size="sm" className="text-xs"><Plus className="h-3.5 w-3.5 mr-1" />New Strategy</Button></DialogTrigger>
-          <DialogContent className="bg-popover max-w-lg">
-            <DialogHeader><DialogTitle>Create Strategy</DialogTitle></DialogHeader>
-            <StrategyForm onDone={() => { setDlg(false); qc.invalidateQueries({ queryKey: ['strategies'] }) }} />
-          </DialogContent>
-        </Dialog>
+        <div className="flex items-center gap-2">
+          <Button size="sm" variant="secondary" className="text-xs" onClick={() => setRunner(true)} title="Run python strategy code against the live websocket-fed tape">
+            <TerminalSquare className="h-3.5 w-3.5 mr-1" /> Run Python
+          </Button>
+          <Dialog open={dlg} onOpenChange={setDlg}>
+            <DialogTrigger asChild><Button size="sm" className="text-xs"><Plus className="h-3.5 w-3.5 mr-1" />New Strategy</Button></DialogTrigger>
+            <DialogContent className="bg-popover max-w-lg">
+              <DialogHeader><DialogTitle>Create Strategy</DialogTitle></DialogHeader>
+              <StrategyForm onDone={() => { setDlg(false); qc.invalidateQueries({ queryKey: ['strategies'] }) }} />
+            </DialogContent>
+          </Dialog>
+        </div>
       </div>
+
+      <PythonRunner open={runner} onOpenChange={setRunner} />
 
       <div className="space-y-2">
         {strategies.map(s => (
@@ -226,6 +234,104 @@ function L({ label, hint, children }: { label: string; hint?: string; children: 
       {children}
       {hint && <div className="text-[9px] text-muted-foreground/70">{hint}</div>}
     </div>
+  )
+}
+
+// ---------------- Python runner console ----------------
+// Runs python code in the BACKEND: the SDK pulls candles/quotes from the
+// websocket-fed engine (REST :3004) and signal() fires real master orders
+// (or dry-runs). Output streams back into this console.
+function PythonRunner({ open, onOpenChange }: { open: boolean; onOpenChange: (v: boolean) => void }) {
+  const { data: stratData } = useQuery({ queryKey: ['strategies'], queryFn: () => api.strategies(), enabled: open })
+  const [code, setCode] = useState('')
+  const [symbol, setSymbol] = useState('NIFTY')
+  const [tf, setTf] = useState('5m')
+  const [bars, setBars] = useState('200')
+  const [dryRun, setDryRun] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const [out, setOut] = useState<string[]>([])
+
+  const run = async (id?: string) => {
+    setBusy(true)
+    setOut(o => [...o, `$ python run — symbol=${symbol} tf=${tf} bars=${bars}${dryRun ? ' (dry)' : ' LIVE ORDERS'}`])
+    try {
+      const r = await api.runPython({ id, code: code || undefined, symbol, tf, bars: Number(bars) || 200, dryRun })
+      for (const l of r.logs) setOut(o => [...o, l])
+      setOut(o => [...o, `— done in ${r.ms}ms · ${r.signals.length} signal(s) · ${r.ordersPlaced} fills${r.error ? ` · ERROR: ${r.error}` : ''}`])
+    } catch (e) {
+      setOut(o => [...o, `runner error: ${e instanceof Error ? e.message : String(e)}`])
+    }
+    setBusy(false)
+  }
+
+  const runStrategy = async (id: string) => {
+    setBusy(true)
+    setOut(o => [...o, `$ python run — saved strategy ${id}`])
+    try {
+      const r = await api.runPython({ id, symbol, tf, bars: Number(bars) || 200, dryRun })
+      for (const l of r.logs) setOut(o => [...o, l])
+      setOut(o => [...o, `— done in ${r.ms}ms · ${r.signals.length} signal(s) · ${r.ordersPlaced} fills`])
+    } catch (e) {
+      setOut(o => [...o, `runner error: ${e instanceof Error ? e.message : String(e)}`])
+    }
+    setBusy(false)
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="bg-popover max-w-3xl">
+        <DialogHeader><DialogTitle>Run Python Strategy (backend)</DialogTitle></DialogHeader>
+        <div className="space-y-2">
+          <p className="text-[10px] text-muted-foreground leading-relaxed">
+            SDK injected: <code className="text-[#4dd0e1]">get_candles(symbol, tf, limit)</code> ·{' '}
+            <code className="text-[#4dd0e1]">get_quote(symbol)</code> ·{' '}
+            <code className="text-[#4dd0e1]">log(...)</code> ·{' '}
+            <code className="text-[#e0a63f]">signal(&quot;BUY&quot;|&quot;SELL&quot;, qty?, price?, msg?)</code> — data from the live
+            websocket-fed engine; signals fan out to all enabled accounts.
+          </p>
+          <div className="flex flex-wrap items-center gap-1.5 text-xs">
+            <Input value={symbol} onChange={e => setSymbol(e.target.value.toUpperCase())} className="h-7 w-24 text-[11px]" title="SYMBOL preloaded for the script" />
+            <select value={tf} onChange={e => setTf(e.target.value)} className="h-7 rounded bg-secondary/60 px-1 text-[11px]">
+              {['1m', '3m', '5m', '15m', '30m', '1h'].map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+            <Input value={bars} onChange={e => setBars(e.target.value.replace(/[^0-9]/g, ''))} className="h-7 w-16 text-[11px]" title="BARS preloaded" />
+            <label className="flex items-center gap-1 text-[11px] cursor-pointer" title="Dry run — log signals without placing orders">
+              <input type="checkbox" checked={dryRun} onChange={e => setDryRun(e.target.checked)} className="accent-[#3b82f6] h-3 w-3" />
+              dry run
+            </label>
+            <Button size="sm" className="h-7 text-[11px] ml-auto" disabled={busy} onClick={() => run()}>
+              <Play className="h-3 w-3 mr-1" /> Run code
+            </Button>
+          </div>
+          <textarea
+            value={code}
+            onChange={e => setCode(e.target.value)}
+            placeholder={'# python strategy — leave empty to run the built-in EMA-cross sample\nc = get_candles(SYMBOL, TF, BARS)\nif c[-1]["c"] > c[-2]["c"]:\n    signal("BUY", msg="momentum up")'}
+            rows={8}
+            className="w-full rounded bg-[#0b0e11] border border-border p-2 font-mono text-[11px] outline-none focus:ring-1 ring-primary/60"
+          />
+          {(stratData?.strategies ?? []).length > 0 && (
+            <div className="flex flex-wrap items-center gap-1 text-[10px]">
+              <span className="text-muted-foreground">run a saved strategy:</span>
+              {(stratData?.strategies ?? []).slice(0, 6).map(s => (
+                <button
+                  key={s.id}
+                  disabled={busy}
+                  onClick={() => runStrategy(s.id)}
+                  className="px-1.5 py-0.5 rounded bg-secondary/70 text-muted-foreground hover:text-foreground disabled:opacity-40"
+                  title="Execute this strategy's exported python on the live tape"
+                >
+                  {s.name}
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="rounded bg-[#0b0e11] border border-border p-2 font-mono text-[10px] max-h-56 overflow-y-auto min-h-16 whitespace-pre-wrap">
+            {out.length === 0 ? <span className="text-muted-foreground">$ output appears here…</span> : out.map((l, i) => <div key={i} className={l.startsWith('▸') ? 'text-[#e0a63f]' : l.startsWith('—') ? 'text-muted-foreground' : ''}>{l}</div>)}
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
   )
 }
 

@@ -103,9 +103,12 @@ export interface WorkspaceCfg {
   showBOLL?: boolean
   showRSI?: boolean
   showMACD?: boolean
-  // 1M ghost overlay (sample-tool #ghostCtl): 1m candles ghosted on >1m charts
+  showADX?: boolean
+  // ghost overlay (#ghostCtl): inner candles of `ghostTf` inside higher-tf
+  // shells — auto-calc math works BOTH ways (ghost lower OR higher than tf)
   showGhost?: boolean
   ghostStyle?: 'hollow' | 'fade'
+  ghostTf?: Timeframe // inner/shell timeframe, default 1m
   // axis scales: topmost enabled = right axis, others = left measurement
   // column; % / pts are relative to a draggable baseline
   scales?: { price: boolean; pct: boolean; inv: boolean; pts: boolean }
@@ -136,6 +139,15 @@ interface TerminalState {
   selectedSymbol: string
   // starred watchlist (Watch tab in the left panel)
   watchSymbols: string[]
+  // user-defined watchlist tabs (N tabs; each holds explicit symbols)
+  wlTabs: WlTabCfg[]
+  // chart levels per symbol — SL / target lines the user can DRAG on the
+  // chart (persisted); real resting orders are placed on drop when a
+  // position exists
+  chartLevels: Record<string, { sl?: number; target?: number }>
+  // strike currently loaded into a chart pane (highlight in the strikes
+  // panel + watchlist)
+  activeStrike: { strike: number; type: 'CE' | 'PE'; wsId: string } | null
   // order pad state (shared + synced from chart/panels)
   side: OrderSide
   orderType: OrderTypeKind
@@ -162,9 +174,24 @@ interface TerminalState {
   setBottomTab: (t: 'orders' | 'trades' | 'positions' | 'funds' | 'logs') => void
   setBottomCollapsed: (c: boolean) => void
   toggleWatch: (s: string) => void
+  // watchlist user tabs
+  addWlTab: (name?: string) => string
+  removeWlTab: (id: string) => void
+  renameWlTab: (id: string, name: string) => void
+  toggleWlTabSymbol: (id: string, s: string) => void
+  // draggable chart levels
+  setChartLevel: (symbol: string, kind: 'sl' | 'target', price: number | null) => void
+  setActiveStrike: (v: { strike: number; type: 'CE' | 'PE'; wsId: string } | null) => void
   /** Open (or re-activate) a per-symbol workspace; FNO ones get the
    *  spot+ATM layout and the strikes panel auto-bound to the symbol. */
   openSymbolWorkspace: (s: string, fno?: boolean) => void
+}
+
+// ---- user-defined watchlist tabs ----
+export interface WlTabCfg {
+  id: string
+  name: string
+  symbols: string[]
 }
 
 const mkWs = (id: string, name: string, symbol: string): WorkspaceCfg => ({
@@ -172,7 +199,7 @@ const mkWs = (id: string, name: string, symbol: string): WorkspaceCfg => ({
   allocMode: 'PCT', showOptionMinis: true, layout: 'spot-atm', panes: defaultPanes(), strikes: defaultStrikes(),
   depthPanels: defaultDepthPanels(symbol),
   // default live view = 5m shell + 1m ghost candles (scalping-tool #ghostCtl)
-  showGhost: true, ghostStyle: 'hollow', scales: { price: true, pct: false, inv: false, pts: false },
+  showGhost: true, ghostStyle: 'hollow', ghostTf: '1m', scales: { price: true, pct: false, inv: false, pts: false },
 })
 
 export const useTerminal = create<TerminalState>()(
@@ -183,6 +210,9 @@ export const useTerminal = create<TerminalState>()(
       activeWs: 'ws1',
       selectedSymbol: 'NIFTY',
       watchSymbols: ['NIFTY', 'SENSEX', 'BANKNIFTY'],
+      wlTabs: [],
+      chartLevels: {},
+      activeStrike: null,
       side: 'BUY',
       orderType: 'MARKET',
       productType: 'MIS',
@@ -226,6 +256,30 @@ export const useTerminal = create<TerminalState>()(
         const cur = get().watchSymbols
         set({ watchSymbols: cur.includes(s) ? cur.filter(x => x !== s) : [...cur, s] })
       },
+      addWlTab: name => {
+        const id = `wlt${Date.now().toString(36)}`
+        const n = get().wlTabs.length + 1
+        set({ wlTabs: [...get().wlTabs, { id, name: name || `List ${n}`, symbols: [] }] })
+        return id
+      },
+      removeWlTab: id => set({ wlTabs: get().wlTabs.filter(t => t.id !== id) }),
+      renameWlTab: (id, name) => set({ wlTabs: get().wlTabs.map(t => (t.id === id ? { ...t, name } : t)) }),
+      toggleWlTabSymbol: (id, s) =>
+        set({
+          wlTabs: get().wlTabs.map(t =>
+            t.id === id
+              ? { ...t, symbols: t.symbols.includes(s) ? t.symbols.filter(x => x !== s) : [...t.symbols, s] }
+              : t,
+          ),
+        }),
+      setChartLevel: (symbol, kind, price) => {
+        const cur = get().chartLevels
+        const next = { ...(cur[symbol] ?? {}) }
+        if (price == null || !Number.isFinite(price)) delete next[kind]
+        else next[kind] = price
+        set({ chartLevels: { ...cur, [symbol]: next } })
+      },
+      setActiveStrike: v => set({ activeStrike: v }),
       openSymbolWorkspace: (s, fno = false) => {
         const existing = get().workspaces.find(w => w.symbol === s)
         if (existing) {
@@ -241,15 +295,22 @@ export const useTerminal = create<TerminalState>()(
     }),
     {
       name: 'zterm-workspaces',
-      partialize: s => ({ workspaces: s.workspaces, activeWs: s.activeWs, productType: s.productType, qtyMode: s.qtyMode, watchSymbols: s.watchSymbols, bottomCollapsed: s.bottomCollapsed }),
-      version: 2,
+      partialize: s => ({ workspaces: s.workspaces, activeWs: s.activeWs, productType: s.productType, qtyMode: s.qtyMode, watchSymbols: s.watchSymbols, wlTabs: s.wlTabs, chartLevels: s.chartLevels, bottomCollapsed: s.bottomCollapsed }),
+      version: 3,
       // v2: default the ghost overlay ON for every workspace (5m shell + 1m
       // ghost is the house default live view) unless the user had it on.
+      // v3: ghostTf default 1m + wlTabs/chartLevels defaults.
       migrate: (state: unknown) => {
-        const st = state as { workspaces?: WorkspaceCfg[]; bottomCollapsed?: boolean }
+        const st = state as { workspaces?: WorkspaceCfg[]; bottomCollapsed?: boolean; wlTabs?: WlTabCfg[]; chartLevels?: Record<string, { sl?: number; target?: number }> }
         if (Array.isArray(st.workspaces)) {
-          st.workspaces = st.workspaces.map(w => ({ ...w, showGhost: w.showGhost ?? true }))
+          st.workspaces = st.workspaces.map(w => ({
+            ...w,
+            showGhost: w.showGhost ?? true,
+            ghostTf: w.ghostTf ?? '1m',
+          }))
         }
+        if (!Array.isArray(st.wlTabs)) st.wlTabs = []
+        if (typeof st.chartLevels !== 'object' || st.chartLevels === null) st.chartLevels = {}
         return st
       },
       // Avoid SSR/CSR hydration mismatch: server renders defaults, client

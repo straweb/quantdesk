@@ -241,6 +241,150 @@ function listTickSessions(): { file: string; bytes: number; mtime: string }[] {
   return out.sort((a, b) => (a.file < b.file ? 1 : -1)).slice(0, 40)
 }
 
+// ============================================================
+// PAPER-TRADING REPLAY ENGINE
+// Plays a RECORDED tick session (db/ticks/<day>/session-*.db)
+// back through the normal live pipeline: symbol states, candles
+// and socket streams are driven by the recorded ticks with their
+// timestamps SHIFTED so the replay start maps to "now". The
+// terminal, auto-rules and paper accounts see a normal session —
+// admin can start it at ANY time (random session or a specific
+// date-time range) and trade it as live paper trading.
+// ============================================================
+interface ReplayRow { ts: number; symbol: string; ltp: number; bid: number; ask: number; vol: number; high: number; low: number; open: number; prevClose: number }
+interface ReplayState {
+  rows: ReplayRow[]
+  idx: number
+  baseTs: number // first row ts (recording clock)
+  startWall: number // Date.now() at start (wall clock)
+  speed: number
+  file: string
+  total: number
+}
+const gReplay = g as unknown as { __replay?: ReplayState }
+const gRepTimers = g as unknown as { __replayTimer?: ReturnType<typeof setInterval> }
+const replayedSymbols = new Set<string>()
+
+function applyTickToSeries(symbol: string, price: number, volDelta: number, nowMs: number): void {
+  const bars = S.candles.get(`${symbol}|1m`)
+  if (!bars) return
+  const bs = bucketStart(nowMs, '1m')
+  let cur = bars[bars.length - 1]
+  if (!cur || cur.t !== bs) {
+    bars.push({ t: bs, o: price, h: price, l: price, c: price, v: Math.max(0, volDelta) })
+    if (bars.length > DAYS_BACK * 1440 + 500) bars.splice(0, 200)
+    for (const tf of Object.keys(TF_MS)) {
+      if (tf === '1m') continue
+      const sk = `${symbol}|${tf}`
+      const series = S.candles.get(sk)
+      if (!series) continue
+      const b2 = bucketStart(nowMs, tf)
+      const last2 = series[series.length - 1]
+      if (last2 && last2.t === b2) {
+        last2.h = Math.max(last2.h, price)
+        last2.l = Math.min(last2.l, price)
+        last2.c = price
+        last2.v += Math.max(0, volDelta)
+      } else {
+        series.push({ t: b2, o: price, h: price, l: price, c: price, v: Math.max(0, volDelta) })
+      }
+    }
+  } else {
+    cur.h = Math.max(cur.h, price)
+    cur.l = Math.min(cur.l, price)
+    cur.c = price
+    cur.v += Math.max(0, volDelta)
+  }
+}
+
+function applyReplayTick(row: ReplayRow, startWall: number, baseTs: number, speed: number): void {
+  let st = S.states.get(row.symbol)
+  if (!st) {
+    loadUniverse([{ symbol: row.symbol, basePrice: row.ltp || 100, lotSize: 1, instrumentType: 'INDEX' }])
+    st = S.states.get(row.symbol)
+    if (!st) return
+  }
+  replayedSymbols.add(row.symbol)
+  const prevLtp = st.ltp
+  st.ltp = r2(row.ltp)
+  if (row.prevClose) st.prevClose = r2(row.prevClose)
+  if (row.open) st.open = r2(row.open)
+  st.high = Math.max(st.high, r2(row.high || row.ltp))
+  st.low = Math.min(st.low === 0 ? r2(row.low || row.ltp) : st.low, r2(row.low || row.ltp))
+  st.bid = r2(row.bid || row.ltp * 0.9995)
+  st.ask = r2(row.ask || row.ltp * 1.0005)
+  st.lastTickDir = row.ltp >= prevLtp ? 1 : -1
+  // recorded day volume is cumulative — take the delta for the candle
+  const dv = Math.max(0, (row.vol || 0) - Math.max(0, (st as unknown as { _lastVol?: number })._lastVol ?? 0))
+  ;(st as unknown as { _lastVol?: number })._lastVol = row.vol || 0
+  st.vol = Math.max(st.vol, row.vol || st.vol)
+  // VIRTUAL clock: the recorded moment mapped onto the wall clock
+  const virtNow = startWall + (row.ts - baseTs) / speed
+  applyTickToSeries(row.symbol, st.ltp, dv, virtNow)
+}
+
+function replayStep(): void {
+  const r = gReplay.__replay
+  if (!r) return
+  const now = Date.now()
+  const targetTs = r.baseTs + (now - r.startWall) * r.speed
+  let budget = 4000 // cap per step so huge speeds cannot stall the loop
+  while (r.idx < r.rows.length && r.rows[r.idx].ts <= targetTs && budget-- > 0) {
+    applyReplayTick(r.rows[r.idx], r.startWall, r.baseTs, r.speed)
+    r.idx++
+  }
+  if (r.idx >= r.rows.length) {
+    console.log('[market-feed] replay finished —', r.total, 'ticks ·', r.file)
+    stopReplay()
+  }
+}
+
+function stopReplay(): void {
+  if (gRepTimers.__replayTimer) { clearInterval(gRepTimers.__replayTimer); gRepTimers.__replayTimer = undefined }
+  gReplay.__replay = undefined
+  replayedSymbols.clear()
+  for (const st of S.states.values()) delete (st as unknown as { _lastVol?: number })._lastVol
+}
+
+function replayStatus() {
+  const r = gReplay.__replay
+  if (!r) return { active: false, file: null as string | null, speed: 1, startedAt: null as string | null, total: 0, played: 0, symbols: [...replayedSymbols], progressPct: 0 }
+  return {
+    active: true,
+    file: r.file,
+    speed: r.speed,
+    startedAt: new Date(r.startWall).toISOString(),
+    total: r.total,
+    played: r.idx,
+    symbols: [...replayedSymbols],
+    progressPct: r.total ? Math.round((r.idx / r.total) * 100) : 0,
+  }
+}
+
+async function loadReplayRows(file: string | null, random: boolean, fromTs: number | null, toTs: number | null): Promise<{ rows: ReplayRow[]; file: string } | null> {
+  let target = file
+  if (!target || random) {
+    const sessions = listTickSessions()
+    if (sessions.length === 0) return null
+    target = random ? sessions[Math.floor(Math.random() * sessions.length)].file : sessions[0].file
+  }
+  const full = path.resolve(process.cwd(), '../..', target)
+  if (!full.includes('db/ticks') || target.includes('..')) return null
+  const DatabaseAny = Database as unknown as new (p: string, ro: boolean) => InstanceType<typeof Database>
+  const dbh = new DatabaseAny(full, true)
+  try {
+    const conds: string[] = []
+    const args: unknown[] = []
+    if (fromTs) { conds.push('ts >= ?'); args.push(fromTs) }
+    if (toTs) { conds.push('ts <= ?'); args.push(toTs) }
+    const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''
+    const rows = dbh.prepare(`SELECT ts, symbol, ltp, bid, ask, vol, high, low, open, prevClose FROM ticks ${where} ORDER BY ts ASC LIMIT 400000`).all(...(args as [unknown])) as ReplayRow[]
+    return { rows, file: target }
+  } finally {
+    dbh.close()
+  }
+}
+
 // ---------- sidecar supervisor: keep the Next.js dev server alive ----------
 // This service is boot-spawned and outlives agent tool sessions (whose spawned
 // processes get reaped at session boundaries), so it doubles as the dev-server
@@ -384,6 +528,7 @@ function aggregate(base: Candle[], tf: string): Candle[] {
 function tickOnce() {
   const now = Date.now()
   for (const st of S.states.values()) {
+    if (replayedSymbols.has(st.symbol)) continue // replay drives this symbol
     const shock = (Math.random() - 0.5) * 2 * st.vola
     const meanRev = (st.base - st.ltp) / st.base * 0.0006
     st.ltp = r2(st.ltp * (1 + shock + meanRev))
@@ -507,6 +652,39 @@ const httpServer = createServer((req, res) => {
       return json(200, { file, count: rows.length, ticks: rows })
     } catch (e) { return json(500, { error: String(e) }) }
   }
+
+  // ---- paper-trading replay (admin) ----
+  if (url.pathname === '/replay-config') {
+    if (req.method === 'POST') {
+      let body = ''
+      req.on('data', c => (body += c))
+      req.on('end', async () => {
+        try {
+          const b = JSON.parse(body) as { mode?: string; file?: string | null; random?: boolean; fromTs?: number | null; toTs?: number | null; speed?: number }
+          if (b.mode === 'stop') {
+            stopReplay()
+            return json(200, { ok: true, ...replayStatus() })
+          }
+          if (b.mode === 'start') {
+            const loaded = await loadReplayRows(b.file ?? null, !!b.random, b.fromTs ?? null, b.toTs ?? null)
+            if (!loaded || loaded.rows.length === 0) return json(400, { ok: false, error: 'no recorded tick session available (enable the tick recorder and let it capture some minutes first)' })
+            stopReplay()
+            const speed = Math.max(0.5, Math.min(20, b.speed ?? 1))
+            gReplay.__replay = { rows: loaded.rows, idx: 0, baseTs: loaded.rows[0].ts, startWall: Date.now(), speed, file: loaded.file, total: loaded.rows.length }
+            if (gRepTimers.__replayTimer) clearInterval(gRepTimers.__replayTimer)
+            gRepTimers.__replayTimer = setInterval(replayStep, 100)
+            console.log(`[market-feed] replay START ${loaded.file} · ${loaded.rows.length} ticks · speed ${speed}x${b.fromTs ? ` · from ${new Date(b.fromTs).toISOString()}` : ''}${b.toTs ? ` · to ${new Date(b.toTs).toISOString()}` : ''}`)
+            return json(200, { ok: true, ...replayStatus() })
+          }
+          json(400, { ok: false, error: 'mode must be start|stop' })
+        } catch (e) { json(400, { ok: false, error: String(e) }) }
+      })
+      return
+    }
+    return json(200, replayStatus())
+  }
+
+  if (url.pathname === '/replay-status') return json(200, replayStatus())
 
   // ---- active feed source (which account the terminal pulls data from) ----
   // Persisted to a shared JSON file so the Next.js API can read/write it too.
@@ -634,15 +812,18 @@ loadUniverse(DEFAULT_UNIVERSE)
 
 // ---- timers: bun --hot stacks intervals across reloads — deregister the
 // previous module's loops first (globalThis survives hot reloads) ----
-interface HotTimers { tick?: ReturnType<typeof setInterval>; stream?: ReturnType<typeof setInterval>; watch?: ReturnType<typeof setInterval>; tickRec?: ReturnType<typeof setInterval>; sync?: ReturnType<typeof setInterval> }
+interface HotTimers { tick?: ReturnType<typeof setInterval>; stream?: ReturnType<typeof setInterval>; watch?: ReturnType<typeof setInterval>; tickRec?: ReturnType<typeof setInterval>; sync?: ReturnType<typeof setInterval>; replay?: ReturnType<typeof setInterval> }
 const hot = g as unknown as { __feedTimers?: HotTimers }
 if (hot.__feedTimers) {
   if (hot.__feedTimers.tick) clearInterval(hot.__feedTimers.tick)
   if (hot.__feedTimers.stream) clearInterval(hot.__feedTimers.stream)
   if (hot.__feedTimers.watch) clearInterval(hot.__feedTimers.watch)
   if (hot.__feedTimers.tickRec) clearInterval(hot.__feedTimers.tickRec)
+  if (hot.__feedTimers.replay) clearInterval(hot.__feedTimers.replay)
 }
 hot.__feedTimers = {}
+// replay timer ownership (hot-reload safe): re-register if a replay is live
+if (gRepTimers.__replayTimer) { clearInterval(gRepTimers.__replayTimer); gRepTimers.__replayTimer = setInterval(replayStep, 100) }
 // the tick-recorder loop registers itself via gTimers.__tickRecTimer inside
 // openTickSession() — clear any stale one left by a previous module instance
 if (gTimers.__tickRecTimer) clearInterval(gTimers.__tickRecTimer)

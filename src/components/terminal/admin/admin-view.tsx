@@ -22,7 +22,110 @@ export function AdminView() {
         <MasterContracts />
       </div>
       <TickRecorder />
+      <ReplayManager />
       <AuditTrail />
+    </div>
+  )
+}
+
+// ---------------- Paper-trading replay ----------------
+// Start a RECORDED tick session as a live paper session — a random archive
+// or a specific date-time range, at 1x-20x. While the replay runs, the feed
+// service drives NIFTY/SENSEX (and any other recorded symbols) from the
+// recorded ticks, so the terminal + paper accounts trade a "live" market.
+function ReplayManager() {
+  const qc = useQueryClient()
+  const { data: rec } = useQuery({ queryKey: ['tick-recorder'], queryFn: () => api.tickRecorder(), refetchInterval: 10_000 })
+  const { data: st } = useQuery({ queryKey: ['replay-status'], queryFn: () => api.replayStatus(), refetchInterval: 1500 })
+  const [file, setFile] = useState<string>('')
+  const [random, setRandom] = useState(true)
+  const [speed, setSpeed] = useState(1)
+  const [from, setFrom] = useState('')
+  const [to, setTo] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const sessions = rec?.sessions ?? []
+  const active = st?.active
+
+  const control = async (mode: 'start' | 'stop') => {
+    setBusy(true)
+    try {
+      const fromTs = from ? new Date(from).getTime() : null
+      const toTs = to ? new Date(to).getTime() : null
+      const r = await api.replayControl({ mode, file: file || null, random: random && !file, fromTs, toTs, speed })
+      if ((r as { ok?: boolean }).ok === false && 'error' in r) throw new Error((r as { error?: string }).error)
+      toast.success(mode === 'start' ? `Replay started — ${r.file} (${r.total} ticks @ ${r.speed}x)` : 'Replay stopped')
+      await qc.invalidateQueries({ queryKey: ['replay-status'] })
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Replay control failed')
+    }
+    setBusy(false)
+  }
+
+  return (
+    <div className="rounded-lg border bg-card p-4 space-y-3">
+      <div className="flex items-center gap-2">
+        <Radio className={`h-4 w-4 ${active ? 'text-[#00c896]' : 'text-muted-foreground'}`} />
+        <div className="font-bold text-sm">Paper Trading Replay</div>
+        {active && (
+          <span className="text-[9px] px-1.5 py-0.5 rounded bg-up text-[#00c896] font-bold animate-pulse">PLAYING {st?.speed}x</span>
+        )}
+        <div className="flex-1" />
+        {active && (
+          <span className="text-[10px] text-muted-foreground tabular">
+            {st?.played}/{st?.total} ticks · {st?.progressPct}% · {(st?.symbols ?? []).join(', ')}
+          </span>
+        )}
+      </div>
+      <p className="text-[11px] text-muted-foreground leading-relaxed">
+        Load a recorded tick session and play it as a live session — paper accounts trade the replayed market.
+        Pick a specific archive or let the system choose a random one, optionally bounded by a date-time range.
+      </p>
+      <div className="grid md:grid-cols-2 gap-3">
+        <div className="space-y-2">
+          <label className="flex items-center gap-2 text-xs cursor-pointer">
+            <input type="checkbox" checked={random && !file} onChange={e => { setRandom(e.target.checked); if (e.target.checked) setFile('') }} className="accent-[#3b82f6] h-3 w-3" />
+            Random recorded session
+          </label>
+          <Select value={file || 'none'} onValueChange={v => { setFile(v === 'none' ? '' : v); setRandom(v === 'none') }}>
+            <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="Pick a recorded session…" /></SelectTrigger>
+            <SelectContent className="text-xs max-h-56">
+              <SelectItem value="none">— pick a session —</SelectItem>
+              {sessions.map(s => (
+                <SelectItem key={s.file} value={s.file}>{s.file} · {(s.bytes / 1024).toFixed(0)} KB</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <div className="flex items-center gap-2 text-xs">
+            <span className="text-muted-foreground shrink-0">Speed</span>
+            <Select value={String(speed)} onValueChange={v => setSpeed(Number(v))}>
+              <SelectTrigger className="h-8 w-24 text-xs"><SelectValue /></SelectTrigger>
+              <SelectContent className="text-xs">
+                {[0.5, 1, 2, 5, 10, 20].map(s => <SelectItem key={s} value={String(s)}>{s}x</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+        <div className="space-y-2">
+          <div className="text-[10px] text-muted-foreground uppercase tracking-wide">optional date-time range (IST)</div>
+          <div className="flex items-center gap-1.5">
+            <Input type="datetime-local" value={from} onChange={e => setFrom(e.target.value)} className="h-8 text-xs" />
+            <span className="text-muted-foreground">–</span>
+            <Input type="datetime-local" value={to} onChange={e => setTo(e.target.value)} className="h-8 text-xs" />
+          </div>
+          <div className="flex gap-2">
+            <Button size="sm" className="h-8 text-xs flex-1" disabled={busy || !!active} onClick={() => control('start')}>
+              Start replay
+            </Button>
+            <Button size="sm" variant="secondary" className="h-8 text-xs" disabled={busy || !active} onClick={() => control('stop')}>
+              Stop
+            </Button>
+          </div>
+        </div>
+      </div>
+      {active && st?.file && (
+        <div className="text-[10px] text-muted-foreground">playing <b>{st.file}</b> since {st.startedAt ? fmtDateTime(st.startedAt) : '—'}</div>
+      )}
     </div>
   )
 }

@@ -7,8 +7,8 @@ import { Bot, Clock3, Gauge, Layers, Trash2, Webhook } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
-import { api, fmtTime } from '../lib/client-api'
-import type { WorkspaceCfg } from '../lib/store'
+import { api, fmtTime, sideStrikeFor } from '../lib/client-api'
+import { useTerminal, type WorkspaceCfg, type StrikeRowCfg } from '../lib/store'
 
 // ============================================================
 // Auto bot (right dock "Auto" tab) — rule builder v3.
@@ -70,6 +70,40 @@ export function AutoPanel({ ws }: { ws: WorkspaceCfg }) {
 
   const effUnderlying = underlying || defaultUnderlying
   const wsRows = (ws.strikes?.rows ?? []).filter(r => r.type === optType)
+
+  // chain meta for the ITM/OTM quick-add (side-specific strikes)
+  const { data: chainData } = useQuery({
+    queryKey: ['autoChain', effUnderlying, ws.strikes?.expiry],
+    queryFn: () => api.optionChain(effUnderlying!, ws.strikes?.expiry ?? null, []),
+    enabled: !!effUnderlying,
+    refetchInterval: 10_000,
+  })
+  const autoMeta = chainData?.meta ?? null
+
+  /** offset (in side-ATM steps) semantics — the service adds offset*step to
+   *  the SIDE ATM (CE floor / PE ceil): CE ITM = negative, PE ITM = positive. */
+  const labelForOffset = (o: number) =>
+    o === 0 ? 'ATM' : optType === 'CE' ? (o < 0 ? `ITM ${-o}` : `OTM ${o}`) : (o > 0 ? `ITM ${o}` : `OTM ${-o}`)
+  const btnLabel = (o: number) => {
+    if (o === 0) return 'ATM'
+    const itm = optType === 'CE' ? o < 0 : o > 0
+    return `${itm ? 'I' : 'O'}${Math.abs(o)}`
+  }
+
+  /** Add a strike for THIS arm's side to the workspace strikes list. */
+  const patchWsSt = useTerminal(s => s.patchWs)
+  const addArmStrike = async (strike: number) => {
+    const id = `${strike}:${optType}`
+    const cur = useTerminal.getState().workspaces.find(w => w.id === ws.id)?.strikes ?? ws.strikes
+    if (!cur) return
+    if (cur.rows.some(r => r.id === id)) { setPicked(p => ({ ...p, [id]: p[id] ?? allocPct })); return }
+    try { await api.ensureStrike(effUnderlying || ws.strikes?.underlying || '', strike, ws.strikes?.expiry ?? null) } catch { /* contracts may exist */ }
+    const cur2 = useTerminal.getState().workspaces.find(w => w.id === ws.id)?.strikes ?? cur
+    const next: StrikeRowCfg = { id, strike, type: optType, enabled: true, allocPct: 0 }
+    const rows = [...cur2.rows, next]
+    patchWsSt(ws.id, { strikes: { ...cur2, rows } })
+    setPicked(p => ({ ...p, [id]: p[id] ?? allocPct }))
+  }
 
   const togglePicked = (id: string, strike: number, on: boolean) => {
     setPicked(p => {
@@ -224,32 +258,63 @@ export function AutoPanel({ ws }: { ws: WorkspaceCfg }) {
           </button>
         </div>
 
-        {/* strikes: ATM ±5 buttons or picked set */}
+        {/* strikes: ATM/ITM/OTM buttons or picked set (single-arm strike list) */}
         <div className="flex items-center gap-1">
           <button onClick={() => setPickStrikes(false)} className={btn(!pickStrikes)}>ATM</button>
           <button
             onClick={() => setPickStrikes(true)}
             className={btn(pickStrikes)}
-            title="Pick specific strikes from the workspace strike list (or a set of strikes)"
+            title="Pick specific strikes from the workspace strike list (or build the arm's list below)"
           >Strikes</button>
           {!pickStrikes ? (
-            <div className="flex items-center gap-0.5">
+            <div className="flex items-center gap-0.5 flex-wrap">
               {[-5, -4, -3, -2, -1].map(o => (
-                <button key={o} onClick={() => setOffset(o)} className={`h-4.5 w-5 text-[9px] tabular rounded ${offset === o ? 'bg-primary text-primary-foreground' : 'bg-secondary/60 text-muted-foreground hover:text-foreground'}`}>{o}</button>
+                <button key={o} onClick={() => setOffset(o)} title={labelForOffset(o)} className={`h-4.5 w-5 text-[9px] tabular rounded ${offset === o ? 'bg-primary text-primary-foreground' : 'bg-secondary/60 text-muted-foreground hover:text-foreground'}`}>{btnLabel(o)}</button>
               ))}
-              <button onClick={() => setOffset(0)} className={`px-1 h-4.5 text-[9px] font-bold rounded ${offset === 0 ? 'bg-primary text-primary-foreground' : 'bg-secondary/60 text-muted-foreground hover:text-foreground'}`}>ATM</button>
+              <button onClick={() => setOffset(0)} title="ATM" className={`px-1 h-4.5 text-[9px] font-bold rounded ${offset === 0 ? 'bg-primary text-primary-foreground' : 'bg-secondary/60 text-muted-foreground hover:text-foreground'}`}>ATM</button>
               {[1, 2, 3, 4, 5].map(o => (
-                <button key={o} onClick={() => setOffset(o)} className={`h-4.5 w-5 text-[9px] tabular rounded ${offset === o ? 'bg-primary text-primary-foreground' : 'bg-secondary/60 text-muted-foreground hover:text-foreground'}`}>+{o}</button>
+                <button key={o} onClick={() => setOffset(o)} title={labelForOffset(o)} className={`h-4.5 w-5 text-[9px] tabular rounded ${offset === o ? 'bg-primary text-primary-foreground' : 'bg-secondary/60 text-muted-foreground hover:text-foreground'}`}>{btnLabel(o)}</button>
               ))}
             </div>
           ) : (
             <span className="text-[8px] text-muted-foreground">{Object.keys(picked).length} picked from {optType} rows</span>
           )}
         </div>
+        {!pickStrikes && autoMeta && (
+          <div className="text-[8px] text-muted-foreground">{labelForOffset(offset)} → {optType} @ {(autoMeta.step) * 0 + (optType === 'CE' ? autoMeta.ceAtm + offset * autoMeta.step : autoMeta.peAtm + offset * autoMeta.step)}</div>
+        )}
 
         {pickStrikes && (
-          <div className="rounded bg-secondary/30 p-1 space-y-0.5 max-h-28 overflow-y-auto">
-            {wsRows.length === 0 && <div className="text-[9px] text-muted-foreground px-1">No {optType} strikes in the Strikes panel — add some first.</div>}
+          <div className="rounded bg-secondary/30 p-1 space-y-0.5 max-h-36 overflow-y-auto">
+            {/* ITM/ATM/OTM quick-add for THIS arm's side only */}
+            {autoMeta && (
+              <div className="flex items-center gap-0.5 pb-1 border-b border-border/40">
+                <span className="text-[8px] font-bold text-[#4dd0e1] shrink-0">ITM</span>
+                {[3, 2, 1].map(n => {
+                  const s = sideStrikeFor({ ce: autoMeta.ceAtm, pe: autoMeta.peAtm }, autoMeta.step, -1, n, optType)
+                  const on = wsRows.some(r => r.strike === s)
+                  return (
+                    <button key={n} onClick={() => addArmStrike(s)} title={`add ${optType} ${s} to this arm's list`}
+                      className={`flex-1 h-4 text-[9px] tabular rounded ${on ? 'bg-primary/25 text-foreground' : 'bg-secondary/70 text-muted-foreground hover:text-foreground'}`}
+                    >{n}</button>
+                  )
+                })}
+                <button onClick={() => addArmStrike(optType === 'CE' ? autoMeta.ceAtm : autoMeta.peAtm)} title={`add ATM ${optType}`}
+                  className="flex-1 h-4 text-[9px] font-bold rounded bg-primary/25 text-foreground"
+                >ATM</button>
+                <span className="text-[8px] font-bold text-[#e0a63f] shrink-0">OTM</span>
+                {[1, 2, 3].map(n => {
+                  const s = sideStrikeFor({ ce: autoMeta.ceAtm, pe: autoMeta.peAtm }, autoMeta.step, 1, n, optType)
+                  const on = wsRows.some(r => r.strike === s)
+                  return (
+                    <button key={n} onClick={() => addArmStrike(s)} title={`add ${optType} ${s} to this arm's list`}
+                      className={`flex-1 h-4 text-[9px] tabular rounded ${on ? 'bg-primary/25 text-foreground' : 'bg-secondary/70 text-muted-foreground hover:text-foreground'}`}
+                    >{n}</button>
+                  )
+                })}
+              </div>
+            )}
+            {wsRows.length === 0 && <div className="text-[9px] text-muted-foreground px-1">No {optType} strikes yet — use the ITM/ATM/OTM buttons above to build this arm's list.</div>}
             {wsRows.map(r => (
               <label key={r.id} className="flex items-center gap-1.5 px-1 py-0.5 text-[10px] cursor-pointer hover:bg-secondary/50 rounded">
                 <input

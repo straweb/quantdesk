@@ -45,3 +45,24 @@ export function normalizeStatus(raw: string | undefined | null): string {
   if (/PART|PENDING|OPEN|PLACED|NEW|TRIGGER/.test(s)) return 'OPEN'
   return s || 'OPEN'
 }
+
+// ------------------------------------------------------------
+// Auth-error detection + fresh-token retry (aligned with the
+// straweb/hedging websocket_proxy pattern: is_auth_error →
+// get_fresh_auth_token → retry the original call once).
+// ------------------------------------------------------------
+export function isAuthError(status: number, body: unknown): boolean {
+  if (status === 401 || status === 403) return true
+  const msg = typeof body === 'string' ? body : JSON.stringify(body ?? {})
+  return /session\s*(expired|invalid|token)|invalid\s*(token|session)|auth.*fail|please.*login|jKey|token.*expire/i.test(msg)
+}
+
+/** Retry `fn` once with fresh credentials when the first attempt fails on auth. */
+export async function withAuthRetry<T>(
+  fn: (fresh: boolean) => Promise<T>,
+  detect: (r: T) => boolean,
+): Promise<T> {
+  const first = await fn(false)
+  if (!detect(first)) return first
+  return fn(true) // second attempt — caller re-reads the session token inside
+}

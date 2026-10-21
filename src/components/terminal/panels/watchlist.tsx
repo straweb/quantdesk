@@ -5,7 +5,9 @@ import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { ChevronDown, ChevronRight, GripHorizontal, Layers, Plus, Search, Star, X } from 'lucide-react'
 import { Input } from '@/components/ui/input'
-import { api, fmtMoney, type SymbolRow } from '../lib/client-api'
+import { api, fmtMoney, sideOffsetLabel } from '../lib/client-api'
+import type { SymbolRow } from '../lib/client-api'
+import type { FnoUniverseResp, FnoUnderlyingRow } from '../lib/client-api'
 import type { IndexComponentRow, IndexComponentsResp } from '../lib/client-api'
 import { useTerminal, defaultDepthPanels, addDepthPanelTo, type DepthPanelCfg, type WorkspaceCfg } from '../lib/store'
 import { onTicks, subscribeTicks, unsubscribeTicks } from '../lib/socket'
@@ -13,36 +15,45 @@ import { useSyncData } from '../lib/sync'
 import type { Tick } from '@/lib/types'
 
 // ============================================================
-// Left panel — watchlist of tabs:
-//  · Watch — the user's starred symbols (persisted)
-//  · Index — all indices; the arrow expands the constituent stocks
-//    with H / LTP / L / Vol / chg% / contribution pts to the index
-//  · Eq / Fut / Opt — filtered master-contract lists
-// Clicking any row opens (or re-activates) that symbol's workspace —
-// F&O underlyings load the spot + ATM CE/PE layout with the strikes
-// panel pre-bound. The market-depth stack below renders quantity in
-// LOTS whenever the instrument has a lot size, else raw shares.
+// Left panel — watchlist with N tabs:
+//  · Watch  — starred symbols (persisted)
+//  · Index  — all indices; rows expand into constituent stocks
+//             (H / LTP / L / Vol / chg% / contribution pts);
+//             a COMMODITIES section lists MCX underlyings
+//  · FNO    — latest-expiry option/futures underlyings from ALL
+//             exchanges: NFO, BFO, BFNO, MCX, CDS — indices,
+//             stocks, commodities, currency
+//  · user tabs — any number of custom symbol lists (+ to add,
+//             double-click to rename, × to delete; the star adds
+//             the row to the ACTIVE user tab)
+// Sorting (symbol / LTP / chg) on every tab; rows show LTP, the
+// change pts + %, and day H/L. Clicking any row opens (or re-
+// activates) that symbol's workspace — F&O underlyings load the
+// spot + ATM CE/PE layout with the strikes panel pre-bound.
 // ============================================================
 
-type WlTab = 'watch' | 'index' | 'eq' | 'fut' | 'opt'
+type BuiltinTab = 'watch' | 'index' | 'fno'
+type TabKey = BuiltinTab | `user:${string}`
 
-const TABS: [WlTab, string][] = [
-  ['watch', 'Watch'],
-  ['index', 'Index'],
-  ['eq', 'Eq'],
-  ['fut', 'Fut'],
-  ['opt', 'Opt'],
-]
+type SortKey = 'sym' | 'ltp' | 'chg'
 
 export function Watchlist() {
   const [q, setQ] = useState('')
-  const [tab, setTab] = useState<WlTab>('watch')
+  const [tab, setTab] = useState<TabKey>('watch')
   const [ticks, setTicks] = useState<Record<string, Tick>>({})
   const [expandedIdx, setExpandedIdx] = useState<string | null>(null)
+  const [sortBy, setSortBy] = useState<SortKey>('sym')
+  const [sortAsc, setSortAsc] = useState(true)
+  const [renaming, setRenaming] = useState<string | null>(null)
   const selectedSymbol = useTerminal(s => s.selectedSymbol)
   const watchSymbols = useTerminal(s => s.watchSymbols)
   const toggleWatch = useTerminal(s => s.toggleWatch)
   const openSymbolWorkspace = useTerminal(s => s.openSymbolWorkspace)
+  const wlTabs = useTerminal(s => s.wlTabs)
+  const addWlTab = useTerminal(s => s.addWlTab)
+  const removeWlTab = useTerminal(s => s.removeWlTab)
+  const renameWlTab = useTerminal(s => s.renameWlTab)
+  const toggleWlTabSymbol = useTerminal(s => s.toggleWlTabSymbol)
 
   const { data: undData } = useQuery({
     queryKey: ['optionUnderlyings'],
@@ -52,15 +63,28 @@ export function Watchlist() {
   const fnoSet = useMemo(() => new Set((undData?.underlyings ?? []).map(u => u.underlying)), [undData])
   const indexMeta = useMemo(() => new Map((undData?.underlyings ?? []).map(u => [u.underlying, u])), [undData])
 
-  const typeFilter = tab === 'eq' ? 'EQ' : tab === 'fut' ? 'FUT' : tab === 'opt' ? 'OPT' : ''
+  // ---- FNO universe (all exchanges) ----
+  const { data: fnoData } = useQuery({
+    queryKey: ['fnoUniverse'],
+    queryFn: () => api.fnoUniverse(),
+    refetchInterval: 10_000,
+    enabled: tab === 'fno' || tab === 'index',
+  })
+  const fnoGroups = fnoData?.groups ?? []
+
+  const isUserTab = tab.startsWith('user:')
+  const userTabId = isUserTab ? tab.slice(5) : null
+  const userTab = wlTabs.find(t => t.id === userTabId) ?? null
+
+  const typeFilter = ''
   const { data } = useQuery({
     queryKey: ['symbols', q, typeFilter],
     queryFn: () => api.symbols(q, typeFilter),
     refetchInterval: 60_000,
-    enabled: tab !== 'watch' && tab !== 'index',
+    enabled: !isUserTab && tab !== 'watch' && tab !== 'index' && tab !== 'fno',
   })
 
-  // rows for Eq/Fut/Opt tabs
+  // rows for the generic master-list search (fallback tab)
   const symbols = useMemo(() => {
     const list = data?.symbols ?? []
     const rank = (r: SymbolRow) => (r.instrumentType === 'INDEX' ? 0 : r.instrumentType === 'EQ' ? 1 : r.instrumentType === 'FUT' ? 2 : 3)
@@ -85,7 +109,7 @@ export function Watchlist() {
     return out
   }, [watchData, watchSymbols, fnoSet, indexMeta])
 
-  // Index tab rows — all indices
+  // Index tab rows — all indices (+ commodities section from the FNO universe)
   const { data: idxData } = useQuery({
     queryKey: ['symbols-index'],
     queryFn: () => api.symbols('', 'INDEX'),
@@ -93,13 +117,85 @@ export function Watchlist() {
     enabled: tab === 'index',
   })
   const indexRows = useMemo(() => (idxData?.symbols ?? []).slice(0, 20), [idxData])
+  const commRows = useMemo(() => {
+    const out: FnoUnderlyingRow[] = []
+    for (const g of fnoGroups) {
+      if (g.exchange === 'MCX') for (const u of g.underlyings) if (u.segment === 'COMM') out.push(u)
+    }
+    return out
+  }, [fnoGroups])
 
-  const listed = tab === 'watch' ? watchRows : tab === 'index' ? indexRows : symbols
-  // search box also filters the Watch / Index tabs (Eq/Fut/Opt filter server-side)
-  const visible = q && (tab === 'watch' || tab === 'index')
-    ? listed.filter(s => s.symbol.includes(q) || (s.name ?? '').toUpperCase().includes(q))
-    : listed
-  const visibleKey = visible.map(s => s.symbol).join(',')
+  // user tab rows
+  const { data: userData } = useQuery({
+    queryKey: ['symbols-usertab', userTab?.symbols.join(',')],
+    queryFn: () => api.symbolsByList(userTab?.symbols ?? []),
+    refetchInterval: 60_000,
+    enabled: isUserTab && (userTab?.symbols.length ?? 0) > 0,
+  })
+  const userRows = useMemo(() => {
+    const map = new Map((userData?.symbols ?? []).map(s => [s.symbol, s]))
+    const out: SymbolRow[] = []
+    for (const sym of userTab?.symbols ?? []) {
+      const row = map.get(sym)
+      if (row) out.push(row)
+      else out.push({ id: `adhoc-${sym}`, symbol: sym, name: sym, exchange: '—', instrumentType: fnoSet.has(sym) ? 'INDEX' : 'EQ', lotSize: indexMeta.get(sym)?.lotSize ?? 1, mappings: [] })
+    }
+    return out
+  }, [userData, userTab, fnoSet, indexMeta])
+
+  // ---- generic row model + sort (LTP/chg come from live ticks) ----
+  interface Row {
+    key: string
+    symbol: string
+    name: string
+    exchange: string
+    instrumentType: string
+    lotSize: number
+    ltp: number
+    chg: number
+    chgPct: number
+    high: number
+    low: number
+    fno: boolean
+    exp?: string | null
+    contracts?: number
+    row?: SymbolRow
+  }
+  const tickOf = (sym: string, fb?: number): { ltp: number; chg: number; chgPct: number; high: number; low: number } => {
+    const t = ticks[sym]
+    if (t && t.prevClose) {
+      return { ltp: t.ltp, chg: t.ltp - t.prevClose, chgPct: ((t.ltp - t.prevClose) / t.prevClose) * 100, high: t.high, low: t.low }
+    }
+    return { ltp: fb ?? 0, chg: 0, chgPct: 0, high: 0, low: 0 }
+  }
+  const mkRow = (r: SymbolRow): Row => {
+    const t = tickOf(r.symbol, r.basePrice ?? 0)
+    return { key: r.id, symbol: r.symbol, name: r.name, exchange: r.exchange, instrumentType: r.instrumentType, lotSize: r.lotSize, ...t, fno: fnoSet.has(r.symbol), row: r }
+  }
+  const mkFnoRow = (u: FnoUnderlyingRow): Row => {
+    const t = tickOf(u.underlying, u.spot)
+    return { key: `fno-${u.exchange}-${u.underlying}`, symbol: u.underlying, name: u.name, exchange: u.exchange, instrumentType: u.instrumentType, lotSize: u.lotSize, ltp: u.spot || t.ltp, chg: t.chg, chgPct: t.chgPct || u.chgPct, high: t.high, low: t.low, fno: u.contracts > 0, exp: u.latestExpiry, contracts: u.contracts }
+  }
+
+  const baseRows: Row[] = useMemo(() => {
+    if (tab === 'watch') return watchRows.map(mkRow)
+    if (tab === 'index') return indexRows.map(mkRow)
+    if (isUserTab) return userRows.map(mkRow)
+    if (tab === 'fno') return fnoGroups.flatMap(g => g.underlyings.map(mkFnoRow))
+    return symbols.map(mkRow)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, watchRows, indexRows, userRows, fnoGroups, symbols, ticks])
+
+  const visible = useMemo(() => {
+    let list = baseRows
+    if (q && (tab === 'watch' || tab === 'index' || isUserTab || tab === 'fno')) {
+      list = list.filter(r => r.symbol.includes(q) || (r.name ?? '').toUpperCase().includes(q))
+    }
+    const val = (r: Row) => (sortBy === 'sym' ? 0 : sortBy === 'ltp' ? r.ltp : r.chgPct)
+    return [...list].sort((a, b) => sortBy === 'sym' ? (sortAsc ? a.symbol.localeCompare(b.symbol) : b.symbol.localeCompare(a.symbol)) : (sortAsc ? val(a) - val(b) : val(b) - val(a)))
+  }, [baseRows, q, tab, isUserTab, sortBy, sortAsc])
+
+  const visibleKey = visible.map(r => r.symbol).join(',')
   useEffect(() => {
     const list = visibleKey ? visibleKey.split(',') : []
     subscribeTicks(list)
@@ -109,6 +205,29 @@ export function Watchlist() {
   useEffect(() => onTicks(setTicks), [])
 
   const openWs = (symbol: string) => openSymbolWorkspace(symbol, fnoSet.has(symbol))
+
+  /** star = add/remove in the ACTIVE user tab; on builtin tabs = the Watch list */
+  const starFor = (symbol: string): { on: boolean; fn: () => void; title: string } => {
+    if (isUserTab && userTab) {
+      const on = userTab.symbols.includes(symbol)
+      return { on, fn: () => toggleWlTabSymbol(userTab.id, symbol), title: on ? `Remove from ${userTab.name}` : `Add to ${userTab.name}` }
+    }
+    const on = watchSymbols.includes(symbol)
+    return { on, fn: () => toggleWatch(symbol), title: on ? 'Remove from Watch tab' : 'Star → Watch tab' }
+  }
+
+  const sortCtl = (
+    <div className="flex items-center gap-1 px-2 pb-1">
+      <select value={sortBy} onChange={e => setSortBy(e.target.value as SortKey)} className="h-4.5 rounded bg-secondary/60 px-0.5 text-[8px] outline-none" title="Sort rows">
+        <option value="sym">symbol</option>
+        <option value="ltp">LTP</option>
+        <option value="chg">chg%</option>
+      </select>
+      <button onClick={() => setSortAsc(a => !a)} className="px-1 rounded bg-secondary/60 hover:text-foreground text-[8px]" title={sortAsc ? 'Ascending' : 'Descending'}>{sortAsc ? '↑' : '↓'}</button>
+      <div className="flex-1" />
+      <span className="text-[8px] text-muted-foreground">LTP · chg · H/L</span>
+    </div>
+  )
 
   return (
     <div className="flex h-full flex-col">
@@ -122,54 +241,132 @@ export function Watchlist() {
             className="h-8 pl-7 text-xs bg-secondary/60"
           />
         </div>
-        <div className="flex gap-0.5">
-          {TABS.map(([v, l]) => (
-            <button
-              key={v}
-              onClick={() => setTab(v)}
-              className={`flex-1 px-1 py-0.5 text-[10px] rounded ${tab === v ? 'bg-primary text-primary-foreground' : 'bg-secondary text-muted-foreground hover:text-foreground'}`}
-            >
-              {l}
-            </button>
+        <div className="flex gap-0.5 flex-wrap items-center">
+          <button
+            onClick={() => setTab('watch')}
+            className={`px-1.5 py-0.5 text-[10px] rounded ${tab === 'watch' ? 'bg-primary text-primary-foreground' : 'bg-secondary text-muted-foreground hover:text-foreground'}`}
+          >Watch</button>
+          <button
+            onClick={() => setTab('index')}
+            className={`px-1.5 py-0.5 text-[10px] rounded ${tab === 'index' ? 'bg-primary text-primary-foreground' : 'bg-secondary text-muted-foreground hover:text-foreground'}`}
+          >Index</button>
+          <button
+            onClick={() => setTab('fno')}
+            title="Latest-expiry F&O from NFO / BFO / BFNO / MCX / CDS"
+            className={`px-1.5 py-0.5 text-[10px] rounded ${tab === 'fno' ? 'bg-primary text-primary-foreground' : 'bg-secondary text-muted-foreground hover:text-foreground'}`}
+          >FNO</button>
+          {wlTabs.map(t => (
+            <span key={t.id} className={`flex items-center gap-0.5 px-1 py-0.5 rounded text-[10px] group ${tab === `user:${t.id}` ? 'bg-primary text-primary-foreground' : 'bg-secondary text-muted-foreground hover:text-foreground'}`}>
+              {renaming === t.id ? (
+                <input
+                  autoFocus
+                  defaultValue={t.name}
+                  onBlur={e => { renameWlTab(t.id, e.target.value.trim() || t.name); setRenaming(null) }}
+                  onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+                  className="w-12 bg-transparent outline-none text-[10px]"
+                />
+              ) : (
+                <button
+                  onClick={() => setTab(`user:${t.id}`)}
+                  onDoubleClick={() => setRenaming(t.id)}
+                  title={`${t.name} — ${t.symbols.length} symbols (double-click to rename)`}
+                >{t.name}</button>
+              )}
+              <button
+                onClick={e => { e.stopPropagation(); if (tab === `user:${t.id}`) setTab('watch'); removeWlTab(t.id) }}
+                className="opacity-0 group-hover:opacity-70 hover:!opacity-100"
+                title={`Delete ${t.name}`}
+              >
+                <X className="h-2.5 w-2.5" />
+              </button>
+            </span>
           ))}
+          <button
+            onClick={() => setTab(`user:${addWlTab()}`)}
+            title="New watchlist tab — double-click its name to rename"
+            className="p-0.5 rounded bg-secondary text-muted-foreground hover:text-foreground"
+          >
+            <Plus className="h-3 w-3" />
+          </button>
         </div>
-        {q && tab !== 'watch' && tab !== 'index' && (
-          <div className="text-[8px] text-muted-foreground">searching “{q}” — click a result to open its workspace</div>
+        {isUserTab && userTab && (
+          <div className="text-[8px] text-muted-foreground">custom tab — tap the star on any row to add it here</div>
+        )}
+        {tab === 'fno' && (
+          <div className="text-[8px] text-muted-foreground">latest-expiry contracts · NFO / BFO / BFNO / MCX / CDS</div>
         )}
       </div>
+      {sortCtl}
       <div className="flex-1 overflow-y-auto">
-        {/* Index tab: expandable constituent lists */}
-        {tab === 'index' && visible.map(s => (
-          <IndexRow
-            key={s.id}
-            symbol={s.symbol}
-            name={s.name}
-            lotSize={s.lotSize}
-            tick={ticks[s.symbol]}
-            active={s.symbol === selectedSymbol}
-            starred={watchSymbols.includes(s.symbol)}
-            onStar={() => toggleWatch(s.symbol)}
-            onOpen={() => openWs(s.symbol)}
-            onOpenSymbol={sym => openSymbolWorkspace(sym, false)}
-            expanded={expandedIdx === s.symbol}
-            onToggle={() => setExpandedIdx(expandedIdx === s.symbol ? null : s.symbol)}
-          />
+        {/* Index tab: expandable constituent lists + commodities */}
+        {tab === 'index' && (
+          <>
+            {visible.map(r => (
+              <IndexRow
+                key={r.key}
+                symbol={r.symbol}
+                name={r.name}
+                lotSize={r.lotSize}
+                tick={ticks[r.symbol]}
+                active={r.symbol === selectedSymbol}
+                starred={watchSymbols.includes(r.symbol)}
+                onStar={() => toggleWatch(r.symbol)}
+                onOpen={() => openWs(r.symbol)}
+                onOpenSymbol={sym => openSymbolWorkspace(sym, false)}
+                expanded={expandedIdx === r.symbol}
+                onToggle={() => setExpandedIdx(expandedIdx === r.symbol ? null : r.symbol)}
+              />
+            ))}
+            {commRows.length > 0 && (
+              <div className="px-2 pt-2 pb-1 text-[8px] uppercase tracking-wide text-muted-foreground bg-card/60 sticky top-0">commodities · mcx</div>
+            )}
+            {commRows.map(u => {
+              const r = mkFnoRow(u)
+              return (
+                <SymbolRowItem
+                  key={r.key}
+                  row={{ id: r.key, symbol: r.symbol, name: r.name, exchange: r.exchange, instrumentType: 'COMM', lotSize: r.lotSize, mappings: [] }}
+                  tick={ticks[r.symbol]}
+                  fallbackLtp={r.ltp}
+                  active={r.symbol === selectedSymbol}
+                  starred={watchSymbols.includes(r.symbol)}
+                  onStar={() => toggleWatch(r.symbol)}
+                  onOpen={() => openWs(r.symbol)}
+                />
+              )
+            })}
+          </>
+        )}
+        {/* FNO tab: grouped by exchange */}
+        {tab === 'fno' && fnoGroups.map(g => (
+          <div key={g.exchange}>
+            <div className="px-2 py-1 text-[8px] uppercase tracking-wide text-muted-foreground bg-card/60 sticky top-0 border-y border-border/40">
+              {g.label} · {g.underlyings.length}
+            </div>
+            {visible.filter(r => r.exchange === g.exchange).map(r => (
+              <FnoRowItem key={r.key} row={r} active={r.symbol === selectedSymbol} starred={watchSymbols.includes(r.symbol)} onStar={() => toggleWatch(r.symbol)} onOpen={() => openWs(r.symbol)} />
+            ))}
+          </div>
         ))}
-        {/* other tabs / search results */}
-        {tab !== 'index' && visible.map(s => (
+        {/* watch / user tabs / fallback search results */}
+        {(tab === 'watch' || isUserTab || (tab !== 'index' && tab !== 'fno')) && visible.map(r => (
           <SymbolRowItem
-            key={s.id}
-            row={s}
-            tick={ticks[s.symbol]}
-            active={s.symbol === selectedSymbol}
-            starred={watchSymbols.includes(s.symbol)}
-            onStar={() => toggleWatch(s.symbol)}
-            onOpen={() => openWs(s.symbol)}
+            key={r.key}
+            row={r.row ?? { id: r.key, symbol: r.symbol, name: r.name, exchange: r.exchange, instrumentType: r.instrumentType, lotSize: r.lotSize, mappings: [] }}
+            tick={ticks[r.symbol]}
+            fallbackLtp={r.ltp}
+            active={r.symbol === selectedSymbol}
+            starred={starFor(r.symbol).on}
+            onStar={() => starFor(r.symbol).fn()}
+            onOpen={() => openWs(r.symbol)}
           />
         ))}
         {visible.length === 0 && (
           <div className="p-4 text-center text-[11px] text-muted-foreground">
-            {tab === 'watch' ? 'No starred symbols — tap the star on any row.' : 'No symbols. Sync master contracts in Admin.'}
+            {tab === 'watch' ? 'No starred symbols — tap the star on any row.'
+            : isUserTab ? 'Empty tab — tap the star on any row to add symbols here.'
+            : tab === 'fno' ? 'No F&O contracts — sync master contracts in Admin.'
+            : 'No symbols. Sync master contracts in Admin.'}
           </div>
         )}
       </div>
@@ -177,11 +374,11 @@ export function Watchlist() {
   )
 }
 
-function starBtn(starred: boolean, onStar: () => void) {
+function starBtn(starred: boolean, onStar: () => void, title?: string) {
   return (
     <button
       onClick={e => { e.stopPropagation(); onStar() }}
-      title={starred ? 'Remove from Watch tab' : 'Star → Watch tab'}
+      title={title ?? (starred ? 'Remove from Watch tab' : 'Star → Watch tab')}
       className={`p-0.5 rounded shrink-0 ${starred ? 'text-[#e0a63f]' : 'text-muted-foreground/40 hover:text-[#e0a63f]'}`}
     >
       <Star className="h-3 w-3" fill={starred ? 'currentColor' : 'none'} />
@@ -189,37 +386,80 @@ function starBtn(starred: boolean, onStar: () => void) {
   )
 }
 
-function SymbolRowItem({ row, tick, active, starred, onStar, onOpen }: {
+/** Generic symbol row — LTP + change pts/% + day H/L. */
+function SymbolRowItem({ row, tick, active, starred, onStar, onOpen, fallbackLtp }: {
   row: SymbolRow
   tick?: Tick
   active: boolean
   starred: boolean
   onStar: () => void
   onOpen: () => void
+  fallbackLtp?: number
 }) {
-  const ltp = tick?.ltp ?? row.basePrice ?? 0
-  const chg = tick && tick.prevClose ? ((tick.ltp - tick.prevClose) / tick.prevClose) * 100 : 0
-  const up = chg >= 0
+  const ltp = tick?.ltp ?? fallbackLtp ?? row.basePrice ?? 0
+  const prev = tick?.prevClose ?? 0
+  const chg = tick && prev ? ltp - prev : 0
+  const chgPct = tick && prev ? (chg / prev) * 100 : 0
+  const up = tick ? chg >= 0 : true
   return (
     <div
       onClick={onOpen}
       className={`w-full px-2 py-1.5 flex items-center justify-between text-left border-l-2 cursor-pointer transition-colors ${
-        active ? 'border-primary bg-accent' : 'border-transparent hover:bg-secondary/50'
+        active ? 'border-[#e0a63f] bg-accent' : 'border-transparent hover:bg-secondary/50'
       }`}
     >
       <div className="min-w-0">
         <div className="text-[11px] font-medium truncate">{row.symbol}</div>
         <div className="text-[9px] text-muted-foreground">
-          {row.exchange} · {row.instrumentType}{row.instrumentType === 'EQ' ? ` · L${row.lotSize}` : ''}
+          {row.exchange} · {row.instrumentType}{row.instrumentType === 'EQ' || row.instrumentType === 'COMM' || row.instrumentType === 'CUR' ? ` · L${row.lotSize}` : ''}
         </div>
       </div>
       <div className="flex items-center gap-1">
         <div className="text-right tabular">
-          <div className={`text-[11px] ${tick ? (tick.ltp >= (tick.prevClose || tick.ltp) ? 'term-up' : 'term-down') : ''}`}>
+          <div className={`text-[11px] ${tick ? (ltp >= (prev || ltp) ? 'term-up' : 'term-down') : ''}`}>
             {ltp ? ltp.toFixed(2) : '—'}
           </div>
           <div className={`text-[9px] ${up ? 'term-up' : 'term-down'}`}>
-            {tick ? `${up ? '+' : ''}${chg.toFixed(2)}%` : '—'}
+            {tick ? `${up ? '+' : ''}${chg.toFixed(2)} (${chgPct.toFixed(2)}%)` : '—'}
+            {tick?.high ? <span className="text-muted-foreground"> · {tick.high.toFixed(0)}/{tick.low.toFixed(0)}</span> : null}
+          </div>
+        </div>
+        {starBtn(starred, onStar)}
+      </div>
+    </div>
+  )
+}
+
+/** FNO tab row — exchange badge + latest expiry + contract count. */
+function FnoRowItem({ row, active, starred, onStar, onOpen }: {
+  row: { symbol: string; name: string; exchange: string; lotSize: number; ltp: number; chgPct: number; high: number; low: number; fno: boolean; exp?: string | null; contracts?: number }
+  active: boolean
+  starred: boolean
+  onStar: () => void
+  onOpen: () => void
+}) {
+  return (
+    <div
+      onClick={onOpen}
+      className={`w-full px-2 py-1.5 flex items-center justify-between text-left border-l-2 cursor-pointer transition-colors ${
+        active ? 'border-[#e0a63f] bg-accent' : 'border-transparent hover:bg-secondary/50'
+      }`}
+      title={`${row.name} · lot ${row.lotSize} — click to open its workspace`}
+    >
+      <div className="min-w-0">
+        <div className="text-[11px] font-medium truncate flex items-center gap-1">
+          {row.symbol}
+          <span className="text-[7px] px-1 rounded bg-secondary/80 text-muted-foreground">{row.exchange}</span>
+        </div>
+        <div className="text-[9px] text-muted-foreground truncate">
+          {row.exp ? `${row.exp} · ${row.contracts ?? 0} strikes · L${row.lotSize}` : `L${row.lotSize}`}
+        </div>
+      </div>
+      <div className="flex items-center gap-1">
+        <div className="text-right tabular">
+          <div className={`text-[11px] ${row.chgPct >= 0 ? 'term-up' : 'term-down'}`}>{row.ltp ? row.ltp.toFixed(2) : '—'}</div>
+          <div className={`text-[9px] ${row.chgPct >= 0 ? 'term-up' : 'term-down'}`}>
+            {row.ltp ? `${row.chgPct >= 0 ? '+' : ''}${row.chgPct.toFixed(2)}%` : '—'}
           </div>
         </div>
         {starBtn(starred, onStar)}
@@ -249,7 +489,7 @@ function IndexRow({ symbol, name, lotSize, tick, active, starred, onStar, onOpen
       <div
         onClick={onOpen}
         className={`w-full px-2 py-1.5 flex items-center justify-between text-left border-l-2 cursor-pointer transition-colors ${
-          active ? 'border-primary' : 'border-transparent hover:bg-secondary/50'
+          active ? 'border-[#e0a63f]' : 'border-transparent hover:bg-secondary/50'
         }`}
       >
         <div className="flex items-center gap-1 min-w-0">

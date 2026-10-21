@@ -247,6 +247,74 @@ export async function syncMasterContracts(source: 'SEED' | 'DAILY_SYNC' | 'MANUA
     }
   }
 
+  // --- BFO (BSE F&O): BANKEX futures + weekly options (SENSEX lives on NSE rows here) ---
+  {
+    const base = 58000
+    const lot = 15
+    rows.push({ symbol: 'BANKEX', name: 'BSE Bankex Index', exchange: 'BSE', instrumentType: 'INDEX', lotSize: 1, tickSize: 0.05, basePrice: base })
+    for (const exp of weekly) {
+      rows.push({ symbol: `BANKEX${exp.replaceAll('-', '')}FUT`, name: `BANKEX ${exp} Fut`, exchange: 'BFO', instrumentType: 'FUT', expiry: exp, lotSize: lot, tickSize: 0.05, underlying: 'BANKEX', basePrice: base })
+      const atm = Math.round(base / 100) * 100
+      for (let k = -6; k <= 6; k++) {
+        const strike = atm + k * 100
+        for (const t of ['CE', 'PE'] as const) {
+          rows.push({
+            symbol: `BANKEX${exp.replaceAll('-', '')}${strike}${t}`,
+            name: `BANKEX ${strike} ${t} ${exp}`,
+            exchange: 'BFO', instrumentType: t, expiry: exp, strike, optionType: t,
+            lotSize: lot, tickSize: 0.05, underlying: 'BANKEX',
+            basePrice: optionPremium(base, strike, t, daysTo(exp)),
+          })
+        }
+      }
+    }
+  }
+
+  // --- MCX commodities: base + monthly futures + ATM±4 options ---
+  const COMM_UNIVERSE = [
+    { symbol: 'GOLD', name: 'Gold', base: 76500, lot: 100, step: 100 },
+    { symbol: 'SILVER', name: 'Silver', base: 91000, lot: 30, step: 500 },
+    { symbol: 'CRUDEOIL', name: 'Crude Oil', base: 6150, lot: 100, step: 50 },
+    { symbol: 'NATURALGAS', name: 'Natural Gas', base: 245, lot: 1250, step: 5 },
+    { symbol: 'COPPER', name: 'Copper', base: 852, lot: 2500, step: 5 },
+    { symbol: 'ZINC', name: 'Zinc', base: 278, lot: 5000, step: 5 },
+    { symbol: 'ALUMINIUM', name: 'Aluminium', base: 248, lot: 5000, step: 5 },
+  ]
+  for (const c of COMM_UNIVERSE) {
+    rows.push({ symbol: c.symbol, name: c.name, exchange: 'MCX', instrumentType: 'COMM', lotSize: c.lot, tickSize: 0.05, basePrice: c.base })
+    for (const exp of monthly) {
+      rows.push({ symbol: `${c.symbol}${exp.replaceAll('-', '')}FUT`, name: `${c.name} ${exp} Fut`, exchange: 'MCX', instrumentType: 'FUT', expiry: exp, lotSize: c.lot, tickSize: 0.05, underlying: c.symbol, basePrice: c.base })
+    }
+    const exp = monthly[0]
+    const atm = Math.round(c.base / c.step) * c.step
+    for (let k = -4; k <= 4; k++) {
+      const strike = atm + k * c.step
+      for (const t of ['CE', 'PE'] as const) {
+        rows.push({
+          symbol: `${c.symbol}${exp.replaceAll('-', '')}${strike}${t}`,
+          name: `${c.name} ${strike} ${t} ${exp}`,
+          exchange: 'MCX', instrumentType: t, expiry: exp, strike, optionType: t,
+          lotSize: c.lot, tickSize: 0.05, underlying: c.symbol,
+          basePrice: optionPremium(c.base, strike, t, daysTo(exp)),
+        })
+      }
+    }
+  }
+
+  // --- CDS currency derivatives: base + monthly futures ---
+  const CUR_UNIVERSE = [
+    { symbol: 'USDINR', name: 'US Dollar INR', base: 84.35, lot: 1000 },
+    { symbol: 'EURINR', name: 'Euro INR', base: 91.2, lot: 1000 },
+    { symbol: 'GBPINR', name: 'Pound INR', base: 108.4, lot: 1000 },
+    { symbol: 'JPYINR', name: 'Yen INR', base: 56.2, lot: 1000 },
+  ]
+  for (const c of CUR_UNIVERSE) {
+    rows.push({ symbol: c.symbol, name: c.name, exchange: 'CDS', instrumentType: 'CUR', lotSize: c.lot, tickSize: 0.0025, basePrice: c.base })
+    for (const exp of monthly) {
+      rows.push({ symbol: `${c.symbol}${exp.replaceAll('-', '')}FUT`, name: `${c.name} ${exp} Fut`, exchange: 'CDS', instrumentType: 'FUT', expiry: exp, lotSize: c.lot, tickSize: 0.0025, underlying: c.symbol, basePrice: c.base })
+    }
+  }
+
   // --- upsert master symbols ---
   let symbolCount = 0
   for (const r of rows) {

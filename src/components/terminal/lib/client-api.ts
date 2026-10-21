@@ -254,6 +254,20 @@ export const api = {
     fetch('/api/orders/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accountId, orderId }) }).then(r => j<{ ok: boolean }>(r)),
   status: () => fetch('/api/market/status').then(r => j<{ services: Record<string, string | number>; masterContracts: { count: number; lastSync: string | null }; accounts: number; enabledStrategies: number }>(r)),
 
+  // ---- FNO universe (all exchanges: NFO / BFO / BFNO / MCX / CDS) ----
+  fnoUniverse: () =>
+    fetch('/api/market/fno').then(r => j<FnoUniverseResp>(r)),
+
+  // ---- paper-trading replay (admin) ----
+  replayStatus: () =>
+    fetch('/api/replay').then(r => j<ReplayStatusResp>(r)),
+  replayControl: (body: { mode: 'start' | 'stop'; file?: string | null; random?: boolean; fromTs?: number | null; toTs?: number | null; speed?: number }) =>
+    fetch('/api/replay', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => j<ReplayStatusResp>(r)),
+
+  // ---- python strategy runner (backend tool) ----
+  runPython: (body: { id?: string; code?: string; symbol?: string; tf?: string; bars?: number; dryRun?: boolean }) =>
+    fetch('/api/strategy/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => j<PythonRunResp>(r)),
+
   // ---- options chain (strikes panel) ----
   optionUnderlyings: () =>
     fetch('/api/options/underlyings').then(r => j<{ underlyings: OptionUnderlyingRow[] }>(r)),
@@ -410,6 +424,47 @@ export interface TickRecorderResp {
   sessions: { file: string; bytes: number; mtime: string }[]
 }
 
+export interface FnoUnderlyingRow {
+  underlying: string
+  name: string
+  exchange: string // NFO | BFO | BFNO | MCX | CDS
+  segment: string // IDX | EQ | COMM | CUR
+  instrumentType: string
+  lotSize: number
+  latestExpiry: string | null
+  contracts: number // option contracts for the latest expiry
+  spot: number
+  chgPct: number
+}
+
+export interface FnoUniverseResp {
+  groups: { exchange: string; label: string; underlyings: FnoUnderlyingRow[] }[]
+}
+
+export interface ReplayStatusResp {
+  active: boolean
+  file: string | null
+  random?: boolean
+  speed: number
+  startedAt: string | null
+  total: number
+  played: number
+  symbols: string[]
+  fromTs?: number | null
+  toTs?: number | null
+  progressPct: number
+}
+
+export interface PythonRunResp {
+  ok: boolean
+  runId: string
+  logs: string[]
+  signals: { ts: string; symbol: string; side: string; qty?: number; price?: number; message?: string }[]
+  ordersPlaced: number
+  error?: string
+  ms: number
+}
+
 export interface BrokerBookRow {
   brokerOrderId: string
   symbol: string
@@ -420,6 +475,28 @@ export interface BrokerBookRow {
   avgPrice?: number
   orderType?: string
   ts?: string
+}
+
+// ---- ITM / OTM / ATM strike labeling (hedge-desk convention) ----
+// Side-ATM: CE ATM = floor(spot/step)*step, PE ATM = ceil(spot/step)*step.
+// Spot 23030 (step 50): CE ATM 23000 · CE ITM1 22950 · CE OTM1 23050;
+//                       PE ATM 23050 · PE ITM1 23100 · PE OTM1 23000.
+// offset = steps vs the SIDE's ATM (offsetCe for CE, offsetPe for PE):
+//   CE: negative offset = strike below side-ATM = ITM, positive = OTM
+//   PE: positive offset = strike above side-ATM = ITM, negative = OTM
+export function sideOffsetLabel(offset: number | null | undefined, type: 'CE' | 'PE'): string {
+  if (offset == null || !Number.isFinite(offset)) return ''
+  if (offset === 0) return 'ATM'
+  const itm = type === 'CE' ? offset < 0 : offset > 0
+  return `${itm ? 'ITM' : 'OTM'} ${Math.abs(offset)}`
+}
+
+/** Side-specific strike for a labeled distance from ATM: dir = -1 (ITM) | 0 (ATM) | +1 (OTM). */
+export function sideStrikeFor(atm: { ce: number; pe: number }, step: number, dir: -1 | 0 | 1, n: number, type: 'CE' | 'PE'): number {
+  const base = type === 'CE' ? atm.ce : atm.pe
+  // CE: ITM = below ceAtm, OTM = above; PE mirrored (ITM = above peAtm)
+  const signed = type === 'CE' ? dir : -dir
+  return base + signed * n * step
 }
 
 export function fmtMoney(n: number | null | undefined, dp = 2): string {

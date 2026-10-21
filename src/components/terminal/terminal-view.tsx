@@ -4,7 +4,6 @@ import { useMemo, useState } from 'react'
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
 import { useQuery } from '@tanstack/react-query'
 import { ListTree, FileBox, Plus, X, Crosshair, Layers, Bot } from 'lucide-react'
-import { toast } from 'sonner'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { CanvasChart } from './chart/canvas-chart'
 import { Watchlist, DepthStack } from './panels/watchlist'
@@ -15,7 +14,8 @@ import { AutoPanel } from './panels/auto-panel'
 import { WorkspacePanes } from './panels/option-panes'
 import { useTerminal, wsLayout, addDepthPanelTo, type WsLayout } from './lib/store'
 import { api } from './lib/client-api'
-import { useSyncChannel, type SyncCore } from './lib/sync'
+import { useChartCore, useChartMarkers, commitChartLevel } from './lib/use-chart-markers'
+import { toast } from 'sonner'
 import { TIMEFRAMES } from '@/lib/types'
 import type { Timeframe } from '@/lib/types'
 
@@ -28,14 +28,8 @@ export function TerminalView() {
   const setOrderType = useTerminal(s => s.setOrderType)
   const bottomCollapsed = useTerminal(s => s.bottomCollapsed)
 
-  // positions for the spot-chart L/S markers — websocket sync (fallback REST)
-  const core = useSyncChannel<SyncCore>('sync:core')
-  const { data: posData } = useQuery({
-    queryKey: ['positions'],
-    queryFn: () => api.positions(),
-    enabled: !core,
-    refetchInterval: 2000,
-  })
+  // positions for the spot-chart L/S markers — websocket sync hub
+  const core = useChartCore()
 
   // F&O underlyings -> enable the spot+ATM CE/PE mini charts strip
   const { data: undData } = useQuery({
@@ -49,16 +43,17 @@ export function TerminalView() {
     [ws, undData],
   )
 
-  const markers = useMemo(() => {
-    const rows = core
-      ? core.positions.filter(p => p.symbol === ws?.symbol && p.netQty !== 0 && p.avgPrice > 0)
-      : (posData?.positions ?? []).filter(p => p.symbol === ws?.symbol && p.netQty !== 0 && p.avgPrice > 0)
-    return rows.map(p => ({
-      price: p.avgPrice,
-      label: p.netQty > 0 ? 'L' : 'S',
-      color: p.netQty > 0 ? '#00c896' : '#ff4d5e',
-    }))
-  }, [ws, core, posData])
+  // entry markers (positions @ price + PnL/%) + draggable SL/target levels
+  const spotMarkers = useChartMarkers(ws?.symbol ?? '', core)
+  const onMarkerDrop = (kind: 'sl' | 'target', price: number) => {
+    if (ws) void commitChartLevel(ws.symbol, kind, price, core)
+  }
+  const onMarkerRemove = (kind: 'sl' | 'target') => {
+    if (ws) {
+      useTerminal.getState().setChartLevel(ws.symbol, kind, null)
+      toast.info(`${kind === 'sl' ? 'SL' : 'Target'} level removed`)
+    }
+  }
 
   if (!ws) return null
 
@@ -98,9 +93,9 @@ export function TerminalView() {
           <span className="w-px h-4 bg-border mx-0.5" />
           <span
             className="px-1.5 py-0.5 rounded bg-secondary text-muted-foreground text-[9px]"
-            title="Each chart has its own controls: type, indicators, 1m ghost, scales and draw tools — top-right of the chart"
+            title="Each chart has its own controls on the LEFT under the legend: type, indicators, ghost (any tf), scales and draw tools — hover an icon to open its menu"
           >
-            per-chart: type · indicators · ghost · scales · tools
+            per-chart (left bar): type · indicators · ghost · scales · tools
           </span>
           <span className="w-px h-4 bg-border mx-0.5" />
           <button
@@ -155,10 +150,14 @@ export function TerminalView() {
                         showBOLL={ws.showBOLL}
                         showRSI={ws.showRSI}
                         showMACD={ws.showMACD}
+                        showADX={ws.showADX}
                         showGhost={ws.showGhost}
                         ghostStyle={ws.ghostStyle}
+                        ghostTf={ws.ghostTf}
                         scales={ws.scales}
-                        markers={markers}
+                        markers={spotMarkers}
+                        onMarkerDrop={onMarkerDrop}
+                        onMarkerRemove={onMarkerRemove}
                         onPriceClick={p => { setLimitPrice(p); setOrderType('LIMIT') }}
                         settingsKey={`${ws.id}:spot`}
                         height="h-full"

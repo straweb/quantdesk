@@ -15,6 +15,7 @@ import {
   type PaneCfg, type WorkspaceCfg,
 } from '../lib/store'
 import { useSyncData, mergeChain, type SyncChainResp } from '../lib/sync'
+import { useChartCore, useChartMarkers, commitChartLevel } from '../lib/use-chart-markers'
 
 // ============================================================
 // Multi-pane chart region for F&O workspaces — fully resizable
@@ -54,9 +55,74 @@ export function DepthAddButton({ ws, symbol }: { ws: WorkspaceCfg; symbol: strin
   )
 }
 
-/** Slim header for the spot pane: [depth] SYMBOL · LTP chg% */
+// ============================================================
+// TradeButtons — BUY / [lots] / SELL between the buttons.
+// Spot instruments without a direct B/S (indices) render CE / PE
+// buttons that deploy the side-ATM strike instead.
+// ============================================================
+export function TradeButtons({ symbol, kind, lotSize }: { symbol: string; kind: 'spot' | 'CE' | 'PE'; lotSize?: number }) {
+  const [lots, setLots] = useState(1)
+  const [busy, setBusy] = useState(false)
+  const { data: undData } = useQuery({ queryKey: ['optionUnderlyings'], queryFn: () => api.optionUnderlyings(), staleTime: 5 * 60_000 })
+  const isUnderlying = kind === 'spot' && (undData?.underlyings ?? []).some(u => u.underlying === symbol)
+
+  const marketOrder = async (side: 'BUY' | 'SELL', sym = symbol, qtyLots = lots) => {
+    setBusy(true)
+    try {
+      const res = await api.placeOrder({ symbol: sym, exchange: 'NFO', side, qty: qtyLots, orderType: 'MARKET', productType: 'MIS', source: 'MANUAL' })
+      const f = res.legs.filter(l => l.status === 'FILLED').length
+      res.status === 'FAILED'
+        ? toast.error(`${side} failed — ${res.message}`)
+        : toast.success(`${side} ${sym} × ${qtyLots} lot(s) — ${f}/${res.legs.length} accounts`)
+    } catch (e) { toast.error(e instanceof Error ? e.message : 'Order failed') }
+    setBusy(false)
+  }
+
+  /** Deploy one side's ATM (CE floor / PE ceil convention). */
+  const deployAtm = async (type: 'CE' | 'PE') => {
+    setBusy(true)
+    try {
+      const chain = await api.optionChain(symbol, null, [])
+      const cell = type === 'CE' ? chain.atmCe : chain.atmPe
+      if (!cell?.exists) { toast.error(`${type} ATM unavailable for ${symbol}`); setBusy(false); return }
+      const r = await api.ensureStrike(symbol, cell.strike, chain.meta.expiry)
+      void r
+      await marketOrder('BUY', cell.symbol, Math.max(1, lots))
+    } catch (e) { toast.error(e instanceof Error ? e.message : 'ATM deploy failed') }
+    setBusy(false)
+  }
+
+  if (kind === 'spot' && isUnderlying) {
+    // index / F&O underlying — no direct B/S → CE/PE deploy ATM
+    return (
+      <span className="flex items-center gap-0.5 shrink-0" title="Spot has no direct B/S — buy the side-ATM option">
+        <button onClick={() => deployAtm('CE')} disabled={busy} className="px-1 py-0.5 rounded bg-up text-[#00c896] hover:brightness-125 text-[9px] font-bold disabled:opacity-40">CE</button>
+        <button onClick={() => deployAtm('PE')} disabled={busy} className="px-1 py-0.5 rounded bg-down text-[#ff4d5e] hover:brightness-125 text-[9px] font-bold disabled:opacity-40">PE</button>
+      </span>
+    )
+  }
+  return (
+    <span className="flex items-center gap-0.5 shrink-0">
+      <button onClick={() => marketOrder('BUY')} disabled={busy} className="px-1 py-0.5 rounded bg-up text-[#00c896] hover:brightness-125 text-[9px] font-bold disabled:opacity-40">B</button>
+      <input
+        value={lots}
+        onChange={e => setLots(Math.max(1, Math.min(999, Number(e.target.value.replace(/[^0-9]/g, '')) || 1)))}
+        title={`Lot size — ${lotSize && lotSize > 1 ? `1 lot = ${lotSize} qty · ` : ''}editable between buy/sell`}
+        className="h-4.5 w-6 rounded bg-secondary/70 text-center text-[9px] tabular outline-none focus:ring-1 ring-primary/60"
+      />
+      <button onClick={() => marketOrder('SELL')} disabled={busy} className="px-1 py-0.5 rounded bg-down text-[#ff4d5e] hover:brightness-125 text-[9px] font-bold disabled:opacity-40">S</button>
+    </span>
+  )
+}
+
+/** Slim header for the spot pane: [depth] SYMBOL · LTP chg% · B/S or CE/PE */
 export function SpotPaneHeader({ ws }: { ws: WorkspaceCfg }) {
   const [tick, setTick] = useState<Tick | null>(null)
+  const { data: quoteData } = useQuery({
+    queryKey: ['quote-lot', ws.symbol],
+    queryFn: () => api.quote(ws.symbol),
+    refetchInterval: 15_000,
+  })
   useEffect(() => {
     subscribeTicks([ws.symbol])
     const off = onTicks(map => {
@@ -81,6 +147,7 @@ export function SpotPaneHeader({ ws }: { ws: WorkspaceCfg }) {
       >
         click to set active
       </button>
+      <TradeButtons symbol={ws.symbol} kind="spot" lotSize={quoteData?.lotSize} />
       <div className="flex-1 min-w-0" />
       <span className={`tabular font-bold shrink-0 ${ltp && chgPct !== null && chgPct >= 0 ? 'term-up' : 'term-down'}`}>
         {ltp ? fmtMoney(ltp) : '—'}
@@ -95,6 +162,7 @@ export function SpotPaneHeader({ ws }: { ws: WorkspaceCfg }) {
 export function OptionPane({ ws, kind }: { ws: WorkspaceCfg; kind: PaneCfg['key'] }) {
   const patchWs = useTerminal(s => s.patchWs)
   const setSymbol = useTerminal(s => s.setSymbol)
+  const core = useChartCore()
   const st = ws.strikes ?? defaultStrikes()
   const pane = wsPanes(ws).find(p => p.key === kind) ?? { key: kind, strike: null, type: null }
 
@@ -140,6 +208,19 @@ export function OptionPane({ ws, kind }: { ws: WorkspaceCfg; kind: PaneCfg['key'
     return data?.atmPe ?? null
   }, [data, pinned, type])
 
+  // position entry + draggable SL/target markers for THIS option's chart
+  const chartSymbol = cell?.exists ? cell.symbol : ''
+  const markers = useChartMarkers(chartSymbol, core, meta?.lotSize ?? 1)
+  const onMarkerDrop = (k: 'sl' | 'target', price: number) => {
+    if (chartSymbol) void commitChartLevel(chartSymbol, k, price, core)
+  }
+  const onMarkerRemove = (k: 'sl' | 'target') => {
+    if (chartSymbol) {
+      useTerminal.getState().setChartLevel(chartSymbol, k, null)
+      toast.info(`${k === 'sl' ? 'SL' : 'Target'} level removed`)
+    }
+  }
+
   const offset = meta && cell
     ? Math.round((cell.strike - (type === 'CE' ? meta.ceAtm : meta.peAtm)) / meta.step)
     : null
@@ -160,8 +241,8 @@ export function OptionPane({ ws, kind }: { ws: WorkspaceCfg; kind: PaneCfg['key'
             symbol={ws.symbol} tf={ws.tf} chartType={ws.chartType} showVolume={ws.showVolume}
             showSMA20={ws.showSMA20} showSMA50={ws.showSMA50}
             showEMA={ws.showEMA} showVWAP={ws.showVWAP} showBOLL={ws.showBOLL}
-            showRSI={ws.showRSI} showMACD={ws.showMACD}
-            showGhost={ws.showGhost} ghostStyle={ws.ghostStyle} scales={ws.scales}
+            showRSI={ws.showRSI} showMACD={ws.showMACD} showADX={ws.showADX}
+            showGhost={ws.showGhost} ghostStyle={ws.ghostStyle} ghostTf={ws.ghostTf} scales={ws.scales}
             settingsKey={`${ws.id}:extra`}
             height="h-full"
           />
@@ -177,8 +258,8 @@ export function OptionPane({ ws, kind }: { ws: WorkspaceCfg; kind: PaneCfg['key'
         {cell?.exists ? `${cell.strike} ${type}` : `${type} ·—`}
       </span>
       {offset !== null && (
-        <span className="text-muted-foreground shrink-0" title="Offset from side ATM (steps)">
-          {offset === 0 ? 'ATM' : offset > 0 ? `+${offset}` : offset}
+        <span className="text-muted-foreground shrink-0" title="Position vs the side ATM (ITM/OTM/ATM)">
+          {offset === 0 ? 'ATM' : (type === 'CE' ? (offset < 0 ? `ITM ${-offset}` : `OTM ${offset}`) : (offset > 0 ? `ITM ${offset}` : `OTM ${-offset}`))}
         </span>
       )}
       <button
@@ -188,6 +269,7 @@ export function OptionPane({ ws, kind }: { ws: WorkspaceCfg; kind: PaneCfg['key'
       >
         {meta ? `${meta.underlying} · ${meta.expiry} · L${meta.lotSize}` : '—'}
       </button>
+      <TradeButtons symbol={cell?.exists ? cell.symbol : ''} kind={type} lotSize={meta?.lotSize} />
       <span className={`tabular font-bold shrink-0 ${cell && cell.ltp >= cell.prevClose ? 'term-up' : 'term-down'}`}>
         {cell?.exists ? fmtMoney(cell.ltp) : '—'}
         {cell?.exists ? (
@@ -238,7 +320,11 @@ export function OptionPane({ ws, kind }: { ws: WorkspaceCfg; kind: PaneCfg['key'
         showBOLL={ws.showBOLL}
         showRSI={ws.showRSI}
         showMACD={ws.showMACD}
-        showGhost={ws.showGhost} ghostStyle={ws.ghostStyle} scales={ws.scales}
+        showADX={ws.showADX}
+        showGhost={ws.showGhost} ghostStyle={ws.ghostStyle} ghostTf={ws.ghostTf} scales={ws.scales}
+        markers={markers}
+        onMarkerDrop={onMarkerDrop}
+        onMarkerRemove={onMarkerRemove}
         settingsKey={`${ws.id}:${kind}`}
         height="h-full"
       />
