@@ -42,7 +42,11 @@ export function calcCharges(params: {
   const r = RATES[seg]
   const v = Math.max(0, params.value)
 
-  const brokerage = params.brokeragePct > 0 ? Math.min(r.brokerageFlat, v * r.brokeragePct) : r.brokerageFlat
+  // pct-of-turnover brokerage capped at the flat rate; flat-only segments
+  // (delivery / options) have pct 0 → always the flat fee.
+  // (was `params.brokeragePct` — always undefined, making brokerage flat
+  //  ₹20 for every segment and overcharging small intraday/futures legs)
+  const brokerage = r.brokeragePct > 0 ? Math.min(r.brokerageFlat, v * r.brokeragePct) : r.brokerageFlat
   const stt = (params.side === 'SELL' ? r.sttSell : 0) * v + (params.side === 'BUY' ? r.sttBuy : 0) * v
   const transaction = r.txn * v
   const sebi = r.sebi * v

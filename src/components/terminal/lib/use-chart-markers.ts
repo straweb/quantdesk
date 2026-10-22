@@ -31,31 +31,41 @@ export function useChartMarkers(symbol: string, core: SyncCore | null, lotSize =
   return useMemo(() => {
     const out: ChartMarker[] = []
     const rows = (core?.positions ?? []).filter(p => p.symbol === symbol && p.netQty !== 0 && p.avgPrice > 0)
+    // ONE aggregated entry marker per symbol (the sync stream emits one row
+    // per ACCOUNT — three identical chips would just crowd small panes)
+    const absQty = rows.reduce((s, p) => s + Math.abs(p.netQty), 0)
+    const netQty = rows.reduce((s, p) => s + p.netQty, 0)
+    const avg = absQty ? rows.reduce((s, p) => s + p.avgPrice * Math.abs(p.netQty), 0) / absQty : 0
+    const pnl = rows.reduce((s, p) => s + p.unrealizedPnl, 0)
     const pos = rows[0]
-    for (const p of rows) {
-      const pnl = p.unrealizedPnl
-      const pct = p.avgPrice ? (pnl / Math.abs(p.avgPrice * p.netQty)) * 100 : 0
+    if (rows.length && netQty !== 0 && avg > 0) {
+      const pct = avg ? (pnl / Math.abs(avg * netQty)) * 100 : 0
       out.push({
-        id: `pos-${p.accountId}`,
+        id: 'pos-agg',
         kind: 'entry',
-        price: p.avgPrice,
-        label: p.netQty > 0 ? 'L' : 'S',
-        color: p.netQty > 0 ? '#00c896' : '#ff4d5e',
+        price: avg,
+        label: netQty > 0 ? 'L' : 'S',
+        color: netQty > 0 ? '#00c896' : '#ff4d5e',
         sub: `${pnl >= 0 ? '+' : ''}${fmtMoney(pnl, 0)} · ${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%`,
       })
     }
-    const long = pos ? pos.netQty > 0 : true
-    if (levels?.sl && levels.sl > 0) {
-      out.push({ id: 'lvl-sl', kind: 'sl', price: levels.sl, label: long ? 'S·SELL' : 'S·BUY', color: '#ff4d5e' })
-    } else if (pos) {
-      // suggested stop — drag it to arm the real stop-sell / stop-buy
-      out.push({ id: 'lvl-sl', kind: 'sl', price: Number((pos.avgPrice * (long ? 0.98 : 1.02)).toFixed(2)), label: long ? 'S·SELL' : 'S·BUY', color: '#ff4d5e', sub: 'drag = stop' })
-    }
-    if (levels?.target && levels.target > 0) {
-      out.push({ id: 'lvl-tgt', kind: 'target', price: levels.target, label: 'CLOSE', color: '#00c896' })
-    } else if (pos) {
-      // suggested target — drag it anywhere (drop arms a real close-position LIMIT)
-      out.push({ id: 'lvl-tgt', kind: 'target', price: Number((pos.avgPrice * (long ? 1.04 : 0.96)).toFixed(2)), label: 'CLOSE', color: '#00c896', sub: 'drag = close' })
+    // SL / target markers exist ONLY while a position is open — when the
+    // position closes the sync stream drops it and these disappear (the
+    // persisted chartLevels stay for the next position on this symbol).
+    if (pos && netQty !== 0) {
+      const long = netQty > 0
+      if (levels?.sl && levels.sl > 0) {
+        out.push({ id: 'lvl-sl', kind: 'sl', price: levels.sl, label: long ? 'S·SELL' : 'S·BUY', color: '#ff4d5e' })
+      } else {
+        // suggested stop — drag it to arm the real stop-sell / stop-buy
+        out.push({ id: 'lvl-sl', kind: 'sl', price: Number((avg * (long ? 0.98 : 1.02)).toFixed(2)), label: long ? 'S·SELL' : 'S·BUY', color: '#ff4d5e', sub: 'drag = stop' })
+      }
+      if (levels?.target && levels.target > 0) {
+        out.push({ id: 'lvl-tgt', kind: 'target', price: levels.target, label: 'CLOSE', color: '#00c896' })
+      } else {
+        // suggested target — drag it anywhere (drop arms a real close-position LIMIT)
+        out.push({ id: 'lvl-tgt', kind: 'target', price: Number((avg * (long ? 1.04 : 0.96)).toFixed(2)), label: 'CLOSE', color: '#00c896', sub: 'drag = close' })
+      }
     }
     void lotSize
     return out

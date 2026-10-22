@@ -2,6 +2,7 @@ import { db } from '../db'
 import { hashPassword, verifyPassword, hmacToken } from '../crypto'
 import { syncMasterContracts } from './symbol-service'
 import { ensureStrategyScheduler } from './strategy-engine'
+import { isMissingSchemaError, ensureDbSchema } from '../db-setup'
 
 // ============================================================
 // Bootstrap: admin user, demo broker accounts (all 4 brokers),
@@ -10,13 +11,33 @@ import { ensureStrategyScheduler } from './strategy-engine'
 // every API route as a fallback.
 // ============================================================
 
-const g = globalThis as unknown as { __bootstrapped: boolean }
+const g = globalThis as unknown as { __bootstrapped: boolean; __schemaHealed: boolean }
+let bootPromise: Promise<void> | null = null
 
-export async function bootstrap() {
+export function bootstrap(): Promise<void> {
   // strategy scheduler must always be running (1s tick)
   ensureStrategyScheduler()
-  if (g.__bootstrapped) return
-  g.__bootstrapped = true
+  if (g.__bootstrapped) return Promise.resolve()
+  // single-flight — concurrent API routes share one bootstrap run
+  if (!bootPromise) {
+    bootPromise = bootstrapInner()
+      .then(() => { g.__bootstrapped = true })
+      .catch(async e => {
+        bootPromise = null
+        // fresh clone self-heal: tables missing → push the schema once, retry
+        if (!g.__schemaHealed && isMissingSchemaError(e)) {
+          g.__schemaHealed = true
+          console.warn('[bootstrap] database schema missing — running prisma db push (self-heal)…')
+          await ensureDbSchema()
+          return bootstrap()
+        }
+        throw e
+      })
+  }
+  return bootPromise
+}
+
+async function bootstrapInner() {
 
   // 1. admin
   const admin = await db.adminUser.findFirst()
@@ -70,6 +91,7 @@ export async function bootstrap() {
       console.log(`[bootstrap] master contracts synced: ${r.symbolCount} symbols, ${r.mappedCount} mappings`)
     } catch (e) {
       g.__bootstrapped = false // retry on next call
+      bootPromise = null
       console.error('[bootstrap] master sync failed:', e)
     }
   }

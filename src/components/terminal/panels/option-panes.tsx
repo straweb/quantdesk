@@ -220,6 +220,19 @@ export function OptionPane({ ws, kind }: { ws: WorkspaceCfg; kind: PaneCfg['key'
       toast.info(`${k === 'sl' ? 'SL' : 'Target'} level removed`)
     }
   }
+  // EXIT button on the entry marker line — close the open position (all legs)
+  const onExitPosition = () => {
+    if (!chartSymbol) return
+    void (async () => {
+      try {
+        const so = await api.squareOffAll(false, [chartSymbol])
+        if (so.orders > 0) toast.success(`Exit ${chartSymbol} — ${so.filledLegs} legs closed`)
+        else toast.info(`No open position on ${chartSymbol}`)
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : 'Exit failed')
+      }
+    })()
+  }
 
   const offset = meta && cell
     ? Math.round((cell.strike - (type === 'CE' ? meta.ceAtm : meta.peAtm)) / meta.step)
@@ -325,6 +338,7 @@ export function OptionPane({ ws, kind }: { ws: WorkspaceCfg; kind: PaneCfg['key'
         markers={markers}
         onMarkerDrop={onMarkerDrop}
         onMarkerRemove={onMarkerRemove}
+        onExitPosition={onExitPosition}
         settingsKey={`${ws.id}:${kind}`}
         height="h-full"
       />

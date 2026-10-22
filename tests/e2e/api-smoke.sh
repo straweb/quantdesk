@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# ============================================================
+# E2E API smoke test — runs against a LIVE deployment.
+#
+#   bash tests/e2e/api-smoke.sh                 # default http://localhost:3000
+#   BASE=http://localhost:81 bash tests/e2e/api-smoke.sh   # through Caddy
+#
+# Prereqs: Next.js (:3000) + feed (:3004) running, seeded bootstrap
+# (admin/admin123 + demo accounts). Uses jq. Safe to re-run: the trade
+# leg is on the sim feed and is squared off + cancelled at the end.
+# ============================================================
+set -uo pipefail
+
+BASE="${BASE:-http://localhost:3000}"
+FEED="${FEED:-http://localhost:3004}"
+JAR="$(mktemp)"
+PASS=0; FAIL=0
+
+say()  { printf '\n\033[1;36m▸ %s\033[0m\n' "$*"; }
+ok()   { printf '  \033[32m✓ %s\033[0m\n' "$*"; PASS=$((PASS+1)); }
+bad()  { printf '  \033[31m✗ %s\033[0m\n' "$*"; FAIL=$((FAIL+1)); }
+check(){ if [ "$1" = "0" ]; then ok "$2"; else bad "$2"; fi }
+
+# chk <desc> <actual> <jq-filter> <expected>
+chk() {
+  local desc="$1" actual="$2" filter="$3" expected="${4:-}" got
+  got="$(printf '%s' "$actual" | jq -r "$filter" 2>/dev/null)" || { bad "$desc (unparseable JSON)"; return; }
+  if [ "$got" = "$expected" ]; then ok "$desc"; else bad "$desc — expected [$expected] got [$got]"; fi
+}
+
+cleanup() {
+  say "Cleanup (squareoff + cancel-all)"
+  curl -s -b "$JAR" -X POST "$BASE/api/orders/squareoff"  -H 'Content-Type: application/json' -d '{}' >/dev/null
+  curl -s -b "$JAR" -X POST "$BASE/api/orders/cancel-all" -H 'Content-Type: application/json' -d '{}' >/dev/null
+  rm -f "$JAR"
+}
+trap cleanup EXIT
+
+say "1. Infra health"
+H="$(curl -s --max-time 5 "$FEED/health")"
+chk "feed :3004 /health ok"        "$H" '.ok' 'true'
+chk "feed universe >= 400 symbols" "$H" '(.symbols >= 400)' 'true'
+M="$(curl -s --max-time 8 "$BASE/api/auth/me")"
+chk "Next :3000 /api/auth/me alive (user=null, feed key present)" "$M" 'has("user") and has("feed")' 'true'
+
+say "2. Auth"
+R="$(curl -s -c "$JAR" -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin123"}')"
+chk "login admin/admin123"        "$R" '.ok' 'true'
+U="$(curl -s -b "$JAR" "$BASE/api/auth/me")"
+chk "session cookie → user=admin" "$U" '.user' 'admin'
+X="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/accounts")"
+chk "unauthenticated /api/accounts → 401" "$([ "$X" = "401" ] && echo 0 || echo 1)" '0' '0'
+
+say "3. Accounts & capital"
+A="$(curl -s -b "$JAR" "$BASE/api/accounts")"
+chk "demo accounts seeded (>= 6)" "$A" '(.accounts | length >= 6)' 'true'
+chk "every account exposes usable capital (usableCapital)" "$A" '([.accounts[] | has("usableCapital")] | all)' 'true'
+
+say "4. Market data (REST proxies → feed)"
+Q="$(curl -s -b "$JAR" "$BASE/api/market/quote?symbol=NIFTY")"
+chk "quote NIFTY has ltp"     "$Q" '(.ltp | type == "number")' 'true'
+C="$(curl -s -b "$JAR" "$BASE/api/market/candles?symbol=NIFTY&tf=1m&limit=50")"
+chk "candles NIFTY 1m ×50"    "$C" '(.candles | length == 50)' 'true'
+CH="$(curl -s -b "$JAR" "$BASE/api/options/chain?underlying=NIFTY")"
+chk "NIFTY chain: ceAtm/peAtm computed (CE floor / PE ceil)" "$CH" '(.meta.ceAtm > 0 and .meta.peAtm > 0)' 'true'
+chk "NIFTY chain: peAtm = ceAtm + step (spot between strikes)" "$CH" '(.meta.peAtm - .meta.ceAtm == .meta.step)' 'true'
+ATMCE_SYM="$(printf '%s' "$CH" | jq -r '.atmCe.symbol')"
+ATMCE_LTP="$(printf '%s' "$CH" | jq -r '.atmCe.ltp')"
+ok  "ATM CE = $ATMCE_SYM @ ₹$ATMCE_LTP"
+
+say "5. Order lifecycle (sim fan-out → positions → squareoff)"
+# trade an ATM CE option: premium-sized, affordable by every sim account
+# regardless of how far the sim equity prices have drifted from base
+if [ -z "$ATMCE_SYM" ] || [ "$ATMCE_SYM" = "null" ]; then
+  bad "ATM CE symbol missing — cannot run order lifecycle"
+else
+  O="$(curl -s -b "$JAR" -X POST "$BASE/api/orders" -H 'Content-Type: application/json' \
+    -d "{\"symbol\":\"$ATMCE_SYM\",\"exchange\":\"NFO\",\"side\":\"BUY\",\"orderType\":\"MARKET\",\"productType\":\"NRML\",\"qty\":75,\"source\":\"MANUAL\"}")"
+  chk "master order accepted (not FAILED)" "$O" '(.status != "FAILED")' 'true'
+  FILLS="$(printf '%s' "$O" | jq '[.legs[]? | select(.status == "FILLED")] | length')"
+  ok  "filled legs reported: $FILLS"
+  sleep 1
+  P="$(curl -s -b "$JAR" "$BASE/api/positions")"
+  chk "ATM CE position open after buy" "$(printf '%s' "$P" | jq --arg s "$ATMCE_SYM" '[.positions[]? | select(.symbol==$s and (.netQty != 0))] | length > 0')" '.' 'true'
+  S="$(curl -s -b "$JAR" -X POST "$BASE/api/orders/squareoff" -H 'Content-Type: application/json' -d "{\"symbols\":[\"$ATMCE_SYM\"]}")"
+  chk "squareoff accepted" "$S" '.ok' 'true'
+  sleep 2
+  P2="$(curl -s -b "$JAR" "$BASE/api/positions")"
+  chk "ATM CE flat after squareoff" "$(printf '%s' "$P2" | jq --arg s "$ATMCE_SYM" '[.positions[]? | select(.symbol==$s and (.netQty != 0))] | length == 0')" '.' 'true'
+fi
+
+say "6. Stats & automation endpoints"
+ST="$(curl -s -b "$JAR" "$BASE/api/stats/session")"
+chk "session stats has net/winRate"  "$ST" 'has("net")' 'true'
+AU="$(curl -s -b "$JAR" "$BASE/api/autorules")"
+chk "auto-bot rules list reachable"  "$AU" 'has("rules")' 'true'
+GT="$(curl -s -b "$JAR" "$BASE/api/gtt")"
+chk "GTT list reachable"             "$GT" 'has("rules")' 'true'
+TR="$(curl -s -b "$JAR" "$BASE/api/tickrecorder")"
+chk "tick recorder status reachable" "$TR" 'has("sessions")' 'true'
+
+printf '\n\033[1m──────── E2E summary: %d passed, %d failed ────────\033[0m\n' "$PASS" "$FAIL"
+[ "$FAIL" = "0" ]

@@ -57,7 +57,7 @@ import {
 //   LINES      trend · ray · h-ray · h-line · v-line · arrow · pencil(free)
 //   FIB        retracement · extension · trend-based fib time zones ·
 //              fib fan
-//   SHAPES     rectangle · ellipse/circle
+//   SHAPES     rectangle · ellipse · circle
 //   MEASURE    price range · price+date range · forecast (projected Δ)
 //   POSITION   long box · short box · volume profile · buy/sell imbalance
 //   ANNOTATION text · price note · pin · comment (leader+bubble) ·
@@ -157,7 +157,7 @@ export type DrawTool =
   // fib suite
   | 'fib' | 'fibext' | 'fibtz' | 'fan'
   // shapes
-  | 'rect' | 'ellipse'
+  | 'rect' | 'ellipse' | 'circle'
   // measure / forecast
   | 'pricerange' | 'pricedate' | 'forecast'
   // position / data
@@ -212,7 +212,8 @@ const TOOL_META: { id: DrawTool | 'cursor'; label: string; hint: string; group: 
   { id: 'fan', label: 'Fib fan', hint: 'click origin & end — fan rays', group: 'Fib' },
   // shapes
   { id: 'rect', label: 'Rectangle', hint: 'click two corners', group: 'Shapes' },
-  { id: 'ellipse', label: 'Ellipse / circle', hint: 'click two corners', group: 'Shapes' },
+  { id: 'ellipse', label: 'Ellipse', hint: 'click two corners — oval bounding box', group: 'Shapes' },
+  { id: 'circle', label: 'Circle', hint: 'click center, click radius edge — perfect circle', group: 'Shapes' },
   // measure
   { id: 'pricerange', label: 'Price range', hint: 'click start, click end — Δ pts/%', group: 'Measure' },
   { id: 'pricedate', label: 'Price + date range', hint: 'Δ price, %, bars & duration', group: 'Measure' },
@@ -246,7 +247,8 @@ const TOOL_ICONS: Record<string, React.ReactNode> = {
   fibtz: <Hourglass className="h-3.5 w-3.5" />,
   fan: <Sun className="h-3.5 w-3.5" />,
   rect: <Square className="h-3.5 w-3.5" />,
-  ellipse: <Circle className="h-3.5 w-3.5" />,
+  ellipse: <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2"><ellipse cx="12" cy="12" rx="9" ry="6" /></svg>,
+  circle: <Circle className="h-3.5 w-3.5" />,
   pricerange: <Ruler className="h-3.5 w-3.5" />,
   pricedate: <CalendarClock className="h-3.5 w-3.5" />,
   forecast: <MoveUpRight className="h-3.5 w-3.5" />,
@@ -262,7 +264,7 @@ const TOOL_ICONS: Record<string, React.ReactNode> = {
   table: <Table className="h-3.5 w-3.5" />,
   pattern: <Waves className="h-3.5 w-3.5" />,
 }
-const TWO_PT_TOOLS = new Set<DrawTool>(['trend', 'ray', 'hray', 'arrow', 'rect', 'ellipse', 'fib', 'fibext', 'fibtz', 'fan', 'pricerange', 'pricedate', 'forecast', 'vprofile', 'vbs'])
+const TWO_PT_TOOLS = new Set<DrawTool>(['trend', 'ray', 'hray', 'arrow', 'rect', 'ellipse', 'circle', 'fib', 'fibext', 'fibtz', 'fan', 'pricerange', 'pricedate', 'forecast', 'vprofile', 'vbs'])
 const TEXT_TOOLS = new Set<DrawTool>(['text', 'pricenote', 'pin', 'comment', 'callout', 'table'])
 const TOOL_GROUP_ORDER = ['Lines', 'Fib', 'Shapes', 'Measure', 'Position', 'Annotate', 'Pattern']
 /** single-row toolbar icon per draw-tool group */
@@ -720,6 +722,8 @@ interface Props {
   onMarkerDrop?: (kind: 'sl' | 'target', price: number) => void
   /** Remove a draggable marker (double-click its handle). */
   onMarkerRemove?: (kind: 'sl' | 'target') => void
+  /** EXIT button on the entry marker line was clicked (close the position). */
+  onExitPosition?: () => void
   height: string
   mini?: boolean // compact mode: no crosshair, thin axes, no controls
   /** Per-chart identity — settings + drawings persist under this key so
@@ -735,7 +739,7 @@ export function CanvasChart({
   symbol, tf, chartType, showVolume, showSMA20, showSMA50,
   showEMA = false, showVWAP = false, showBOLL = false, showRSI = false, showMACD = false, showADX = false,
   showGhost = false, ghostStyle = 'hollow', ghostTf, scales,
-  markers = [], onPriceClick, onMarkerDrop, onMarkerRemove, height, mini = false, settingsKey, controls,
+  markers = [], onPriceClick, onMarkerDrop, onMarkerRemove, onExitPosition, height, mini = false, settingsKey, controls,
 }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -844,6 +848,8 @@ export function CanvasChart({
   const drawMetaRef = useRef({ yBase: -1, baseline: 0 })
   // live drag of a level marker (sl/target): { id, kind, price }
   const markerDragRef = useRef<{ id: string; kind: 'sl' | 'target'; price: number } | null>(null)
+  // last-drawn EXIT button rect on the entry marker line (canvas hit-test)
+  const exitBtnRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null)
 
   // ---- baseline pick-mode bus (armed from the toolbar SCALES popover) ----
   useEffect(() => {
@@ -1598,40 +1604,109 @@ export function CanvasChart({
       if (vw) drawSeries(vw, 'rgba(77,208,225,0.75)', [5, 3])
 
       // ================= position / level markers =================
-      // entry (open position @ price + PnL) · draggable SL / target lines.
+      // entry (open position) · draggable SL / target lines.
       // A marker being dragged overrides its price from the live drag ref.
-      const markerYs: { m: ChartMarker; y: number }[] = []
+      // Round-10 semantics:
+      //   · right price-scale tag shows ONLY the price VALUE
+      //   · LEFT of the marker line: label @price (+ PnL ₹/% for entry)
+      //   · entry line carries an EXIT button (click = close the position)
+      //   · markers exist ONLY while the position is open (parent filters)
+      // Left chips are laid out in TWO passes: pass 1 computes the desired
+      // (line-anchored) position of every chip, pass 2 resolves collisions —
+      // chips that fall inside the legend/toolbar band or overlap another
+      // chip slide down to the next free slot. Deterministic, no overprint.
+      exitBtnRef.current = null
+      const CH = 15 // chip height
+      const topGuard = 60 // legend rows + DOM toolbar row (empirical: rows can reach ~48px in short panes)
+      if (typeof window !== 'undefined' && !(window as { __chipsV3?: boolean }).__chipsV3) {
+        (window as { __chipsV3?: boolean }).__chipsV3 = true
+        console.log('[chart] chip-layout v3 (two-pass collision resolve)')
+      }
+      interface ChipLayout { m: ChartMarker; y: number; cy: number; leftTxt: string; tw: number; chipW: number; hasExit: boolean; draggable: boolean }
+      const chips: ChipLayout[] = []
       for (const m0 of markers) {
         const m = markerDragRef.current && markerDragRef.current.id === m0.id
           ? { ...m0, price: markerDragRef.current.price }
           : m0
         const y = yOf(m.price)
-        markerYs.push({ m, y })
         if (y < -8 || y > priceH + 8) continue
-        const draggable = !!m.id && (m.kind === 'sl' || m.kind === 'target')
+        const leftTxt = `${m.label} @${m.price.toFixed(2)}${m.sub ? ` ${m.sub}` : ''}`
+        ctx.font = 'bold 9px ui-monospace, monospace'
+        const tw = ctx.measureText(leftTxt).width
+        const hasExit = m.kind === 'entry' && !!onExitPosition
+        chips.push({
+          m, y, cy: y - CH / 2, leftTxt, tw,
+          chipW: tw + (hasExit ? 46 : 10),
+          hasExit, draggable: !!m.id && (m.kind === 'sl' || m.kind === 'target'),
+        })
+      }
+      // resolve chip vertical positions (all anchor at the same left x, so a
+      // vertical overlap check is sufficient)
+      const taken: { y0: number; y1: number }[] = []
+      for (const c of chips) {
+        let cy = c.y - CH / 2
+        if (cy < topGuard) cy = c.y + 3 // below the line (legend band)
+        const clashes = (v: number) => taken.some(t => v < t.y1 + 1 && v + CH > t.y0 - 1)
+        if (cy < topGuard || clashes(cy)) {
+          cy = Math.max(topGuard, cy)
+          while (clashes(cy)) cy += CH + 2
+          if (cy > priceH - CH - 2) {
+            // plot too short for every slot — scan upward from the bottom edge
+            // for a free slot; never send the chip back into the legend band
+            let fy = priceH - CH - 2
+            while (fy > topGuard && clashes(fy)) fy -= CH + 2
+            cy = Math.max(topGuard, fy)
+          }
+        }
+        taken.push({ y0: cy, y1: cy + CH })
+        c.cy = cy
+      }
+      // draw pass
+      for (const c of chips) {
+        const { m, y, cy, leftTxt, tw, chipW } = c
         ctx.setLineDash(m.kind === 'entry' ? [4, 3] : [6, 3])
         ctx.strokeStyle = m.color
-        ctx.lineWidth = draggable ? 1.2 : 1
-        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke()
+        ctx.lineWidth = c.draggable ? 1.2 : 1
+        ctx.beginPath(); ctx.moveTo(colW, y); ctx.lineTo(plotW, y); ctx.stroke()
         ctx.setLineDash([])
         ctx.lineWidth = 1
-        // right axis tag — label + optional second line (PnL / %)
-        const tagH = m.sub ? 22 : 14
+        // right axis tag — price VALUE only (no s-sell / close wording)
         ctx.fillStyle = m.color
-        ctx.fillRect(plotW + 2, y - tagH / 2, axisW - 4, tagH)
+        ctx.fillRect(plotW + 2, y - 8, axisW - 4, 16)
         ctx.fillStyle = '#0b0e11'
         ctx.textAlign = 'center'
         ctx.textBaseline = 'middle'
         ctx.font = 'bold 9px ui-monospace, monospace'
-        ctx.fillText(m.label, plotW + axisW / 2, m.sub ? y - 5 : y)
-        if (m.sub) {
-          ctx.font = '8px ui-monospace, monospace'
-          ctx.fillText(m.sub, plotW + axisW / 2, y + 6)
+        ctx.fillText(m.price.toFixed(2), plotW + axisW / 2, y)
+        // left chip — dark backing + colored border + label (+ EXIT)
+        ctx.fillStyle = 'rgba(11,14,17,0.82)'
+        ctx.fillRect(colW + 4, cy, chipW, CH)
+        ctx.strokeStyle = m.color
+        ctx.globalAlpha = 0.7
+        ctx.strokeRect(colW + 4.5, cy + 0.5, chipW - 1, CH - 1)
+        ctx.globalAlpha = 1
+        ctx.fillStyle = m.color
+        ctx.textAlign = 'left'
+        ctx.fillText(leftTxt, colW + 9, cy + CH / 2 + 0.5)
+        // EXIT button on the entry chip (click = close the position) — one
+        // per chart even when several accounts hold the same symbol
+        if (c.hasExit && !exitBtnRef.current) {
+          const bx = colW + 4 + tw + 12
+          const bw = 34, bh = 13
+          const by = cy + (CH - bh) / 2
+          ctx.fillStyle = '#ff4d5e'
+          ctx.fillRect(bx, by, bw, bh)
+          ctx.fillStyle = '#ffffff'
+          ctx.font = 'bold 8px ui-monospace, monospace'
+          ctx.textAlign = 'center'
+          ctx.fillText('EXIT', bx + bw / 2, by + bh / 2 + 0.5)
+          ctx.font = 'bold 9px ui-monospace, monospace'
+          exitBtnRef.current = { x: bx, y: by, w: bw, h: bh }
         }
         ctx.font = '10px ui-monospace, monospace'
         ctx.textBaseline = 'alphabetic'
         // draggable grip at the left edge (three bars)
-        if (draggable) {
+        if (c.draggable) {
           ctx.fillStyle = m.color
           ctx.globalAlpha = 0.9
           ctx.fillRect(2, y - 5, 9, 2)
@@ -1902,6 +1977,18 @@ export function CanvasChart({
             ctx.globalAlpha = 0.08
             ctx.beginPath()
             ctx.ellipse((x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2, 0, 0, Math.PI * 2)
+            ctx.fill()
+            ctx.globalAlpha = 1
+            ctx.stroke()
+            break
+          }
+          case 'circle': {
+            // P1 = center · radius = |P2 - P1| — stays a perfect circle at
+            // screen scale (radius measured in pixels, not price units)
+            const r = Math.max(3, Math.hypot(X1 - X0, Y1 - Y0))
+            ctx.globalAlpha = 0.08
+            ctx.beginPath()
+            ctx.arc(X0, Y0, r, 0, Math.PI * 2)
             ctx.fill()
             ctx.globalAlpha = 1
             ctx.stroke()
@@ -2496,6 +2583,12 @@ export function CanvasChart({
             || ((Math.abs(x - xa) < 5 || Math.abs(x - xb) < 5) && y >= ya - 4 && y <= yb + 4)
           break
         }
+        case 'circle': {
+          // stroke hit — within 6px of the circle's rim
+          const r = Math.max(3, Math.hypot(X1 - X0, Y1 - Y0))
+          hit = Math.abs(Math.hypot(x - X0, y - Y0) - r) < 6
+          break
+        }
         case 'fib':
         case 'fibext': {
           const xa = Math.min(X0, X1), xb = Math.max(X0, X1)
@@ -2652,6 +2745,15 @@ export function CanvasChart({
     const x = e.clientX - rect.left
     const y = e.clientY - rect.top
     const win = winRef.current
+
+    // ---- EXIT button on the entry marker line — highest priority ----
+    if (exitBtnRef.current && onExitPosition && x <= win.plotW && y <= win.priceH) {
+      const b = exitBtnRef.current
+      if (x >= b.x - 2 && x <= b.x + b.w + 2 && y >= b.y - 2 && y <= b.y + b.h + 2) {
+        onExitPosition()
+        return
+      }
+    }
 
     // ---- draggable level markers (sl/target LINES) — highest priority.
     // The whole line is the handle: any x inside the plot within ±8px of the
@@ -3004,7 +3106,7 @@ export function CanvasChart({
            shows its INFO NOTE; CLICK opens the group flyout (items
            commit on click, flyout stays open until outside click/Esc). ---- */}
       {showControls && (
-        <div className="absolute left-1 top-[30px] z-10 flex items-stretch gap-[3px] max-w-[calc(100%-110px)] overflow-x-auto pb-px">
+        <div className="absolute left-1 top-[30px] z-10 flex items-stretch gap-[3px] max-w-[calc(100%-110px)] overflow-x-auto pl-1.5 pr-4 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden pb-px">
           {/* cursor / select — icon only (round-9: main menu shows icons, hover shows the info note) */}
           <button
             onClick={() => { setToolBoth('cursor'); pendingRef.current = null }}
