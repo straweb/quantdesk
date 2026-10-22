@@ -43,6 +43,9 @@
     "node_modules",
     "scripts/check-export.ts",
     "scripts/check-sync-admin.ts",
-    "scripts/repair-cash.ts"
+    "scripts/repair-cash.ts",
+    "scripts/test-real-sync.ts",
+    "scripts/test-ingest-mem.ts",
+    "scripts/test-publish.ts"
   ]
 }

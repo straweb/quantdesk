@@ -113,6 +113,21 @@ const EMPTY_RESULT_MESSAGES = [
   'no trades available', 'no gtts found', 'no records found', 'data not available',
 ]
 
+/**
+ * True when Breeze rejected the CREDENTIALS (not the request):
+ *   · HTTP 401, or the Breeze envelope Error is "Unauthorized User"
+ *     (expired/dead session — e.g. a new day without a fresh session)
+ *   · "Invalid User Details" (session/appkey mismatch — same remedy)
+ * Callers use this to force a credential reload and tell the user to
+ * re-create the session instead of retrying blindly.
+ */
+export function isAuthError(r: { httpStatus?: number; status?: number; error?: string | null } | null | undefined): boolean {
+  if (!r) return false
+  if (r.httpStatus === 401) return true
+  const e = String(r.error ?? '').toLowerCase()
+  return e.includes('unauthorized user') || e.includes('invalid user details') || e.includes('session expired') || e.includes('session token')
+}
+
 function isEmptyResult(j: { Status?: unknown; Success?: unknown; Error?: unknown } | null): boolean {
   if (!j || j.Success != null) return false
   const err = String(j.Error ?? '').toLowerCase()

@@ -7,7 +7,7 @@ import { spawn } from 'child_process'
 // (used later for paper trading / replay). Node fallback: not supported.
 // @ts-ignore bun runtime builtin
 import { Database } from 'bun:sqlite'
-import { ensureLiveFeed, liveFedSymbols, liveFeedStatus } from './live-broker-feed'
+import { ensureLiveFeed, liveFedSymbols, liveFeedStatus, decryptJson } from './live-broker-feed'
 
 // ============================================================
 // Market Feed Mini-Service (port 3003, bun runtime)
@@ -44,6 +44,9 @@ interface SymbolState {
   bid: number
   ask: number
   lastTickDir: number
+  /** true when the state came from the sim universe (fabricated depth is
+   *  allowed); live-broker states leave this unset — depth is REAL L1 only */
+  simFed?: boolean
 }
 
 interface Candle { t: number; o: number; h: number; l: number; c: number; v: number }
@@ -251,7 +254,7 @@ function pruneTickSessions(keep = 8): void {
     }
     all.sort((a, b) => b.m - a.m)
     for (const old of all.slice(keep)) {
-      try { unlinkSync(old.p); console.log(`arket-feed] pruned old tick session ${old.p}`) } catch { /* in use — next pass */ }
+      try { unlinkSync(old.p); console.log(`[market-feed] pruned old tick session ${old.p}`) } catch { /* in use — next pass */ }
     }
   } catch { /* never break recording over pruning */ }
 }
@@ -519,6 +522,7 @@ function loadUniverse(list: UniverseEntry[]) {
       bid: r2(last * 0.9995),
       ask: r2(last * 1.0005),
       lastTickDir: 1,
+      simFed: true,
     })
   }
 }
@@ -830,12 +834,27 @@ const httpServer = createServer((req, res) => {
     const s = url.searchParams.get('symbol') ?? ''
     const st = S.states.get(s)
     if (!st) return json(404, { error: 'unknown symbol' })
+    if (st.simFed) {
+      // SIM state — fabricated L2 depth is fine (it is a simulation)
+      return json(200, {
+        symbol: s, ltp: st.ltp, prevClose: st.prevClose, open: st.open, high: st.high, low: st.low, vol: st.vol,
+        bid: st.bid, ask: st.ask,
+        depth: {
+          buys: [0, 1, 2, 3, 4].map(i => ({ price: r2(st.bid - i * (st.ltp * 0.0005 + 0.05)), qty: Math.round(50 + Math.random() * 900) })),
+          sells: [0, 1, 2, 3, 4].map(i => ({ price: r2(st.ask + i * (st.ltp * 0.0005 + 0.05)), qty: Math.round(50 + Math.random() * 900) })),
+        },
+        ts: Date.now(),
+      })
+    }
+    // LIVE state — only what the broker actually sent. Level 1 bid/ask are
+    // real; deeper levels stay empty (Breeze/Noren REST quotes don't carry
+    // a full book — fabricating one here would show fake market depth).
     return json(200, {
       symbol: s, ltp: st.ltp, prevClose: st.prevClose, open: st.open, high: st.high, low: st.low, vol: st.vol,
       bid: st.bid, ask: st.ask,
       depth: {
-        buys: [0, 1, 2, 3, 4].map(i => ({ price: r2(st.bid - i * (st.ltp * 0.0005 + 0.05)), qty: Math.round(50 + Math.random() * 900) })),
-        sells: [0, 1, 2, 3, 4].map(i => ({ price: r2(st.ask + i * (st.ltp * 0.0005 + 0.05)), qty: Math.round(50 + Math.random() * 900) })),
+        buys: st.bid > 0 ? [{ price: st.bid, qty: 0 }] : [],
+        sells: st.ask > 0 ? [{ price: st.ask, qty: 0 }] : [],
       },
       ts: Date.now(),
     })
@@ -1348,19 +1367,23 @@ function buildAdminPayload(): SyncCoreRow | null {
   if (!master) return null
 
   const acctRows: SyncCoreRow[] = []
-  const sources: SyncCoreRow[] = [{ id: 'sim', label: 'Sim Feed (built-in)', brokerType: null }]
+  const sources: SyncCoreRow[] = [{ id: 'sim', label: 'Sim Feed (built-in)', brokerType: null, hasSession: false }]
   const logRows: SyncCoreRow[] = []
   try {
     const accounts = master.prepare(`
-      SELECT id, label, brokerType, isActive, isOrderEnabled,
+      SELECT id, label, brokerType, isActive, isOrderEnabled, credentialsEnc,
              (credentialsEnc IS NOT NULL AND credentialsEnc != '') AS hasCreds
       FROM BrokerAccount ORDER BY sortOrder ASC
     `).all() as SyncCoreRow[]
     master.close()
 
     for (const a of accounts) {
-      acctRows.push({ id: a.id, label: a.label, brokerType: a.brokerType, isActive: !!a.isActive, hasCreds: !!a.hasCreds })
-      sources.push({ id: String(a.id), label: String(a.label), brokerType: a.brokerType ?? null })
+      // session presence = LIVE account (vs sandbox) — mirrors the /api/feed
+      // sources so the FEED chip can badge LIVE/SANDBOX over the websocket
+      const creds = decryptJson<{ sessionToken?: string; accessToken?: string; sessionId?: string }>((a as { credentialsEnc?: string }).credentialsEnc ?? null)
+      const hasSession = !!(creds?.sessionToken || creds?.accessToken || creds?.sessionId)
+      acctRows.push({ id: a.id, label: a.label, brokerType: a.brokerType, isActive: !!a.isActive, hasCreds: !!a.hasCreds, hasSession })
+      sources.push({ id: String(a.id), label: String(a.label), brokerType: a.brokerType ?? null, hasSession })
       // per-account broker_logs tail (read-only) — feeds the Logs panel +
       // admin diagnostics without the 2s REST poll
       const bdb = openRO(path.join(FEED_PROJECT_ROOT, 'db', 'brokers', String(a.brokerType).toLowerCase(), `${a.id}.db`))

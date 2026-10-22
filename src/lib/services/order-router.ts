@@ -4,6 +4,7 @@ import { getPositions, getTrades } from '../../../brokers/database'
 import { fetchQuotes } from '../../../brokers/feed-client'
 import { computeUsableCapital, getCapitalState, marginForUnits, onTradeSettled, sizeUnitsForCapital } from './capital-service'
 import { round2 } from '../charges'
+import { optionPremium } from './symbol-service'
 import type { MasterOrderResult, OrderLegResult, PlaceOrderRequest } from '../types'
 
 // ============================================================
@@ -18,6 +19,11 @@ export interface ResolvedInstrument {
   exchange: string
   instrumentType: string
   lotSize: number
+  underlying?: string | null
+  expiry?: string | null
+  strike?: number | null
+  optionType?: string | null
+  basePrice?: number | null
 }
 
 export async function resolveInstrument(symbol: string, exchange?: string): Promise<ResolvedInstrument | null> {
@@ -30,6 +36,11 @@ export async function resolveInstrument(symbol: string, exchange?: string): Prom
     exchange: s.exchange,
     instrumentType: s.instrumentType,
     lotSize: s.lotSize,
+    underlying: s.underlying,
+    expiry: s.expiry,
+    strike: s.strike,
+    optionType: s.optionType,
+    basePrice: s.basePrice,
   }
 }
 
@@ -53,6 +64,39 @@ export async function getExecutableAccounts(onlyIds?: string[]): Promise<{ id: s
   return accounts.map(a => ({ id: a.id, label: a.label, brokerType: a.brokerType, credentialsEnc: a.credentialsEnc }))
 }
 
+/**
+ * Reference price when the feed has NO state for the symbol (never
+ * opened/seeded). Estimates from the underlying's CURRENT price — options
+ * via the same premium model the chain uses, futures from the underlying —
+ * instead of the old ₹1000 placeholder that broke sizing.
+ */
+async function estimatePriceFromMaster(inst: ResolvedInstrument): Promise<number> {
+  const daysTo = (exp: string | null | undefined): number =>
+    Math.max(0, Math.round(((exp ? Date.parse(exp) : 0) - Date.now()) / 86400_000))
+  try {
+    if ((inst.instrumentType === 'CE' || inst.instrumentType === 'PE') && inst.strike) {
+      const und = inst.underlying ?? ''
+      let spot = und ? (await fetchQuotes([und]))[und]?.ltp ?? 0 : 0
+      if (!(spot > 0) && und) {
+        const base = await db.symbolMaster.findFirst({ where: { symbol: und } })
+        spot = base?.basePrice ?? 0
+      }
+      if (!(spot > 0)) return 0
+      return optionPremium(spot, inst.strike, inst.instrumentType as 'CE' | 'PE', daysTo(inst.expiry))
+    }
+    if (inst.instrumentType === 'FUT' && inst.underlying) {
+      const q = await fetchQuotes([inst.underlying])
+      const uLtp = q[inst.underlying]?.ltp ?? 0
+      if (uLtp > 0) return uLtp
+      const base = await db.symbolMaster.findFirst({ where: { symbol: inst.underlying } })
+      return base?.basePrice ?? 0
+    }
+    return inst.basePrice ?? 0
+  } catch {
+    return 0
+  }
+}
+
 export async function placeMasterOrder(req: PlaceOrderRequest): Promise<MasterOrderResult> {
   const masterOrderId = newId('MO-')
   const inst = await resolveInstrument(req.symbol, req.exchange)
@@ -66,7 +110,16 @@ export async function placeMasterOrder(req: PlaceOrderRequest): Promise<MasterOr
   }
 
   const quotes = await fetchQuotes([inst.masterSymbol])
-  const ltp = quotes[inst.masterSymbol]?.ltp ?? 1000
+  let ltp = quotes[inst.masterSymbol]?.ltp ?? 0
+  if (!(ltp > 0)) {
+    // no feed state (symbol never opened/seeded) — NEVER fall back to the old
+    // ₹1000 placeholder (it mispriced options by 10-1000× and made sizing
+    // reject). Estimate from the UNDERLYING's current price instead.
+    ltp = await estimatePriceFromMaster(inst)
+  }
+  if (!(ltp > 0)) {
+    return { masterOrderId, symbol: inst.masterSymbol, exchange: req.exchange, side: req.side, lots: req.qty, status: 'FAILED', legs: [], message: `No price for ${req.symbol} — no live tick and no reference price (open the chain or wait for the feed)` }
+  }
 
   const legs: OrderLegResult[] = []
   let anyFill = false

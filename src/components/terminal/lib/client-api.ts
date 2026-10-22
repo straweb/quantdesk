@@ -200,7 +200,7 @@ export const api = {
   me: () => fetchJson<{ user: string | null; feed: string }>('/api/auth/me'),
 
   feedSource: () =>
-    fetchJson<{ source: string; simDisabled?: boolean; sources: { id: string; label: string; brokerType: string | null }[] }>('/api/feed'),
+    fetchJson<{ source: string; simDisabled?: boolean; sources: { id: string; label: string; brokerType: string | null; hasSession?: boolean }[] }>('/api/feed'),
   feedStatus: () =>
     fetchJson<FeedStatusResp>('/api/feed/status'),
   setFeedSource: (source: string) =>

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireAuth } from '@/lib/api-auth'
-import { getChainMeta, getChainQuotes } from '@/lib/services/option-service'
+import { getChainMeta, getChainQuotes, ensureOptionContracts } from '@/lib/services/option-service'
 
 // GET /api/options/chain?underlying=NIFTY&expiry=...&strikes=24500,24550
 // Returns chain meta (spot, ATM, step, lot, expiries) + per-strike
@@ -21,6 +21,17 @@ export async function GET(req: NextRequest) {
   if (!meta) {
     return NextResponse.json({ error: `No option contracts for ${underlying}` }, { status: 404 })
   }
+
+  // seed the feed states for the ATM rows so the chain/prices/order sizing
+  // work the first time a real (synced) contract is viewed — real masters
+  // carry no basePrice and no state until they are ensured/published
+  try {
+    await Promise.all([
+      ensureOptionContracts(underlying, meta.atm, meta.expiry),
+      ensureOptionContracts(underlying, meta.ceAtm, meta.expiry),
+      ensureOptionContracts(underlying, meta.peAtm, meta.expiry),
+    ])
+  } catch { /* seeding is best-effort */ }
 
   // requested strikes + ATM rows (for the default CE/PE chart panes)
   const want = [...strikes]

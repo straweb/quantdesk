@@ -224,7 +224,15 @@ export async function ensureOptionContracts(underlying: string, strike: number, 
   })
   if (!base && !anyOpt) return { created: 0, symbols: [] }
 
-  const refPrice = base?.basePrice ?? anyOpt?.basePrice ?? 1000
+  // ref price for premium estimates: prefer the underlying's CURRENT feed
+  // LTP (real tick in live mode, sim price in sim mode) — the real synced
+  // masters carry no basePrice, and the old 1000 fallback mispriced ensured
+  // contracts (₹1000 NIFTY premium → absurd margin sizing)
+  let refPrice = base?.basePrice ?? anyOpt?.basePrice ?? 1000
+  try {
+    const spotQ = (await fetchQuotes([underlying]))[underlying]
+    if (spotQ?.ltp && spotQ.ltp > 0) refPrice = spotQ.ltp
+  } catch { /* keep the master/base fallback */ }
   const lotSize = anyOpt?.lotSize ?? base?.lotSize ?? 1
   // default to the earliest LIVE expiry (stale weekly rows accumulate in the
   // master table — never create contracts for an expired series)
@@ -239,18 +247,24 @@ export async function ensureOptionContracts(underlying: string, strike: number, 
   const days = Math.max(0, Math.round((new Date(activeExpiry).getTime() - Date.now()) / 86400000))
   const version = new Date().toISOString().slice(0, 10)
   const created: string[] = []
-  const newUniverse: { symbol: string; basePrice: number; lotSize: number; instrumentType: string }[] = []
+  // every ensured contract goes to the feed universe — REAL synced masters
+  // carry no basePrice and no feed state, so the chain/sizing would fall back
+  // to the ₹1000 placeholder. loadUniverse skips existing states → idempotent.
+  const publishList: { symbol: string; basePrice: number; lotSize: number; instrumentType: string }[] = []
 
   for (const t of ['CE', 'PE'] as const) {
     const symbol = `${underlying}${activeExpiry.replaceAll('-', '')}${strike}${t}`
+    const premium = optionPremium(refPrice, strike, t, days)
     const existing = await db.symbolMaster.findUnique({
       where: { symbol_exchange: { symbol, exchange: 'NFO' } },
     })
     if (existing) {
       created.push(symbol)
+      // existing REAL master — seed the feed state with the premium estimated
+      // from the current spot (real rows have basePrice null)
+      publishList.push({ symbol, basePrice: existing.basePrice ?? premium, lotSize: existing.lotSize || lotSize, instrumentType: t })
       continue
     }
-    const premium = optionPremium(refPrice, strike, t, days)
     const row = await db.symbolMaster.create({
       data: {
         symbol,
@@ -261,7 +275,7 @@ export async function ensureOptionContracts(underlying: string, strike: number, 
       },
     })
     created.push(row.symbol)
-    newUniverse.push({ symbol: row.symbol, basePrice: premium, lotSize, instrumentType: t })
+    publishList.push({ symbol: row.symbol, basePrice: premium, lotSize, instrumentType: t })
 
     for (const bt of BROKER_TYPES as BrokerType[]) {
       const adapter = adapters[bt]
@@ -278,8 +292,8 @@ export async function ensureOptionContracts(underlying: string, strike: number, 
     }
   }
 
-  if (newUniverse.length > 0) {
-    await publishUniverseToFeed(newUniverse)
+  if (publishList.length > 0) {
+    await publishUniverseToFeed(publishList)
   }
   return { created: created.length, symbols: created }
 }

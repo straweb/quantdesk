@@ -167,238 +167,114 @@ export interface SyncResult {
 }
 
 export async function syncMasterContracts(source: 'SEED' | 'DAILY_SYNC' | 'MANUAL' = 'MANUAL'): Promise<SyncResult> {
-  const version = new Date().toISOString().slice(0, 10)
-  // Exchange calendars (verified against the live Dhan/Noren scrip masters,
-  // 2026): NSE F&O weeklies/monthlies expire on TUESDAY, BSE (SENSEX/BANKEX)
-  // on THURSDAY. Keeping these aligned makes the scrip-master token
-  // enrichment (Dhan securityId / Noren tsym) match 1:1.
-  const weekly = nextExpiries(2, 2) // NFO weekly option expiries (Tue)
-  const weeklyBse = nextExpiries(2, 4) // BFO weekly expiries (Thu)
-  const monthly = nextMonthEnds(2, 2) // NFO monthly (Tue)
-  const daysTo = (exp: string) => Math.max(0, Math.round((new Date(exp).getTime() - Date.now()) / 86400000))
+  const version = istToday()
+  try {
+    // ---- REAL master contracts from the brokers' public master files ----
+    // (round-13: the old seeded generator produced 849 demo symbols — the
+    //  universe is now the actual tradable contracts with real strikes,
+    //  expiries, lot sizes and exact broker tokens; no synthetic fallback)
+    const { ingestRealMasters, masterMappingKey } = await import('./real-master-sync')
+    // ONE streaming pass — universe rows + exact broker-token indexes together
+    const { rows, stats, notes, sources, dhanTokens, shoonyaTokens } = await ingestRealMasters()
+    if (rows.length === 0) {
+      throw new Error(`real master sync produced 0 symbols (${notes.join('; ') || 'no notes'}) — master files unreachable or unparseable`)
+    }
 
-  interface Row {
-    symbol: string; name: string; exchange: string; instrumentType: string
-    expiry?: string; strike?: number; optionType?: string; lotSize: number
-    tickSize: number; underlying?: string; basePrice?: number
-  }
-  const rows: Row[] = []
+    // 1. FULL CLEAN REBUILD (SQLite createMany has no skipDuplicates):
+    //    drop every mapping + master, then bulk-insert the real universe.
+    //    Contracts ensured on demand earlier today are recreated by
+    //    ensureOptionContracts the next time a pane needs them.
+    await db.symbolMapping.deleteMany({})
+    await db.symbolMaster.deleteMany({})
 
-  // --- Indices ---
-  for (const i of INDEX_UNIVERSE) {
-    rows.push({ symbol: i.symbol, name: i.name, exchange: 'NSE', instrumentType: 'INDEX', lotSize: 1, tickSize: 0.05, basePrice: i.base })
-  }
-  // --- Equities ---
-  for (const e of EQ_UNIVERSE) {
-    rows.push({ symbol: e.symbol, name: e.name, exchange: 'NSE', instrumentType: 'EQ', lotSize: e.lot, tickSize: 0.05, basePrice: e.base })
-  }
-  // --- Index futures (weekly[0] + monthly) ---
-  const futExpiries = [...new Set([weekly[0], ...monthly])]
-  for (const idx of INDEX_UNIVERSE.slice(0, 2)) {
-    for (const exp of futExpiries) {
-      rows.push({ symbol: `${idx.symbol}${exp.replaceAll('-', '')}FUT`, name: `${idx.symbol} ${exp} Fut`, exchange: 'NFO', instrumentType: 'FUT', expiry: exp, lotSize: idx.symbol === 'NIFTY' ? 75 : 30, tickSize: 0.05, underlying: idx.symbol, basePrice: idx.base })
-    }
-  }
-  // --- Stock futures (monthly[0]) ---
-  for (const e of EQ_UNIVERSE.slice(0, 10)) {
-    rows.push({ symbol: `${e.symbol}${monthly[0].replaceAll('-', '')}FUT`, name: `${e.symbol} ${monthly[0]} Fut`, exchange: 'NFO', instrumentType: 'FUT', expiry: monthly[0], lotSize: e.lot, tickSize: 0.05, underlying: e.symbol, basePrice: e.base })
-  }
-  // --- NIFTY weekly options: 2 expiries, ATM ±10 steps of 50 ---
-  for (const exp of weekly) {
-    const base = INDEX_UNIVERSE[0].base
-    const atm = Math.round(base / 50) * 50
-    for (let k = -10; k <= 10; k++) {
-      const strike = atm + k * 50
-      for (const t of ['CE', 'PE'] as const) {
-        rows.push({
-          symbol: `NIFTY${exp.replaceAll('-', '')}${strike}${t}`,
-          name: `Nifty ${strike} ${t} ${exp}`,
-          exchange: 'NFO', instrumentType: t, expiry: exp, strike, optionType: t,
-          lotSize: 75, tickSize: 0.05, underlying: 'NIFTY',
-          basePrice: optionPremium(base, strike, t, daysTo(exp)),
-        })
-      }
-    }
-  }
-  // --- BANKNIFTY monthly options: ATM ±2000 step 100 ---
-  {
-    const exp = monthly[0]
-    const base = INDEX_UNIVERSE[1].base
-    const atm = Math.round(base / 100) * 100
-    for (let k = -20; k <= 20; k++) {
-      const strike = atm + k * 100
-      for (const t of ['CE', 'PE'] as const) {
-        rows.push({
-          symbol: `BANKNIFTY${exp.replaceAll('-', '')}${strike}${t}`,
-          name: `Bank Nifty ${strike} ${t} ${exp}`,
-          exchange: 'NFO', instrumentType: t, expiry: exp, strike, optionType: t,
-          lotSize: 30, tickSize: 0.05, underlying: 'BANKNIFTY',
-          basePrice: optionPremium(base, strike, t, daysTo(exp)),
-        })
-      }
-    }
-  }
-  // --- Stock options (F&O equities): monthly expiry, ATM ±10, price-based step ---
-  for (const e of EQ_UNIVERSE.slice(0, 10)) {
-    const exp = monthly[0]
-    const step = strikeStepFor(e.base)
-    const atm = Math.round(e.base / step) * step
-    for (let k = -10; k <= 10; k++) {
-      const strike = Number((atm + k * step).toFixed(2))
-      for (const t of ['CE', 'PE'] as const) {
-        rows.push({
-          symbol: `${e.symbol}${exp.replaceAll('-', '')}${strike}${t}`,
-          name: `${e.symbol} ${strike} ${t} ${exp}`,
-          exchange: 'NFO', instrumentType: t, expiry: exp, strike, optionType: t,
-          lotSize: e.lot, tickSize: 0.05, underlying: e.symbol,
-          basePrice: optionPremium(e.base, strike, t, daysTo(exp)),
-        })
-      }
-    }
-  }
-
-  // --- BFO (BSE F&O): BANKEX futures + weekly options (SENSEX lives on NSE rows here) ---
-  {
-    const base = 58000
-    const lot = 15
-    rows.push({ symbol: 'BANKEX', name: 'BSE Bankex Index', exchange: 'BSE', instrumentType: 'INDEX', lotSize: 1, tickSize: 0.05, basePrice: base })
-    for (const exp of weeklyBse) {
-      rows.push({ symbol: `BANKEX${exp.replaceAll('-', '')}FUT`, name: `BANKEX ${exp} Fut`, exchange: 'BFO', instrumentType: 'FUT', expiry: exp, lotSize: lot, tickSize: 0.05, underlying: 'BANKEX', basePrice: base })
-      const atm = Math.round(base / 100) * 100
-      for (let k = -6; k <= 6; k++) {
-        const strike = atm + k * 100
-        for (const t of ['CE', 'PE'] as const) {
-          rows.push({
-            symbol: `BANKEX${exp.replaceAll('-', '')}${strike}${t}`,
-            name: `BANKEX ${strike} ${t} ${exp}`,
-            exchange: 'BFO', instrumentType: t, expiry: exp, strike, optionType: t,
-            lotSize: lot, tickSize: 0.05, underlying: 'BANKEX',
-            basePrice: optionPremium(base, strike, t, daysTo(exp)),
-          })
-        }
-      }
-    }
-  }
-
-  // --- MCX commodities: base + monthly futures + ATM±4 options ---
-  const COMM_UNIVERSE = [
-    { symbol: 'GOLD', name: 'Gold', base: 76500, lot: 100, step: 100 },
-    { symbol: 'SILVER', name: 'Silver', base: 91000, lot: 30, step: 500 },
-    { symbol: 'CRUDEOIL', name: 'Crude Oil', base: 6150, lot: 100, step: 50 },
-    { symbol: 'NATURALGAS', name: 'Natural Gas', base: 245, lot: 1250, step: 5 },
-    { symbol: 'COPPER', name: 'Copper', base: 852, lot: 2500, step: 5 },
-    { symbol: 'ZINC', name: 'Zinc', base: 278, lot: 5000, step: 5 },
-    { symbol: 'ALUMINIUM', name: 'Aluminium', base: 248, lot: 5000, step: 5 },
-  ]
-  for (const c of COMM_UNIVERSE) {
-    rows.push({ symbol: c.symbol, name: c.name, exchange: 'MCX', instrumentType: 'COMM', lotSize: c.lot, tickSize: 0.05, basePrice: c.base })
-    for (const exp of monthly) {
-      rows.push({ symbol: `${c.symbol}${exp.replaceAll('-', '')}FUT`, name: `${c.name} ${exp} Fut`, exchange: 'MCX', instrumentType: 'FUT', expiry: exp, lotSize: c.lot, tickSize: 0.05, underlying: c.symbol, basePrice: c.base })
-    }
-    const exp = monthly[0]
-    const atm = Math.round(c.base / c.step) * c.step
-    for (let k = -4; k <= 4; k++) {
-      const strike = atm + k * c.step
-      for (const t of ['CE', 'PE'] as const) {
-        rows.push({
-          symbol: `${c.symbol}${exp.replaceAll('-', '')}${strike}${t}`,
-          name: `${c.name} ${strike} ${t} ${exp}`,
-          exchange: 'MCX', instrumentType: t, expiry: exp, strike, optionType: t,
-          lotSize: c.lot, tickSize: 0.05, underlying: c.symbol,
-          basePrice: optionPremium(c.base, strike, t, daysTo(exp)),
-        })
-      }
-    }
-  }
-
-  // --- CDS currency derivatives: base + monthly futures ---
-  const CUR_UNIVERSE = [
-    { symbol: 'USDINR', name: 'US Dollar INR', base: 84.35, lot: 1000 },
-    { symbol: 'EURINR', name: 'Euro INR', base: 91.2, lot: 1000 },
-    { symbol: 'GBPINR', name: 'Pound INR', base: 108.4, lot: 1000 },
-    { symbol: 'JPYINR', name: 'Yen INR', base: 56.2, lot: 1000 },
-  ]
-  for (const c of CUR_UNIVERSE) {
-    rows.push({ symbol: c.symbol, name: c.name, exchange: 'CDS', instrumentType: 'CUR', lotSize: c.lot, tickSize: 0.0025, basePrice: c.base })
-    for (const exp of monthly) {
-      rows.push({ symbol: `${c.symbol}${exp.replaceAll('-', '')}FUT`, name: `${c.name} ${exp} Fut`, exchange: 'CDS', instrumentType: 'FUT', expiry: exp, lotSize: c.lot, tickSize: 0.0025, underlying: c.symbol, basePrice: c.base })
-    }
-  }
-
-  // --- upsert master symbols ---
-  let symbolCount = 0
-  for (const r of rows) {
-    await db.symbolMaster.upsert({
-      where: { symbol_exchange: { symbol: r.symbol, exchange: r.exchange } },
-      create: {
+    // 2. bulk-insert the masters
+    for (let i = 0; i < rows.length; i += 2000) {
+      const chunk = rows.slice(i, i + 2000).map(r => ({
         symbol: r.symbol, name: r.name, exchange: r.exchange, instrumentType: r.instrumentType,
-        expiry: r.expiry, strike: r.strike, optionType: r.optionType,
-        lotSize: r.lotSize, tickSize: r.tickSize, underlying: r.underlying,
-        basePrice: r.basePrice, version,
-      },
-      update: {
-        name: r.name, lotSize: r.lotSize, basePrice: r.basePrice,
-        expiry: r.expiry, strike: r.strike, version,
-      },
-    })
-    symbolCount++
-  }
-
-  // --- broker mappings ---
-  const masterRows = await db.symbolMaster.findMany({ where: { version } })
-  let mappedCount = 0
-  for (const m of masterRows) {
-    for (const bt of BROKER_TYPES as BrokerType[]) {
-      const adapter = adapters[bt]
-      if (!adapter) continue
-      const gen = adapter.mapSymbol({
-        symbol: m.symbol, exchange: m.exchange, instrumentType: m.instrumentType,
-        expiry: m.expiry, strike: m.strike, optionType: m.optionType,
-      })
-      await db.symbolMapping.upsert({
-        where: { masterId_brokerType: { masterId: m.id, brokerType: bt } },
-        create: { masterId: m.id, brokerType: bt, brokerSymbol: gen.brokerSymbol, brokerToken: gen.brokerToken },
-        update: { brokerSymbol: gen.brokerSymbol, brokerToken: gen.brokerToken },
-      })
-      mappedCount++
+        expiry: r.expiry ?? null, strike: r.strike ?? null, optionType: r.optionType ?? null,
+        lotSize: r.lotSize, tickSize: r.tickSize, underlying: r.underlying ?? null,
+        basePrice: null as number | null, version,
+      }))
+      await db.symbolMaster.createMany({ data: chunk })
     }
-  }
 
-  // --- publish universe to feed service ---
-  // Publish every LIVE master row (no expiry, or expiry >= IST today) —
-  // not just today's version — so the chain/ATM series selected by
-  // getChainMeta always has feed prices (stale-expired rows stay out).
-  try {
-    const liveRows = await db.symbolMaster.findMany({
-      where: { OR: [{ expiry: null }, { expiry: { gte: istToday() } }] },
-      orderBy: { id: 'asc' },
+    // 3. rebuild the broker mappings with EXACT tokens:
+    //    DHAN securityId (same csv row) · SHOONYA EXCH|tsym (Noren) ·
+    //    ICICI symbolic underlying token · SIMFEED bases only (derivative
+    //    sim mappings are ensured on demand by ensureOptionContracts)
+    const masters = await db.symbolMaster.findMany({
+      select: { id: true, symbol: true, exchange: true, instrumentType: true, underlying: true, expiry: true, strike: true, optionType: true },
     })
-    await publishUniverseToFeed(liveRows)
-  } catch { /* fall back to the version rows below */ }
-  await publishUniverseToFeed(masterRows)
+    const iciciAdapter = adapters['ICICI_BREEZE' as BrokerType]
+    const simAdapter = adapters['SIMFEED' as BrokerType]
+    const dhanRows: { masterId: string; brokerType: string; brokerSymbol: string; brokerToken: string }[] = []
+    const shoonyaRows: typeof dhanRows = []
+    const iciciRows: typeof dhanRows = []
+    const simRows: typeof dhanRows = []
+    for (const m of masters) {
+      const key = masterMappingKey(m)
+      const d = dhanTokens.get(key)
+      if (d) dhanRows.push({ masterId: m.id, brokerType: 'DHAN', brokerSymbol: d.tradingSymbol || d.smstSymbol, brokerToken: d.securityId })
+      const sn = shoonyaTokens.get(key)
+      if (sn) shoonyaRows.push({ masterId: m.id, brokerType: 'SHOONYA', brokerSymbol: sn.tsym, brokerToken: `${sn.exch.toUpperCase()}|${sn.tsym}` })
+      if (iciciAdapter) {
+        const gen = iciciAdapter.mapSymbol({
+          symbol: m.symbol, exchange: m.exchange, instrumentType: m.instrumentType,
+          underlying: m.underlying, expiry: m.expiry, strike: m.strike, optionType: m.optionType,
+        })
+        iciciRows.push({ masterId: m.id, brokerType: 'ICICI_BREEZE', brokerSymbol: gen.brokerSymbol, brokerToken: gen.brokerToken })
+      }
+      if (simAdapter && (m.instrumentType === 'EQ' || m.instrumentType === 'INDEX')) {
+        const gen = simAdapter.mapSymbol({
+          symbol: m.symbol, exchange: m.exchange, instrumentType: m.instrumentType,
+          underlying: m.underlying, expiry: m.expiry, strike: m.strike, optionType: m.optionType,
+        })
+        simRows.push({ masterId: m.id, brokerType: 'SIMFEED', brokerSymbol: gen.brokerSymbol, brokerToken: gen.brokerToken })
+      }
+    }
+    const writeMappings = async (list: typeof dhanRows): Promise<number> => {
+      for (let i = 0; i < list.length; i += 5000) {
+        await db.symbolMapping.createMany({ data: list.slice(i, i + 5000) })
+      }
+      return list.length
+    }
+    // sequential — SQLite has a single writer, parallel createMany locks up
+    const nDhan = await writeMappings(dhanRows)
+    const nShoonya = await writeMappings(shoonyaRows)
+    const nIcici = await writeMappings(iciciRows)
+    const nSim = await writeMappings(simRows)
+    const mappedCount = nDhan + nShoonya + nIcici + nSim
 
-  // --- enrich DHAN/SHOONYA mappings with REAL scrip-master tokens ---
-  // (Dhan securityIds + Noren tsyms from the public master files —
-  //  synthetic tokens cannot query real broker quotes/orders)
-  let enrichNote = ''
-  try {
-    const { enrichBrokerMappings } = await import('./scrip-master')
-    const er = await enrichBrokerMappings()
-    enrichNote = er.notes.length ? ` · ${er.notes.join(' · ')}` : ''
+    // 4. (the exact-key token indexes replace the old fuzzy enrichment pass —
+    //    same files, same keys, no second 26MB re-parse)
+    const enrichNote = ''
+
+    // 5. NO feed-universe publish — the sim universe (db/universe.json) is
+    //    untouched; live feeds resolve mappings per subscribed symbol.
+
+    const statNote = stats.filter(st => st.count > 0).map(st => `${st.label} ${st.count.toLocaleString('en-IN')}`).join(' · ')
+    const mapNote = `mappings — Dhan ${nDhan.toLocaleString('en-IN')} · Shoonya ${nShoonya.toLocaleString('en-IN')} · ICICI ${nIcici.toLocaleString('en-IN')} · SimFeed ${nSim.toLocaleString('en-IN')}`
+    const message = `REAL master contracts (${sources.join(' + ')}) — ${rows.length.toLocaleString('en-IN')} symbols · ${statNote} · ${mapNote}${enrichNote}`
+
+    await db.syncLog.create({
+      data: { source, exchange: 'ALL', symbolCount: rows.length, mappedCount, status: 'SUCCESS', message, version },
+    })
+    await db.systemSetting.upsert({
+      where: { key: 'lastMasterSync' },
+      create: { key: 'lastMasterSync', value: new Date().toISOString() },
+      update: { value: new Date().toISOString() },
+    })
+    console.log(`[symbol-sync] ${message}`)
+    return { symbolCount: rows.length, mappedCount, version }
   } catch (e) {
-    enrichNote = ` · scrip-master enrichment skipped: ${e instanceof Error ? e.message : String(e)}`
+    const msg = e instanceof Error ? e.message : String(e)
+    try {
+      await db.syncLog.create({
+        data: { source, exchange: 'ALL', symbolCount: 0, mappedCount: 0, status: 'FAILED', message: `REAL master sync FAILED — ${msg}` },
+      })
+    } catch { /* logging must never mask the original error */ }
+    throw e
   }
-
-  await db.syncLog.create({
-    data: { source, exchange: 'ALL', symbolCount, mappedCount, status: 'SUCCESS', message: `Synced ${symbolCount} symbols, ${mappedCount} broker mappings${enrichNote}`, version },
-  })
-  await db.systemSetting.upsert({
-    where: { key: 'lastMasterSync' },
-    create: { key: 'lastMasterSync', value: new Date().toISOString() },
-    update: { value: new Date().toISOString() },
-  })
-
-  return { symbolCount, mappedCount, version }
 }
 
 export async function publishUniverseToFeed(masterRows: { symbol: string; basePrice: number | null; lotSize: number; instrumentType: string }[]) {
@@ -409,14 +285,17 @@ export async function publishUniverseToFeed(masterRows: { symbol: string; basePr
       lotSize: m.lotSize,
       instrumentType: m.instrumentType,
     }))
-    await fetch(`${FEED_URL}/universe`, {
+    const res = await fetch(`${FEED_URL}/universe`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ universe }),
       signal: AbortSignal.timeout(3000),
     })
-  } catch {
+    if (!res.ok) console.error(`[symbol-sync] universe publish failed — HTTP ${res.status}`)
+    else console.log(`[symbol-sync] universe published — ${universe.length} symbols (feed states total: ${(await res.json() as { symbols?: number }).symbols ?? '?'})`)
+  } catch (e) {
     // feed service may still be booting — it pulls the universe lazily too
+    console.error('[symbol-sync] universe publish error:', e instanceof Error ? e.message : e)
   }
 }
 

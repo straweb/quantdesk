@@ -3,7 +3,7 @@ import path from 'path'
 import { createDecipheriv, createHash } from 'node:crypto'
 // @ts-ignore bun runtime builtin
 import { Database } from 'bun:sqlite'
-import { breezeRequest, breezeInstrumentParams, parseBreezeQuoteRow, firstSuccess, type BreezeCreds } from '../../brokers/icici_breeze/breeze'
+import { breezeRequest, breezeInstrumentParams, parseBreezeQuoteRow, firstSuccess, isAuthError, type BreezeCreds } from '../../brokers/icici_breeze/breeze'
 
 // ============================================================
 // LIVE BROKER FEED — real market data for live broker accounts.
@@ -40,7 +40,6 @@ export interface LiveFeedCtx {
 }
 
 interface MappingRow { masterSymbol: string; exchange: string; instrumentType: string; lotSize: number; brokerSymbol: string; brokerToken: string }
-
 interface FeedStatus {
   source: string
   brokerType: string | null
@@ -72,6 +71,8 @@ const g = globalThis as unknown as {
     lastVol: Map<string, number>
     inflight: boolean
     simDisabled: boolean
+    authFails: number
+    backoffUntil: number
   }
 }
 
@@ -90,9 +91,15 @@ function st(): NonNullable<typeof g.__liveFeed> {
       lastVol: new Map(),
       inflight: false,
       simDisabled: false,
+      authFails: 0,
+      backoffUntil: 0,
     }
   }
-  return g.__liveFeed
+  const s = g.__liveFeed
+  // hot-reload migration: a pre-existing global state misses the newer fields
+  if (s.authFails == null) s.authFails = 0
+  if (s.backoffUntil == null) s.backoffUntil = 0
+  return s
 }
 
 function dbRoot(): string {
@@ -139,6 +146,8 @@ function decryptJson<T = Record<string, string>>(payload: string | null | undefi
   }
 }
 
+export { decryptJson }
+
 // ---------- master DB access (read-only) ----------
 function openRO(p: string): Database | null {
   try {
@@ -177,32 +186,73 @@ function loadMappings(brokerType: string): void {
 }
 
 // ---------- quote application (mirrors tickOnce candle logic) ----------
-function applyQuote(symbol: string, q: { ltp?: number; bid?: number; ask?: number; open?: number; high?: number; low?: number; prevClose?: number; volume?: number }): boolean {
+/**
+ * Create a REAL market-data state for a symbol that has never been fed
+ * before (live mode opens any of the synced master symbols). The state is
+ * built ONLY from the broker's own quote — no synthetic history, no sim
+ * seed: candles start empty and accumulate from real ticks.
+ */
+function ensureLiveState(symbol: string, m: MappingRow | undefined, q: { ltp: number; bid?: number; ask?: number; open?: number; high?: number; low?: number; prevClose?: number }): boolean {
+  const s = st()
+  const ctx = s.ctx
+  if (!ctx || ctx.S.states.has(symbol)) return true
+  const ltp = ctx.r2(q.ltp)
+  const state = {
+    symbol,
+    instrumentType: m?.instrumentType ?? 'EQ',
+    lotSize: m?.lotSize && m.lotSize > 0 ? m.lotSize : 1,
+    base: ltp,
+    ltp,
+    prevClose: q.prevClose && q.prevClose > 0 ? ctx.r2(q.prevClose) : ltp,
+    open: q.open && q.open > 0 ? ctx.r2(q.open) : ltp,
+    high: q.high && q.high > 0 ? ctx.r2(q.high) : ltp,
+    low: q.low && q.low > 0 ? ctx.r2(q.low) : ltp,
+    vol: 0,
+    vola: 0, // sim walk field — live symbols are never walked (liveFed set)
+    bid: q.bid && q.bid > 0 ? ctx.r2(q.bid) : ltp,
+    ask: q.ask && q.ask > 0 ? ctx.r2(q.ask) : ltp,
+    lastTickDir: 1,
+  }
+  ctx.S.states.set(symbol, state)
+  // empty candle series — real bars appear as real ticks arrive
+  if (!ctx.S.candles.has(`${symbol}|1m`)) ctx.S.candles.set(`${symbol}|1m`, [])
+  pushLog(`live state created for ${symbol} (${state.instrumentType}, lot ${state.lotSize}) from real quote`)
+  return true
+}
+
+function applyQuote(symbol: string, q: { ltp?: number; bid?: number; ask?: number; open?: number; high?: number; low?: number; prevClose?: number; volume?: number }, m?: MappingRow): boolean {
   const s = st()
   const ctx = s.ctx
   if (!ctx) return false
   const state = ctx.S.states.get(symbol)
-  if (!state || !q.ltp || !Number.isFinite(q.ltp) || q.ltp <= 0) return false
+  if (!state) {
+    // unknown symbol (opened from the synced master list) — build the state
+    // from this real quote so the chart/depth/watchlist can go live
+    if (!q.ltp || !Number.isFinite(q.ltp) || q.ltp <= 0) return false
+    ensureLiveState(symbol, m, { ltp: q.ltp, bid: q.bid, ask: q.ask, open: q.open, high: q.high, low: q.low, prevClose: q.prevClose })
+  }
+  const st2 = ctx.S.states.get(symbol)
+  if (!st2 || !q.ltp || !Number.isFinite(q.ltp) || q.ltp <= 0) return false
   const now = Date.now()
   const dv = q.volume != null && Number.isFinite(q.volume)
     ? Math.max(0, Math.round(q.volume) - (s.lastVol.get(symbol) ?? 0))
     : 0
   if (q.volume != null) s.lastVol.set(symbol, Math.round(q.volume))
 
-  state.ltp = ctx.r2(q.ltp)
-  if (q.bid) state.bid = ctx.r2(q.bid)
-  if (q.ask) state.ask = ctx.r2(q.ask)
-  if (q.open) state.open = ctx.r2(q.open)
-  if (q.high) state.high = ctx.r2(q.high)
-  if (q.low) state.low = ctx.r2(q.low)
-  if (q.prevClose) state.prevClose = ctx.r2(q.prevClose)
+  st2.ltp = ctx.r2(q.ltp)
+  if (q.bid) st2.bid = ctx.r2(q.bid)
+  if (q.ask) st2.ask = ctx.r2(q.ask)
+  if (q.open) st2.open = ctx.r2(q.open)
+  if (q.high) st2.high = ctx.r2(q.high)
+  if (q.low) st2.low = ctx.r2(q.low)
+  if (q.prevClose) st2.prevClose = ctx.r2(q.prevClose)
   if (q.high && q.low) { /* broker OHLC wins over per-tick high/low */ }
   else {
-    state.high = Math.max(state.high, state.ltp)
-    state.low = Math.min(state.low, state.ltp)
+    st2.high = Math.max(st2.high, st2.ltp)
+    st2.low = Math.min(st2.low, st2.ltp)
   }
-  if (dv > 0) state.vol += dv
-  state.lastTickDir = 1
+  if (dv > 0) st2.vol += dv
+  st2.lastTickDir = 1
 
   // 1m candle + higher-tf tail (same as the sim tick path)
   const key = `${symbol}|1m`
@@ -211,7 +261,7 @@ function applyQuote(symbol: string, q: { ltp?: number; bid?: number; ask?: numbe
     const bs = ctx.bucketStart(now, '1m')
     let cur = bars[bars.length - 1]
     if (!cur || cur.t !== bs) {
-      cur = { t: bs, o: state.ltp, h: state.ltp, l: state.ltp, c: state.ltp, v: dv }
+      cur = { t: bs, o: st2.ltp, h: st2.ltp, l: st2.ltp, c: st2.ltp, v: dv }
       bars.push(cur)
       for (const tf of Object.keys(TF_MS)) {
         if (tf === '1m') continue
@@ -221,17 +271,17 @@ function applyQuote(symbol: string, q: { ltp?: number; bid?: number; ask?: numbe
           const b2 = ctx.bucketStart(now, tf)
           const last2 = series[series.length - 1]
           if (last2 && last2.t === b2) {
-            last2.h = Math.max(last2.h, state.ltp)
-            last2.l = Math.min(last2.l, state.ltp)
-            last2.c = state.ltp
+            last2.h = Math.max(last2.h, st2.ltp)
+            last2.l = Math.min(last2.l, st2.ltp)
+            last2.c = st2.ltp
             last2.v += dv
-          } else series.push({ t: b2, o: state.ltp, h: state.ltp, l: state.ltp, c: state.ltp, v: dv })
+          } else series.push({ t: b2, o: st2.ltp, h: st2.ltp, l: st2.ltp, c: st2.ltp, v: dv })
         }
       }
     } else {
-      cur.h = Math.max(cur.h, state.ltp)
-      cur.l = Math.min(cur.l, state.ltp)
-      cur.c = state.ltp
+      cur.h = Math.max(cur.h, st2.ltp)
+      cur.l = Math.min(cur.l, st2.ltp)
+      cur.c = st2.ltp
       cur.v += dv
     }
   }
@@ -244,6 +294,34 @@ function applyQuote(symbol: string, q: { ltp?: number; bid?: number; ask?: numbe
 // ---------- per-broker quote fetchers ----------
 function withTimeout(ms: number): AbortSignal {
   return AbortSignal.timeout(ms)
+}
+
+// ---------- auth-failure handling (shared by all fetchers) ----------
+/**
+ * The broker rejected the CREDENTIALS (dead/expired session). Unlike a
+ * network hiccup this needs user action: force a credential reload from the
+ * DB every cycle (a freshly created Admin session is picked up within 1s),
+ * surface the exact remedy, and back off so we never hammer the broker.
+ */
+function noteAuthFailure(broker: string, detail: string): void {
+  const s = st()
+  s.authFails++
+  s.credsTs = 0
+  s.status.lastError = `SESSION REJECTED by ${broker} (${detail}) — re-create it in Admin → Session (credentials re-read every cycle)`
+  s.status.errorTs = Date.now()
+  if (s.authFails >= 6) {
+    s.backoffUntil = Date.now() + 30_000
+    s.authFails = 0
+    pushLog(`auth rejected repeatedly — pausing live polling for 30s (create a fresh session in Admin → Session)`, 'WARN')
+  } else {
+    pushLog(`${broker} rejected the session (${detail}) — reloading credentials from DB; if this repeats, re-create the session in Admin → Session`, 'WARN')
+  }
+}
+
+function noteAuthOk(): void {
+  const s = st()
+  s.authFails = 0
+  s.backoffUntil = 0
 }
 
 async function fetchDhan(accountId: string, creds: Record<string, string>, targets: MappingRow[]): Promise<void> {
@@ -280,9 +358,14 @@ async function fetchDhan(accountId: string, creds: Record<string, string>, targe
   const body = await res.json().catch(() => null) as { data?: Record<string, Record<string, Record<string, unknown>>>; errorMessage?: string } | null
   if (!res.ok) {
     s.status.errors++
-    s.status.lastError = `Dhan quote HTTP ${res.status}${body?.errorMessage ? ` — ${body.errorMessage}` : ''}`
-    s.status.errorTs = Date.now()
-    pushLog(`dhan quote ${res.status} (${Date.now() - started}ms) — ${s.status.lastError}`, 'WARN')
+    const msg = `Dhan quote HTTP ${res.status}${body?.errorMessage ? ` — ${body.errorMessage}` : ''}`
+    if (res.status === 401 || res.status === 403 || /auth|token|access/i.test(body?.errorMessage ?? '')) {
+      noteAuthFailure('Dhan', body?.errorMessage ?? `HTTP ${res.status}`)
+    } else {
+      s.status.lastError = msg
+      s.status.errorTs = Date.now()
+      pushLog(`dhan quote ${res.status} (${Date.now() - started}ms) — ${msg}`, 'WARN')
+    }
     return
   }
   let n = 0
@@ -299,7 +382,7 @@ async function fetchDhan(accountId: string, creds: Record<string, string>, targe
         ask: num(depth.sell?.[0]?.price),
         open: num(ohlc.open), high: num(ohlc.high), low: num(ohlc.low), prevClose: num(ohlc.close),
         volume: num(q.volume),
-      })) n++
+      }, t)) n++
     }
   }
   s.status.polls++
@@ -340,8 +423,10 @@ async function fetchShoonya(accountId: string, creds: Record<string, string>, ta
       })
       const q = await res.json().catch(() => null) as Record<string, unknown> | { emsg?: string } | null
       if (!res.ok || !q || 'emsg' in q) {
-        lastErr = `GetQuote ${res.status} ${(q as { emsg?: string })?.emsg ?? ''}`.trim()
+        const emsg = (q as { emsg?: string })?.emsg ?? ''
+        lastErr = `GetQuote ${res.status} ${emsg}`.trim()
         s.status.errors++
+        if (/session|not authorized|invalid.*token|no session/i.test(emsg)) noteAuthFailure('Shoonya', emsg || `HTTP ${res.status}`)
         continue
       }
       const qr = q as Record<string, unknown>
@@ -350,7 +435,7 @@ async function fetchShoonya(accountId: string, creds: Record<string, string>, ta
         ltp: num(qr.lp), bid: num(qr.bp1), ask: num(qr.sp1),
         open: num(qr.o), high: num(qr.h), low: num(qr.l), prevClose: num(qr.c),
         volume: num(qr.v) ?? num(qr.volume),
-      })) n++
+      }, t)) n++
     } catch (e) {
       lastErr = e instanceof Error ? e.message : String(e)
       s.status.errors++
@@ -397,8 +482,15 @@ async function fetchIcici(accountId: string, creds: Record<string, string>, targ
       )
       const row = firstSuccess(res)
       if (res.status !== 200 || !row) {
-        lastErr = `quotes ${res.httpStatus || res.status} ${res.error ?? ''}`.trim()
         s.status.errors++
+        // dead/expired session ("Unauthorized User" / "Invalid User Details" /
+        // HTTP 401) — force a credential reload + back off, never hammer Breeze
+        if (isAuthError(res)) {
+          noteAuthFailure('ICICI Breeze', res.error ?? `HTTP ${res.httpStatus}`)
+          lastErr = null // noteAuthFailure owns the status message — don't clobber it below
+        } else {
+          lastErr = `quotes ${res.httpStatus || res.status} ${res.error ?? ''}`.trim()
+        }
         continue
       }
       const q = parseBreezeQuoteRow(row)
@@ -406,7 +498,7 @@ async function fetchIcici(accountId: string, creds: Record<string, string>, targ
         ltp: q.ltp, bid: q.bid, ask: q.ask,
         open: q.open, high: q.high, low: q.low, prevClose: q.prevClose,
         volume: q.volume,
-      })) n++
+      }, t)) n++
     } catch (e) {
       lastErr = e instanceof Error ? e.message : String(e)
       s.status.errors++
@@ -430,6 +522,13 @@ async function cycle(): Promise<void> {
   if (!ctx || s.inflight) return
   s.inflight = true
   try {
+    // auth backoff — the broker rejected the session repeatedly; pause instead
+    // of hammering (a fresh Admin session is picked up right after the pause)
+    if (Date.now() < s.backoffUntil) {
+      s.status.lastError = `auth rejected — backing off ${Math.ceil((s.backoffUntil - Date.now()) / 1000)}s (re-create the session in Admin → Session)`
+      return
+    }
+
     // active source + global sim switch (file is the shared source of truth)
     let source = 'sim'
     let simDisabled = false
@@ -495,14 +594,19 @@ async function cycle(): Promise<void> {
       } finally { master.close() }
     }
 
-    // refresh creds + mappings periodically
+    // refresh creds + mappings periodically (credsTs=0 forces an immediate
+    // reload — set by noteAuthFailure when the broker rejects the session)
     if (Date.now() - s.credsTs > 60_000) {
+      const prevJson = s.creds ? JSON.stringify(s.creds) : ''
       s.creds = loadCreds(s.brokerType, s.accountId)
       s.credsTs = Date.now()
-      if (!s.creds) pushLog(`no decrypted credentials for ${s.brokerType} — create the session in Admin`, 'WARN')
-      else {
-        const hasSession = !!(s.creds.sessionToken || s.creds.accessToken || s.creds.sessionId)
-        pushLog(`credentials loaded (${s.brokerType}) — session ${hasSession ? 'present' : 'MISSING'}`, hasSession ? 'INFO' : 'WARN')
+      const newJson = s.creds ? JSON.stringify(s.creds) : ''
+      if (newJson !== prevJson) {
+        if (!s.creds) pushLog(`no decrypted credentials for ${s.brokerType} — create the session in Admin`, 'WARN')
+        else {
+          const hasSession = !!(s.creds.sessionToken || s.creds.accessToken || s.creds.sessionId)
+          pushLog(`credentials loaded (${s.brokerType}) — session ${hasSession ? 'present' : 'MISSING'}`, hasSession ? 'INFO' : 'WARN')
+        }
       }
     }
     if (Date.now() - s.mappingsTs > 120_000) loadMappings(s.brokerType)
@@ -530,6 +634,8 @@ async function cycle(): Promise<void> {
     else if (s.brokerType === 'SHOONYA') await fetchShoonya(s.accountId, creds, targets)
     else if (s.brokerType === 'ICICI_BREEZE') await fetchIcici(s.accountId, creds, targets)
     else { s.status.lastError = `broker ${s.brokerType} has no live feed adapter`; s.status.errorTs = Date.now() }
+    // any applied quote clears the auth-failure state
+    if (s.status.symbols > 0) noteAuthOk()
   } catch (e) {
     s.status.errors++
     s.status.lastError = e instanceof Error ? e.message : String(e)

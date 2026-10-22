@@ -214,8 +214,8 @@ export interface SyncAdmin {
     symbols: number; polls: number; errors: number; startedAt: number
     log: string[]; sessionPresent: boolean; sourceIsLive: boolean; fresh: boolean
   }
-  feedSource: { source: string; simDisabled?: boolean; sources: { id: string; label: string; brokerType: string | null }[] }
-  accountsMeta: { id: string; label: string; brokerType: string; isActive: boolean; hasCreds: boolean }[]
+  feedSource: { source: string; simDisabled?: boolean; sources: { id: string; label: string; brokerType: string | null; hasSession?: boolean }[] }
+  accountsMeta: { id: string; label: string; brokerType: string; isActive: boolean; hasCreds: boolean; hasSession?: boolean }[]
   brokerLogs: SyncAdminLogRow[]
   audit: { id: string; ts: string; source: string; action: string; masterSymbol: string; side: string; qty: number; status: string; message: string | null }[]
   copyTrade: {

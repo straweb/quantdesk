@@ -8,7 +8,7 @@ import { logBroker } from '../database'
 import { num, normalizeStatus } from '../live-api'
 import { isSimDisabled } from '../sim-mode'
 import {
-  breezeRequest, breezeInstrumentParams, parseBreezeQuoteRow, firstSuccess, successList,
+  breezeRequest, breezeInstrumentParams, parseBreezeQuoteRow, firstSuccess, successList, isAuthError,
   type BreezeCreds, type BreezeRes,
 } from './breeze'
 
@@ -108,14 +108,18 @@ const breezeAdapter: BrokerAdapter = {
   isLiveCapable: () => true,
 
   mapSymbol(master) {
-    // brokerToken = stock|expiry(YYYY-MM-DD)|strike|CE/PE — breezeInstrumentParams
+    // brokerToken = STOCK|expiry(YYYY-MM-DD)|strike|CE/PE — breezeInstrumentParams
     // expands it per call (ISO expiry, call/put, strike rounding).
+    // STOCK must be the Breeze stock_code = the UNDERLYING (NIFTY, RELIANCE),
+    // NOT the option/future ticker — master.symbol for real NSE masters is
+    // e.g. "NIFTY2026102725500CE" which Breeze does not accept as stock_code.
     const exp = (master.expiry ?? '').slice(0, 10)
+    const stock = (master.underlying?.trim() || master.symbol).toUpperCase()
     let brokerSymbol = master.symbol
-    if (master.instrumentType === 'FUT') brokerSymbol = `${master.symbol}-FUT`
+    if (master.instrumentType === 'FUT') brokerSymbol = `${stock}-FUT`
     else if (master.instrumentType === 'CE' || master.instrumentType === 'PE')
-      brokerSymbol = `${master.symbol}-${master.strike}-${master.optionType}`
-    return { brokerSymbol, brokerToken: `${master.symbol}|${exp ?? ''}|${master.strike ?? ''}|${master.optionType ?? ''}` }
+      brokerSymbol = `${stock}-${master.strike}-${master.optionType}`
+    return { brokerSymbol, brokerToken: `${stock}|${exp ?? ''}|${master.strike ?? ''}|${master.optionType ?? ''}` }
   },
 
   modeLabel(creds) {
@@ -281,6 +285,12 @@ const breezeAdapter: BrokerAdapter = {
       creds2breeze(ctx.credentials), 'GET', 'funds', {},
       { timeoutMs: 10_000, log: loggerFor(ctx, 'funds') },
     )
+    if (isAuthError(res)) {
+      // "Unauthorized User" / "Invalid User Details" — the session is dead
+      // (Breeze sessions expire daily). Say exactly what to do, never ₹0.
+      logBroker('ICICI_BREEZE', ctx.accountId, `funds rejected — session expired/invalid (${res.error ?? 'unauthorized'}); re-create the session in Admin → Session`, 'ERROR')
+      return { cash: 0, error: `ICICI session expired/invalid (broker said: ${res.error ?? 'Unauthorized User'}) — re-create the session in Admin → Session` }
+    }
     const s = firstSuccess(res)
     if (!s) return { cash: 0, error: res.error ?? `funds API returned no data (HTTP ${res.httpStatus})` }
     const f = (k: string): number => {
@@ -344,9 +354,9 @@ const breezeAdapter: BrokerAdapter = {
 
   async getQuote(ctx, token) {
     if (!ctx.credentials?.sessionToken) return { symbol: token, ltp: 0 }
-    // token = stock|expiry(YYYY-MM-DD)|strike|CE-PE (see mapSymbol)
+    // token = UNDERLYING|expiry(YYYY-MM-DD)|strike|CE-PE (see mapSymbol)
     const [stock, expiry, strike, right] = token.split('|')
-    const row = firstSuccess(await breezeRequest<Record<string, unknown>>(
+    const res = await breezeRequest<Record<string, unknown>>(
       creds2breeze(ctx.credentials!), 'GET', 'quotes',
       breezeInstrumentParams({
         symbol: stock || ctx.symbolMap.masterSymbol,
@@ -357,7 +367,12 @@ const breezeAdapter: BrokerAdapter = {
         optionType: right || ctx.symbolMap.instrumentType,
       }),
       { timeoutMs: 6000, log: loggerFor(ctx, 'quote') },
-    ) as BreezeRes<Record<string, unknown>>)
+    ) as BreezeRes<Record<string, unknown>>
+    if (isAuthError(res)) {
+      logBroker('ICICI_BREEZE', ctx.accountId, `quote rejected — session expired/invalid (${res.error ?? 'unauthorized'})`, 'WARN')
+      return { symbol: token, ltp: 0, error: `session expired — re-create it in Admin → Session` }
+    }
+    const row = firstSuccess(res)
     if (!row) return { symbol: token, ltp: 0 }
     const q = parseBreezeQuoteRow(row)
     return { symbol: token, ...q }

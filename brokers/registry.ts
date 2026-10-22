@@ -125,7 +125,7 @@ export interface BrokerAdapter {
   /** True when the adapter can reach its real REST endpoints; false => sandbox execution */
   isLiveCapable(): boolean
   /** Resolve broker-specific symbol/token from canonical master info (called at sync time) */
-  mapSymbol(master: { symbol: string; exchange: string; instrumentType: string; expiry?: string | null; strike?: number | null; optionType?: string | null }): { brokerSymbol: string; brokerToken: string }
+  mapSymbol(master: { symbol: string; exchange: string; instrumentType: string; underlying?: string | null; expiry?: string | null; strike?: number | null; optionType?: string | null }): { brokerSymbol: string; brokerToken: string }
   placeOrder(ctx: LegContext): Promise<OrderLegResult>
   cancelOrder(ctx: LegContext, brokerOrderId: string): Promise<{ ok: boolean; message?: string }>
   /** Human readable name of the mode the adapter will operate in */

@@ -27,13 +27,14 @@ import { db } from '../db'
 const MASTERS_DIR = path.join(process.cwd(), 'db', 'masters')
 const TTL_MS = 12 * 3600_000
 
-interface DhanRow {
+export interface DhanRow {
   exch: string; segment: string; securityId: string; smstSymbol: string
   tradingSymbol: string; expiry: string; strike: string; optionType: string
   instrument: string; series: string; lotUnits: string
+  tickSize?: string; name?: string
 }
 
-interface ShoonyaRow {
+export interface ShoonyaRow {
   exch: string; token: string; lotSize: string; symbol: string
   tradingSymbol: string; expiry: string; instrument: string
   optionType: string; strike: string; tickSize: string
@@ -117,7 +118,7 @@ async function fetchCached(url: string, file: string, maxAgeMs = TTL_MS): Promis
 }
 
 // ---------------- normalizers ----------------
-function isoExpiry(raw: string): string {
+export function isoExpiry(raw: string): string {
   const s = (raw ?? '').trim()
   if (!s) return ''
   // "2026-10-29"
@@ -136,18 +137,20 @@ function isoExpiry(raw: string): string {
   return ''
 }
 
-function normStrike(raw: string): string {
+export function normStrike(raw: string): string {
   const n = Number(raw)
   if (!Number.isFinite(n) || n === 0) return ''
   return Number.isInteger(n) ? String(n) : String(n)
 }
 
-function squash(s: string): string {
+export function squash(s: string): string {
   return (s ?? '').replace(/[\s_\-]/g, '').toUpperCase()
 }
 
+export { fetchCached }
+
 // ---------------- minimal CSV line parser (quoted fields) ----------------
-function parseCsvLine(line: string): string[] {
+export function parseCsvLine(line: string): string[] {
   const out: string[] = []
   let cur = ''
   let inQ = false
@@ -174,6 +177,29 @@ function parseCsvLine(line: string): string[] {
 //   "NIFTY-29Oct2026-25500-CE" (weekly opt) · "BANKNIFTY-Dec2026-69400-CE"
 //   (monthly opt) · "SENSEX-Nov2026-FUT" (fut)
 export async function loadDhanIndex(): Promise<Map<string, DhanRow[]> | null> {
+  const rows = await loadDhanRows()
+  if (!rows) return null
+  const idx = new Map<string, DhanRow[]>()
+  const addKey = (k: string, row: DhanRow) => {
+    if (!k) return
+    const arr = idx.get(k) ?? []
+    arr.push(row)
+    idx.set(k, arr)
+  }
+  for (const row of rows) {
+    addKey(squash(row.tradingSymbol), row)
+    // derivative rows are additionally indexed under their UNDERLYING so a
+    // NIFTY lookup finds "NIFTY-29Oct2026-25500-CE"-style trading symbols
+    const parts = row.tradingSymbol.split('-')
+    if (row.instrument.startsWith('OPT') && parts.length >= 4) addKey(squash(parts.slice(0, -3).join('-')), row)
+    else if (row.instrument.startsWith('FUT') && parts.length >= 3) addKey(squash(parts.slice(0, -2).join('-')), row)
+  }
+  return idx
+}
+
+/** EVERY parsed Dhan master row (flat) — used by the real master sync.
+ *  Null when the CSV cannot be downloaded/parsed (no fake data fallback). */
+export async function loadDhanRows(): Promise<DhanRow[] | null> {
   const csv = await fetchCached('https://images.dhan.co/api-data/api-scrip-master.csv', 'dhan-scrip-master.csv')
   if (!csv) return null
   const lines = csv.split('\n')
@@ -183,34 +209,25 @@ export async function loadDhanIndex(): Promise<Map<string, DhanRow[]> | null> {
   const iExch = col('SEM_EXM_EXCH_ID'), iSeg = col('SEM_SEGMENT'), iSec = col('SEM_SMST_SECURITY_ID')
   const iCustom = col('SEM_CUSTOM_SYMBOL'), iExp = col('SEM_EXPIRY_DATE'), iStrike = col('SEM_STRIKE_PRICE')
   const iOpt = col('SEM_OPTION_TYPE'), iInst = col('SEM_INSTRUMENT_NAME'), iTrade = col('SEM_TRADING_SYMBOL')
-  const iSeries = col('SEM_SERIES'), iLot = col('SEM_LOT_UNITS')
+  const iSeries = col('SEM_SERIES'), iLot = col('SEM_LOT_UNITS'), iTick = col('SEM_TICK_SIZE')
+  const iName = col('SM_SYMBOL_NAME')
   if (iSec < 0 || iTrade < 0) { console.error('[scrip-master] dhan csv: SEM columns not found'); return null }
-  const idx = new Map<string, DhanRow[]>()
-  const addKey = (k: string, row: DhanRow) => {
-    if (!k) return
-    const arr = idx.get(k) ?? []
-    arr.push(row)
-    idx.set(k, arr)
-  }
+  const out: DhanRow[] = []
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i]
     if (!line || line.length < 10) continue
     const c = parseCsvLine(line)
-    const row: DhanRow = {
+    const row: DhanRow & { tickSize?: string; name?: string } = {
       exch: c[iExch] ?? '', segment: c[iSeg] ?? '', securityId: c[iSec] ?? '', smstSymbol: c[iCustom] ?? '',
       tradingSymbol: c[iTrade] ?? '', expiry: isoExpiry(c[iExp] ?? ''), strike: normStrike(c[iStrike] ?? ''),
       optionType: (c[iOpt] ?? '').trim().toUpperCase(), instrument: (c[iInst] ?? '').trim().toUpperCase(),
       series: c[iSeries] ?? '', lotUnits: c[iLot] ?? '',
+      tickSize: iTick >= 0 ? (c[iTick] ?? '').trim() : '', name: iName >= 0 ? (c[iName] ?? '').trim() : '',
     }
     if (!row.securityId) continue
-    addKey(squash(row.tradingSymbol), row)
-    // derivative rows are additionally indexed under their UNDERLYING so a
-    // NIFTY lookup finds "NIFTY-29Oct2026-25500-CE"-style trading symbols
-    const parts = row.tradingSymbol.split('-')
-    if (row.instrument.startsWith('OPT') && parts.length >= 4) addKey(squash(parts.slice(0, -3).join('-')), row)
-    else if (row.instrument.startsWith('FUT') && parts.length >= 3) addKey(squash(parts.slice(0, -2).join('-')), row)
+    out.push(row)
   }
-  return idx
+  return out
 }
 
 export function pickDhan(
@@ -278,47 +295,63 @@ const SHOONYA_FILES: [string, string][] = [
 ]
 
 export async function loadShoonyaIndex(): Promise<Map<string, ShoonyaRow[]> | null> {
+  const rows = await loadShoonyaRows()
+  if (!rows) return null
   const idx = new Map<string, ShoonyaRow[]>()
-  // parallel downloads — first sync pulls all six zips at once (cached 12h after)
-  const results = await Promise.all(SHOONYA_FILES.map(async ([exch, file]) => ({ exch, txt: await fetchCached(`https://api.shoonya.com/${exch}_symbols.txt.zip`, file) })))
-  let any = false
   const addKey = (k: string, row: ShoonyaRow) => {
     if (!k) return
     const arr = idx.get(k) ?? []
     arr.push(row)
     idx.set(k, arr)
   }
+  for (const row of rows) {
+    addKey(squash(row.tradingSymbol), row)
+    if (row.symbol) addKey(squash(row.symbol), row)
+  }
+  return idx
+}
+
+/** EVERY parsed Noren master row (flat) — used by the real master sync.
+ *  Null when none of the six files can be downloaded/parsed. */
+export async function loadShoonyaRows(): Promise<ShoonyaRow[] | null> {
+  // parallel downloads — first sync pulls all six zips at once (cached 12h after)
+  const results = await Promise.all(SHOONYA_FILES.map(async ([exch, file]) => ({ exch, txt: await fetchCached(`https://api.shoonya.com/${exch}_symbols.txt.zip`, file) })))
+  const out: ShoonyaRow[] = []
   for (const { exch, txt } of results) {
     if (!txt) continue
-    any = true
-    const lines = txt.split('\n')
-    // header-driven columns — the layout differs per exchange file
-    // (NSE lacks Expiry/Strike; MCX inserts a GNGD column after LotSize)
-    const header = lines[0].trim().replace(/,+$/, '').split(',').map(h => h.trim().toUpperCase())
-    if (!header.includes('EXCHANGE')) continue
-    const ci = (name: string): number => header.indexOf(name)
-    const cExch = ci('EXCHANGE'), cTok = ci('TOKEN'), cLot = ci('LOTSIZE'), cSym = ci('SYMBOL')
-    const cTrade = ci('TRADINGSYMBOL'), cExp = ci('EXPIRY'), cInst = ci('INSTRUMENT')
-    const cOpt = ci('OPTIONTYPE'), cStrike = ci('STRIKEPRICE'), cTick = ci('TICKSIZE')
-    for (let i = 1; i < lines.length; i++) {
-      const line = lines[i].trim()
-      if (!line) continue
-      const c = line.replace(/,+$/, '').split(',')
-      if (c.length < 5) continue
-      const row: ShoonyaRow = {
-        exch: (c[cExch] ?? exch).trim(), token: (c[cTok] ?? '').trim(), lotSize: (c[cLot] ?? '').trim(),
-        symbol: (c[cSym] ?? '').trim(), tradingSymbol: (c[cTrade] ?? '').trim(),
-        expiry: isoExpiry(cExp >= 0 ? (c[cExp] ?? '') : ''), instrument: cInst >= 0 ? (c[cInst] ?? '').trim().toUpperCase() : '',
-        optionType: cOpt >= 0 ? (c[cOpt] ?? '').trim().toUpperCase() : '',
-        strike: cStrike >= 0 ? normStrike(c[cStrike] ?? '') : '',
-        tickSize: cTick >= 0 ? (c[cTick] ?? '').trim() : '',
-      }
-      if (!row.tradingSymbol) continue
-      addKey(squash(row.tradingSymbol), row)
-      if (row.symbol) addKey(squash(row.symbol), row)
-    }
+    out.push(...parseShoonyaText(txt, exch))
   }
-  return any ? idx : null
+  return out.length > 0 ? out : null
+}
+
+function parseShoonyaText(txt: string, fallbackExch: string): ShoonyaRow[] {
+  const out: ShoonyaRow[] = []
+  const lines = txt.split('\n')
+  // header-driven columns — the layout differs per exchange file
+  // (NSE lacks Expiry/Strike; MCX inserts a GNGD column after LotSize)
+  const header = lines[0].trim().replace(/,+$/, '').split(',').map(h => h.trim().toUpperCase())
+  if (!header.includes('EXCHANGE')) return out
+  const ci = (name: string): number => header.indexOf(name)
+  const cExch = ci('EXCHANGE'), cTok = ci('TOKEN'), cLot = ci('LOTSIZE'), cSym = ci('SYMBOL')
+  const cTrade = ci('TRADINGSYMBOL'), cExp = ci('EXPIRY'), cInst = ci('INSTRUMENT')
+  const cOpt = ci('OPTIONTYPE'), cStrike = ci('STRIKEPRICE'), cTick = ci('TICKSIZE')
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim()
+    if (!line) continue
+    const c = line.replace(/,+$/, '').split(',')
+    if (c.length < 5) continue
+    const row: ShoonyaRow = {
+      exch: (c[cExch] ?? fallbackExch).trim(), token: (c[cTok] ?? '').trim(), lotSize: (c[cLot] ?? '').trim(),
+      symbol: (c[cSym] ?? '').trim(), tradingSymbol: (c[cTrade] ?? '').trim(),
+      expiry: isoExpiry(cExp >= 0 ? (c[cExp] ?? '') : ''), instrument: cInst >= 0 ? (c[cInst] ?? '').trim().toUpperCase() : '',
+      optionType: cOpt >= 0 ? (c[cOpt] ?? '').trim().toUpperCase() : '',
+      strike: cStrike >= 0 ? normStrike(c[cStrike] ?? '') : '',
+      tickSize: cTick >= 0 ? (c[cTick] ?? '').trim() : '',
+    }
+    if (!row.tradingSymbol) continue
+    out.push(row)
+  }
+  return out
 }
 
 export function pickShoonya(

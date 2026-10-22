@@ -48,11 +48,17 @@ function TradingMode() {
   const toggle = async (next: boolean) => {
     setBusy(true)
     try {
-      await api.setSimDisabled(next)
+      const r = await api.setSimDisabled(next) as { steeredTo?: string; message?: string; source?: string }
       await qc.invalidateQueries({ queryKey: ['feed-source'] })
-      toast.success(next
-        ? 'LIVE-ONLY mode — sim feed + sandbox fills disabled'
-        : 'Sim feed + sandbox re-enabled')
+      if (next && r.steeredTo) {
+        // the previous source was a sandbox account — the server auto-switched
+        // to a live account (round-13: LIVE-ONLY must never sit on a dead feed)
+        toast.success(`LIVE-ONLY mode — ${r.message ?? 'feed source moved to a live account'}`)
+      } else {
+        toast.success(next
+          ? 'LIVE-ONLY mode — sim feed + sandbox fills disabled'
+          : 'Sim feed + sandbox re-enabled')
+      }
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Switch failed')
     } finally { setBusy(false) }
@@ -924,7 +930,7 @@ function MasterContracts() {
     setBusy(true)
     try {
       const r = await api.syncSymbols()
-      toast.success(`Master contracts synced — ${r.symbolCount} symbols, ${r.mappedCount} broker mappings`)
+      toast.success(`Real master contracts synced — ${r.symbolCount.toLocaleString('en-IN')} symbols, ${r.mappedCount.toLocaleString('en-IN')} broker mappings`)
       qc.invalidateQueries({ queryKey: ['sync-info'] })
       qc.invalidateQueries({ queryKey: ['symbols'] })
     } catch (e) {
@@ -938,11 +944,11 @@ function MasterContracts() {
       <div className="flex items-center justify-between">
         <div>
           <h3 className="text-sm font-semibold">Master Contracts (Symbols)</h3>
-          <p className="text-[11px] text-muted-foreground">Daily download & mapping to every broker&apos;s own symbol/token for copy trading.</p>
+          <p className="text-[11px] text-muted-foreground">Downloads the REAL broker master files (Dhan scrip-master CSV + Noren symbols) — every tradable NSE/NFO/BFO/MCX/CDS contract with exact tokens per broker. No generated demo symbols.</p>
         </div>
-        <Button size="sm" className="text-xs h-8" disabled={busy} onClick={sync}>
+        <Button size="sm" className="text-xs h-8" disabled={busy} onClick={sync} title="Downloads ~30MB of real master files (cached 12h) and rebuilds the symbol universe — takes up to a minute">
           {busy ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
-          Sync Now
+          {busy ? 'Syncing real masters…' : 'Sync Now'}
         </Button>
       </div>
       <div className="grid grid-cols-3 gap-2 text-xs">
@@ -951,7 +957,7 @@ function MasterContracts() {
         <Stat label="Last Sync" value={data?.lastSync ? fmtDateTime(data.lastSync) : 'never'} warn={stale} />
       </div>
       <div className="text-[10px] text-muted-foreground">
-        Auto-sync runs on server boot; a sync older than 20h is flagged stale so the daily job can be triggered here or via cron.
+        If both master sources are unreachable the sync FAILS (no fake symbols are generated). Check Admin → Sync history for the exact per-segment counts and the source files used.
       </div>
     </div>
   )

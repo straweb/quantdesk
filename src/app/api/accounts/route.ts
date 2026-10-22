@@ -7,6 +7,7 @@ import type { BrokerType } from '@/lib/types'
 import { computeUsableCapital, getCapitalState } from '@/lib/services/capital-service'
 import { getPositions, getOpenOrders, setCash } from '@brokers/database'
 import { bootstrap } from '@/lib/services/bootstrap-service'
+import { decryptJson } from '@/lib/crypto'
 
 export async function GET(req: NextRequest) {
   await bootstrap()
@@ -21,6 +22,10 @@ export async function GET(req: NextRequest) {
   for (const a of accounts) {
     // full capital state — resolves FIXED vs %-of-available-cash base
     const state = await getCapitalState(a.id)
+    // session presence = LIVE account (vs sandbox) — drives the FEED chip
+    // LIVE/SANDBOX badges and the Live-Only source rules
+    const creds = decryptJson<Record<string, string>>(a.credentialsEnc)
+    const hasSession = !!(creds?.sessionToken || creds?.accessToken || creds?.sessionId)
     snapshots.push({
       id: a.id,
       label: a.label,
@@ -32,6 +37,7 @@ export async function GET(req: NextRequest) {
       isOrderEnabled: a.isOrderEnabled,
       isCopyMaster: a.isCopyMaster,
       sortOrder: a.sortOrder,
+      hasSession,
       mode: state?.mode ?? null,
       modeLabel: state?.mode ?? null,
       usableCapital: state ? computeUsableCapital(state) : 0,

@@ -553,6 +553,16 @@ function FeedChip({ up }: { up: boolean }) {
 
   const pick = async (id: string) => {
     if (id === source || busy) return
+    // Live-Only mode: sandbox accounts (no broker session) can never be the
+    // data source — block at the UI level (the API refuses them too)
+    if (simDisabled && id !== 'sim') {
+      const row = sources.find(s => s.id === id)
+      const sessioned = accById.get(id)?.hasSession ?? row?.hasSession ?? false
+      if (!sessioned) {
+        toast.error(`${row?.label ?? 'This account'} has no broker session (sandbox) — Live-Only mode requires a live account. Create the session in Admin → Session.`)
+        return
+      }
+    }
     setBusy(true)
     try {
       await api.setFeedSource(id)
@@ -685,6 +695,21 @@ function FeedChip({ up }: { up: boolean }) {
                 {acc ? (
                   <span className="flex items-center gap-2 text-[8px] tabular mt-0.5">
                     <span className="uppercase tracking-wide text-muted-foreground">{s.brokerType}</span>
+                    {/* LIVE vs SANDBOX — session presence (round 13: the Live-Only
+                        mode must never silently sit on a sandbox account) */}
+                    <span
+                      className={`px-1 rounded font-bold ${
+                        acc.hasSession
+                          ? 'bg-[#00c896]/15 text-[#00c896]'
+                          : 'bg-[#e0a63f]/15 text-[#e0a63f]'
+                      }`}
+                      title={acc.hasSession ? 'broker session present — live account' : 'no broker session — sandbox account (Live-Only mode cannot use it)'}
+                    >
+                      {acc.hasSession ? 'LIVE' : 'SANDBOX'}
+                    </span>
+                    {!acc.hasSession && simDisabled && (
+                      <span className="text-[#e0a63f]" title="Live-Only mode — create the session in Admin → Session to use this account">session required</span>
+                    )}
                     <span className={acc.realizedPnl >= 0 ? 'term-up' : 'term-down'}>
                       PnL {acc.realizedPnl >= 0 ? '+' : ''}{fmtCompact(acc.realizedPnl)}
                     </span>
@@ -730,12 +755,19 @@ function FeedChip({ up }: { up: boolean }) {
                   {/* live feed enable / disable for this account */}
                   <button
                     onClick={e => { e.stopPropagation(); toggleFeed(acc.id) }}
-                    disabled={busy}
-                    title={isSrc ? 'Disable this account feed (back to Sim)' : 'Enable this account as the live feed'}
+                    disabled={busy || (simDisabled && !isSrc && !(acc.hasSession ?? sources.find(x => x.id === acc.id)?.hasSession))}
+                    title={
+                      isSrc ? 'Disable this account feed (back to Sim)'
+                      : simDisabled && !(acc.hasSession ?? sources.find(x => x.id === acc.id)?.hasSession)
+                        ? 'Blocked — Live-Only mode: this sandbox account has no broker session'
+                        : 'Enable this account as the live feed'
+                    }
                     className={`p-1 rounded border transition-colors ${
                       isSrc
                         ? 'border-primary/60 text-primary bg-primary/15'
-                        : 'border-border text-muted-foreground hover:text-foreground hover:bg-secondary'
+                        : busy || (simDisabled && !isSrc && !(acc.hasSession ?? sources.find(x => x.id === acc.id)?.hasSession))
+                          ? 'border-border/50 text-muted-foreground/40 cursor-not-allowed'
+                          : 'border-border text-muted-foreground hover:text-foreground hover:bg-secondary'
                     }`}
                   >
                     <Radio className={`h-3 w-3 ${isSrc ? 'pulse-dot' : ''}`} />

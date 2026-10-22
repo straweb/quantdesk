@@ -149,6 +149,8 @@ export interface AccountSnapshot {
   isLiveDataSource: boolean
   isOrderEnabled: boolean
   isCopyMaster: boolean
+  /** broker session present (LIVE) vs sandbox — drives FEED chip badges + Live-Only rules */
+  hasSession?: boolean
   usableCapital: number
   initialCapital: number
   /** capital source: FIXED rupee amount or % of the account's available cash */
