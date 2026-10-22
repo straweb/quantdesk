@@ -11,9 +11,15 @@ import type { ChartMarker } from '../chart/canvas-chart'
 // Shared chart-marker plumbing:
 //  · entry markers from OPEN positions (@ avg price + PnL + %)
 //  · draggable SL / target level markers (persisted per symbol)
-// On drop: the level persists AND — when a position exists — a
-// real reduce-only resting order is armed at the dropped price
-// (SL-M for the SL line, LIMIT for the target line).
+// MARKER DRAG SEMANTICS (close-position orders):
+//  · TGT  drag → arm a reduce-only LIMIT at the dropped price that
+//          CLOSES the position (target-to-close; sells longs /
+//          buys shorts at held lots)
+//  · SL   drag → arm a reduce-only SL-M = STOP-SELL (long) /
+//          STOP-BUY (short) that flattens the position
+// Re-dragging REPLACES: any previously resting reduce-only orders
+// of the same kind on that symbol are cancelled before the new
+// one is armed (no stacked exits).
 // ============================================================
 
 export function useChartCore(): SyncCore | null {
@@ -40,42 +46,62 @@ export function useChartMarkers(symbol: string, core: SyncCore | null, lotSize =
     }
     const long = pos ? pos.netQty > 0 : true
     if (levels?.sl && levels.sl > 0) {
-      out.push({ id: 'lvl-sl', kind: 'sl', price: levels.sl, label: 'SL', color: '#ff4d5e' })
+      out.push({ id: 'lvl-sl', kind: 'sl', price: levels.sl, label: long ? 'S·SELL' : 'S·BUY', color: '#ff4d5e' })
     } else if (pos) {
-      // suggested stop — drag it to the level you want (drop arms a real SL-M)
-      out.push({ id: 'lvl-sl', kind: 'sl', price: Number((pos.avgPrice * (long ? 0.98 : 1.02)).toFixed(2)), label: 'SL', color: '#ff4d5e', sub: 'drag to set' })
+      // suggested stop — drag it to arm the real stop-sell / stop-buy
+      out.push({ id: 'lvl-sl', kind: 'sl', price: Number((pos.avgPrice * (long ? 0.98 : 1.02)).toFixed(2)), label: long ? 'S·SELL' : 'S·BUY', color: '#ff4d5e', sub: 'drag = stop' })
     }
     if (levels?.target && levels.target > 0) {
-      out.push({ id: 'lvl-tgt', kind: 'target', price: levels.target, label: 'TGT', color: '#00c896' })
+      out.push({ id: 'lvl-tgt', kind: 'target', price: levels.target, label: 'CLOSE', color: '#00c896' })
     } else if (pos) {
-      // suggested target — drag it anywhere (drop arms a real reduce-only LIMIT)
-      out.push({ id: 'lvl-tgt', kind: 'target', price: Number((pos.avgPrice * (long ? 1.04 : 0.96)).toFixed(2)), label: 'TGT', color: '#00c896', sub: 'drag to set' })
+      // suggested target — drag it anywhere (drop arms a real close-position LIMIT)
+      out.push({ id: 'lvl-tgt', kind: 'target', price: Number((pos.avgPrice * (long ? 1.04 : 0.96)).toFixed(2)), label: 'CLOSE', color: '#00c896', sub: 'drag = close' })
     }
     void lotSize
     return out
   }, [core, symbol, levels, lotSize])
 }
 
-/** Drop a draggable level marker: persist + arm a real resting order when flat-not. */
+/** Cancel this terminal's resting EXIT-side (reduce) orders on `symbol`
+ *  (replace-on-redrag — entry orders on the other side stay untouched). */
+async function cancelStaleReduceOrders(symbol: string, exitSide: 'BUY' | 'SELL'): Promise<number> {
+  try {
+    const { orders } = await api.orders()
+    const stale = orders.filter(o => o.symbol === symbol && o.status === 'OPEN' && o.side === exitSide)
+    let n = 0
+    for (const o of stale) n += await api.cancelOrder(o.accountId, o.id).then(() => 1).catch(() => 0)
+    return n
+  } catch {
+    return 0
+  }
+}
+
+/** Drop a draggable level marker: persist + arm the real close-position order. */
 export async function commitChartLevel(symbol: string, kind: 'sl' | 'target', price: number, core: SyncCore | null): Promise<void> {
   useTerminal.getState().setChartLevel(symbol, kind, price)
   const pos = (core?.positions ?? []).find(p => p.symbol === symbol && p.netQty !== 0)
   if (!pos) {
-    toast.info(`${kind === 'sl' ? 'SL' : 'Target'} level set @ ${fmtMoney(price)} — drag again anytime (arm an order from the strike editor)`)
+    toast.info(`${kind === 'sl' ? 'Stop' : 'Target-to-close'} level set @ ${fmtMoney(price)} — open a position, then drag again to arm the order`)
     return
   }
+  // close-position semantics: exit side is opposite the position
   const side = pos.netQty > 0 ? 'SELL' : 'BUY'
-  const lots = Math.abs(pos.netQty) / (pos.lotSize || 1)
+  const lots = Math.max(1, Math.floor(Math.abs(pos.netQty) / (pos.lotSize || 1)))
+  const exchange = pos.exchange || 'NFO'
   try {
+    const replaced = await cancelStaleReduceOrders(symbol, side)
     const res = await api.placeOrder(
       kind === 'sl'
-        ? { symbol, exchange: 'NFO', side, qty: lots, orderType: 'SL-M', productType: 'MIS', source: 'MANUAL', triggerPrice: price, reduceOnly: true, strategyId: 'reduce' }
-        : { symbol, exchange: 'NFO', side, qty: lots, orderType: 'LIMIT', productType: 'MIS', source: 'MANUAL', limitPrice: price, reduceOnly: true, strategyId: 'reduce' },
+        ? { symbol, exchange, side, qty: lots, orderType: 'SL-M', productType: 'MIS', source: 'MANUAL', triggerPrice: price, reduceOnly: true, strategyId: 'reduce' }
+        : { symbol, exchange, side, qty: lots, orderType: 'LIMIT', productType: 'MIS', source: 'MANUAL', limitPrice: price, reduceOnly: true, strategyId: 'reduce' },
     )
     const f = res.legs.filter(l => l.status === 'FILLED').length
     const r = res.legs.filter(l => l.status === 'OPEN').length
-    if (f + r === 0) toast.error(`${kind === 'sl' ? 'SL' : 'Target'} order failed — ${res.message}`)
-    else toast.success(`${kind === 'sl' ? 'Stop-loss' : 'Target'} armed @ ${fmtMoney(price)} — ${lots} lot(s) reduce-only${r ? ` · ${r} resting` : ''}`)
+    if (f + r === 0) { toast.error(`${kind === 'sl' ? 'Stop' : 'Target'} order failed — ${res.message}`); return }
+    const what = kind === 'sl'
+      ? `${side === 'SELL' ? 'Stop-sell' : 'Stop-buy'} (close ${lots} lot(s))`
+      : `Target-to-close (${side} ${lots} lot(s))`
+    toast.success(`${what} @ ${fmtMoney(price)}${replaced ? ` · replaced ${replaced} old exit(s)` : ''}${r ? ` · ${r} resting` : ''}`)
   } catch (e) {
     toast.error(e instanceof Error ? e.message : 'Level order failed')
   }

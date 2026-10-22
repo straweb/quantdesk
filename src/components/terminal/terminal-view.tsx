@@ -1,6 +1,6 @@
 'use client'
 
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
 import { useQuery } from '@tanstack/react-query'
 import { ListTree, FileBox, Plus, X, Crosshair, Layers, Bot } from 'lucide-react'
@@ -27,6 +27,19 @@ export function TerminalView() {
   const setLimitPrice = useTerminal(s => s.setLimitPrice)
   const setOrderType = useTerminal(s => s.setOrderType)
   const bottomCollapsed = useTerminal(s => s.bottomCollapsed)
+  const centerRef = useRef<HTMLDivElement>(null)
+  // collapsed bottom dock = MIN height (the slim session bar ≈ 34px regardless
+  // of window size) — percent sizes derived from the live container height
+  const [centerH, setCenterH] = useState(900)
+  useEffect(() => {
+    const el = centerRef.current
+    if (!el) return
+    const ro = new ResizeObserver(() => setCenterH(Math.max(320, el.clientHeight)))
+    ro.observe(el)
+    setCenterH(Math.max(320, el.clientHeight))
+    return () => ro.disconnect()
+  }, [])
+  const collapsedPct = useMemo(() => Math.min(8, Math.max(2, (36 / centerH) * 100)), [centerH])
 
   // positions for the spot-chart L/S markers — websocket sync hub
   const core = useChartCore()
@@ -120,7 +133,7 @@ export function TerminalView() {
       </div>
 
       {/* main grid */}
-      <div className="flex-1 min-h-0">
+      <div className="flex-1 min-h-0" ref={centerRef}>
         <PanelGroup direction="horizontal">
           {/* left: watchlist + depth panel stack */}
           <Panel defaultSize={17} minSize={12} maxSize={28}>
@@ -168,7 +181,7 @@ export function TerminalView() {
               </Panel>
               <Handle vertical />
               {bottomCollapsed ? (
-                <Panel key="bottom-mini" defaultSize={5} minSize={4}>
+                <Panel key="bottom-mini" defaultSize={collapsedPct} minSize={Math.max(1.6, collapsedPct - 0.4)} maxSize={collapsedPct + 6}>
                   <BottomPanel />
                 </Panel>
               ) : (

@@ -1,12 +1,14 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
+import { createPortal } from 'react-dom'
 import type { Candle, Tick } from '@/lib/types'
 import { TF_MS } from '@/lib/types'
 import { api } from '../lib/client-api'
 import { onTicks, subscribeTicks, unsubscribeTicks } from '../lib/socket'
 import {
-  CandlestickChart, LineChart, AreaChart, Sigma, Ghost, Ruler, PenLine, Trash2, MousePointer2,
+  CandlestickChart, LineChart, AreaChart, Sigma, Ghost, Ruler, Trash2, MousePointer2,
+  Slash, AlignJustify, Shapes, TrendingUp, Type, Waves,
 } from 'lucide-react'
 
 // ============================================================
@@ -20,37 +22,49 @@ import {
 //   · double-click / ▶LIVE button -> reset view to live edge
 //   · live view always shows ≥3 future slots beyond the last bar
 //
-// GHOST CANDLES (scalping-tool #ghostCtl, generalized):
-//   Ghost timeframe is freely selectable (1m/3m/5m/15m/1h) — the
-//   math auto-calcs BOTH directions:
-//     ghost TF  < chart TF : chart candles are the outer SHELLS,
-//                            ghost-tf candles render SOLID inside
-//     ghost TF  > chart TF : ghost-tf shells are aggregated from
-//                            the chart data (auto-calc), the chart
-//                            candles render SOLID inside them
-//   Outer shells render HOLLOW (outline + faint fill), inner
-//   candles render SOLID. Hovering highlights the hovered shell
-//   + the exact inner bar under the cursor; the legend shows the
-//   shell row + the inner-tf OHLCV row ("mouse over shows inner").
+// GHOST CANDLES v4 (scalping-tool #ghostCtl, generalized):
+//   THE RULE: the LIVE FEED timeframe ALWAYS renders SOLID; the GHOST
+//   timeframe ALWAYS renders HOLLOW — no matter which tf is bigger.
+//   · ghost TF  > chart TF : ghost shells (hollow) wrap AROUND the
+//                            solid live candles (outside view)
+//   · ghost TF  < chart TF : ghost candles (hollow) render INSIDE
+//                            the solid live candles (inside view)
+//   Ghost tf is freely selectable (1m/3m/5m/15m/1h) — the math
+//   auto-calcs BOTH directions. Hovering highlights the hovered
+//   shell + the exact ghost bar under the cursor; the legend shows
+//   the live row + the ghost-tf OHLCV row.
 //
-// LEFT TOOLBAR (after the OHLCV / ghost OHLCV legend text):
-//   chart-type · indicators · ghost · scales · draw tools — each
-//   opens its menu on MOUSE OVER (no click needed).
+// TOP TOOLBAR (single row, under the OHLCV / ghost legend rows):
+//   grouped icon+text buttons — Cursor · Type · Ind · Ghost · Scale ·
+//   Breaks · Lines · Fib · Shapes · Measure · Position · Annotate ·
+//   Pattern · Clear. MOUSE OVER an icon shows its INFO NOTE; CLICK
+//   opens the group flyout (items commit on click).
 //
 // POSITION MARKERS: entry lines from open positions (@ price +
 // PnL/%) + draggable SL / target / stop lines (drag vertically to
 // set the level; drop calls onMarkerDrop so the parent can arm
-// real resting orders).
+// real resting CLOSE-POSITION orders — target→close LIMIT,
+// SL→stop-sell/stop-buy SL-M).
 //
-// #tools — per-chart drawing layer (anchored to time+price):
-//   trend · ray · h-line · rectangle · fib retracement ·
-//   price range (measure) · long/short position box ·
-//   fixed-range VOLUME PROFILE (POC/VAH/VAL) · buy/sell
-//   imbalance (BSV net histogram). Click-click or drag to draw,
-//   click to select, drag to move/edit, Del removes, Esc cancels.
+// #tools — per-chart drawing layer (anchored to time+price), full
+//   TradingView-style set:
+//   LINES      trend · ray · h-ray · h-line · v-line · arrow · pencil(free)
+//   FIB        retracement · extension · trend-based fib time zones ·
+//              fib fan
+//   SHAPES     rectangle · ellipse/circle
+//   MEASURE    price range · price+date range · forecast (projected Δ)
+//   POSITION   long box · short box · volume profile · buy/sell imbalance
+//   ANNOTATION text · price note · pin · comment (leader+bubble) ·
+//              callout (arrow+bubble) · stats table
+//   PATTERNS   multi-point pattern (dbl-top/H&S/triangle/ABCD/… — click
+//              vertices, double-click to finish)
+//   BREAKS     session breaks (09:15/15:30 + shading) · hour breaks ·
+//              prev-day range (PDH/PDL + break markers) — per-chart toggles
+//   Click-click or drag to draw, click to select, drag to move/edit,
+//   Del removes, Esc cancels.
 //
-// Per-chart independence: chart type, indicator set, ghost,
-// scales and drawings are stored PER CHART (settingsKey) —
+// Per-chart independence: chart type, indicator set, ghost, scales,
+// breaks and drawings are stored PER CHART (settingsKey) —
 // opening charts does not force the same config everywhere.
 // ============================================================
 
@@ -93,15 +107,46 @@ export interface ChartSettings {
   ind: IndicatorCfg
   ghost: boolean
   ghostStyle: 'hollow' | 'fade'
-  ghostTf: string // inner/shell timeframe (1m/3m/5m/15m/1h) — works in BOTH directions
+  ghostTf: string // ghost timeframe (1m/3m/5m/15m/1h) — live=solid / ghost=hollow in BOTH directions
   scales: ScalesCfg
+  /** vertical break overlays (per chart) */
+  breaks: { session: boolean; hour: boolean; range: boolean }
 }
+
+/** IST wall-clock parts for a UTC ms timestamp (market 09:15–15:30 IST). */
+function istParts(t: number) {
+  const d = new Date(t + 5.5 * 3600_000)
+  return { y: d.getUTCFullYear(), m: d.getUTCMonth(), d: d.getUTCDate(), mins: d.getUTCHours() * 60 + d.getUTCMinutes() }
+}
+const SESSION_OPEN_MIN = 9 * 60 + 15 // 09:15 IST
+const SESSION_CLOSE_MIN = 15 * 60 + 30 // 15:30 IST
+/** UTC ms timestamp for "IST day D at minutes-since-midnight". */
+function istMs(t: number, minOfDay: number): number {
+  const d = new Date(t + 5.5 * 3600_000)
+  const dayStart = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())
+  return dayStart - 5.5 * 3600_000 + minOfDay * 60_000
+}
+/** Shortest fib levels for the extension tool (beyond 100%). */
+const FIB_EXT = [0, 0.382, 0.618, 1, 1.272, 1.618, 2.0, 2.618]
+const PATTERN_NAMES = ['Double Top', 'Double Bottom', 'Head & Shoulders', 'Inv H&S', 'Triangle', 'Wedge', 'ABCD', 'Flag', 'Channel', 'Custom']
 
 // ---------------- draw tools ----------------
 
 export type DrawTool =
-  | 'trend' | 'ray' | 'hline' | 'rect' | 'fib'
-  | 'pricerange' | 'long' | 'short' | 'vprofile' | 'vbs'
+  // lines
+  | 'trend' | 'ray' | 'hray' | 'hline' | 'vline' | 'arrow' | 'free'
+  // fib suite
+  | 'fib' | 'fibext' | 'fibtz' | 'fan'
+  // shapes
+  | 'rect' | 'ellipse'
+  // measure / forecast
+  | 'pricerange' | 'pricedate' | 'forecast'
+  // position / data
+  | 'long' | 'short' | 'vprofile' | 'vbs'
+  // annotation (text-bearing)
+  | 'text' | 'pricenote' | 'pin' | 'comment' | 'callout' | 'table'
+  // multi-point
+  | 'pattern'
 
 interface DrawPt { t: number; p: number } // anchored to TIME + price (survives reloads/pan)
 
@@ -112,6 +157,8 @@ interface Drawing {
   dir?: 1 | -1 // position box direction
   pS?: number // position stop-loss price
   pT?: number // position target price
+  text?: string // annotation content (text / note / comment / callout / pin / table)
+  variant?: string // pattern name (double-top, hns, triangle…)
 }
 
 function distSeg(px: number, py: number, x1: number, y1: number, x2: number, y2: number): number {
@@ -123,19 +170,55 @@ function distSeg(px: number, py: number, x1: number, y1: number, x2: number, y2:
   return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
 }
 
-const TOOL_META: { id: DrawTool | 'cursor'; label: string; hint: string }[] = [
-  { id: 'trend', label: 'Trend line', hint: 'click start, click end' },
-  { id: 'ray', label: 'Ray', hint: 'click origin, click direction' },
-  { id: 'hline', label: 'H line', hint: 'click to place' },
-  { id: 'rect', label: 'Rectangle', hint: 'click two corners' },
-  { id: 'fib', label: 'Fib retracement', hint: 'click swing high & low' },
-  { id: 'pricerange', label: 'Price range', hint: 'click start, click end — Δ pts/%' },
-  { id: 'long', label: 'Long position', hint: 'click entry — auto SL/TGT box' },
-  { id: 'short', label: 'Short position', hint: 'click entry — auto SL/TGT box' },
-  { id: 'vprofile', label: 'Volume profile', hint: 'click range start & end — POC/VAH/VAL' },
-  { id: 'vbs', label: 'Buy/Sell imbalance', hint: 'click range start & end — net buy vs sell' },
+const TOOL_META: { id: DrawTool | 'cursor'; label: string; hint: string; group: string }[] = [
+  // lines
+  { id: 'trend', label: 'Trend line', hint: 'click start, click end', group: 'Lines' },
+  { id: 'ray', label: 'Ray', hint: 'click origin, click direction', group: 'Lines' },
+  { id: 'hray', label: 'Horizontal ray', hint: 'click — extends right', group: 'Lines' },
+  { id: 'hline', label: 'Horizontal line', hint: 'click to place', group: 'Lines' },
+  { id: 'vline', label: 'Vertical line', hint: 'click to place', group: 'Lines' },
+  { id: 'arrow', label: 'Arrow', hint: 'click tail, click head', group: 'Lines' },
+  { id: 'free', label: 'Pencil (free hand)', hint: 'drag to draw', group: 'Lines' },
+  // fib
+  { id: 'fib', label: 'Fib retracement', hint: 'click swing high & low', group: 'Fib' },
+  { id: 'fibext', label: 'Fib extension', hint: 'click swing, targets beyond 100%', group: 'Fib' },
+  { id: 'fibtz', label: 'Fib time zones', hint: 'click start & end — vertical fib bars', group: 'Fib' },
+  { id: 'fan', label: 'Fib fan', hint: 'click origin & end — fan rays', group: 'Fib' },
+  // shapes
+  { id: 'rect', label: 'Rectangle', hint: 'click two corners', group: 'Shapes' },
+  { id: 'ellipse', label: 'Ellipse / circle', hint: 'click two corners', group: 'Shapes' },
+  // measure
+  { id: 'pricerange', label: 'Price range', hint: 'click start, click end — Δ pts/%', group: 'Measure' },
+  { id: 'pricedate', label: 'Price + date range', hint: 'Δ price, %, bars & duration', group: 'Measure' },
+  { id: 'forecast', label: 'Forecast', hint: 'click start & end — projected Δ box', group: 'Measure' },
+  // position / data
+  { id: 'long', label: 'Long position', hint: 'click entry — auto SL/TGT box', group: 'Position' },
+  { id: 'short', label: 'Short position', hint: 'click entry — auto SL/TGT box', group: 'Position' },
+  { id: 'vprofile', label: 'Volume profile', hint: 'click range start & end — POC/VAH/VAL', group: 'Position' },
+  { id: 'vbs', label: 'Buy/Sell imbalance', hint: 'click range start & end — net buy vs sell', group: 'Position' },
+  // annotation
+  { id: 'text', label: 'Text box', hint: 'click to place, type', group: 'Annotate' },
+  { id: 'pricenote', label: 'Price note', hint: 'price bubble + text', group: 'Annotate' },
+  { id: 'pin', label: 'Pin / flag', hint: 'click to pin a mark', group: 'Annotate' },
+  { id: 'comment', label: 'Comment', hint: 'click anchor, click bubble spot', group: 'Annotate' },
+  { id: 'callout', label: 'Callout (arrow)', hint: 'click anchor, click bubble spot', group: 'Annotate' },
+  { id: 'table', label: 'Table', hint: 'click to place — lines become rows', group: 'Annotate' },
+  // patterns
+  { id: 'pattern', label: 'Pattern (multi-point)', hint: 'click vertices · double-click ends', group: 'Pattern' },
 ]
-const TWO_PT_TOOLS = new Set<DrawTool>(['trend', 'ray', 'rect', 'fib', 'pricerange', 'vprofile', 'vbs'])
+const TWO_PT_TOOLS = new Set<DrawTool>(['trend', 'ray', 'hray', 'arrow', 'rect', 'ellipse', 'fib', 'fibext', 'fibtz', 'fan', 'pricerange', 'pricedate', 'forecast', 'vprofile', 'vbs'])
+const TEXT_TOOLS = new Set<DrawTool>(['text', 'pricenote', 'pin', 'comment', 'callout', 'table'])
+const TOOL_GROUP_ORDER = ['Lines', 'Fib', 'Shapes', 'Measure', 'Position', 'Annotate', 'Pattern']
+/** single-row toolbar icon per draw-tool group */
+const TOOL_GROUP_ICONS: Record<string, React.ReactNode> = {
+  Lines: <Slash className="h-3 w-3" />,
+  Fib: <AlignJustify className="h-3 w-3" />,
+  Shapes: <Shapes className="h-3 w-3" />,
+  Measure: <Ruler className="h-3 w-3" />,
+  Position: <TrendingUp className="h-3 w-3" />,
+  Annotate: <Type className="h-3 w-3" />,
+  Pattern: <Waves className="h-3 w-3" />,
+}
 
 const FIBL = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]
 const UP = '#00c896'
@@ -144,49 +227,151 @@ const GRID = 'rgba(255,255,255,0.045)'
 const AXIS_TXT = '#8b949e'
 const CROSS = 'rgba(255,255,255,0.25)'
 const DCOL = { def: '#5fb0d8', fib: '#e0a63f', pos: '#e0a63f' }
+const AMBER_TOOLS = new Set<DrawTool>(['fib', 'fibext', 'fibtz', 'fan', 'pricerange', 'pricedate', 'forecast', 'long', 'short', 'vprofile', 'vbs', 'text', 'pricenote', 'pin', 'comment', 'callout', 'table', 'pattern'])
 
 // ----------------------------------------------------------
-// HoverMenu — icon button whose flyout opens on MOUSE OVER
-// (the per-chart toolbar shows lists on hover, not on click).
-// Closes ~160ms after the pointer leaves; any click inside also
-// closes it (selection is a commit).
+// ToolMenu — per-chart toolbar control: ICON + common text
+// label. Interaction contract (round-8):
+//   · MOUSE OVER  -> INFO NOTE (styled tooltip: what it does)
+//   · CLICK       -> opens/closes the flyout (always works —
+//                    hover never opens the flyout any more)
+//   · item clicks commit instantly; the flyout STAYS open
+//     (multi-toggle indicators) until an outside click / Esc
+//   · only one flyout open at a time (bus event)
+// The flyout + tooltip render into document.body as FIXED-
+// position portals so chart panes (overflow:hidden) can never
+// clip them; the flyout flips upward near the viewport bottom.
 // ----------------------------------------------------------
-function HoverMenu({ icon, title, tint, width = 'w-44', children }: {
+const TB_OPEN_EVENT = 'qd-tb-open'
+
+function ToolMenu({ icon, label, info, active, tint, width = 'w-48', children }: {
   icon: React.ReactNode
-  title: string
+  label: string
+  info: string
+  active?: boolean
   tint?: string
   width?: string
   children: React.ReactNode
 }) {
   const [open, setOpen] = useState(false)
+  const [tip, setTip] = useState(false)
+  const [pos, setPos] = useState<{ left: number; top: number } | null>(null)
+  const [tipPos, setTipPos] = useState<{ left: number; top: number } | null>(null)
+  const btnRef = useRef<HTMLButtonElement>(null)
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const enter = () => {
+  const tipTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const place = useCallback(() => {
+    const r = btnRef.current?.getBoundingClientRect()
+    if (!r) return null
+    const estH = Math.min(430, window.innerHeight * 0.66)
+    let top = r.bottom + 6
+    if (top + estH > window.innerHeight - 8) top = Math.max(8, r.top - estH - 8)
+    const left = Math.min(r.right - 40, window.innerWidth - 336)
+    return { left: Math.max(4, left), top }
+  }, [])
+
+  const clearTimers = () => {
     if (timer.current) clearTimeout(timer.current)
-    timer.current = setTimeout(() => setOpen(true), 110)
+    if (tipTimer.current) clearTimeout(tipTimer.current)
   }
-  const leave = () => {
-    if (timer.current) clearTimeout(timer.current)
-    timer.current = setTimeout(() => setOpen(false), 160)
+  const onEnter = () => {
+    clearTimers()
+    tipTimer.current = setTimeout(() => {
+      const r = btnRef.current?.getBoundingClientRect()
+      if (r) {
+        setTipPos({
+          left: Math.max(4, Math.min(r.left, window.innerWidth - 300)),
+          top: r.bottom + 6 > window.innerHeight - 60 ? Math.max(4, r.top - 40) : r.bottom + 6,
+        })
+        setTip(true)
+      }
+    }, 260)
   }
-  useEffect(() => () => { if (timer.current) clearTimeout(timer.current) }, [])
+  const onLeave = () => {
+    clearTimers()
+    setTip(false)
+  }
+  const toggle = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    clearTimers()
+    setTip(false)
+    if (!open) {
+      setPos(place())
+      window.dispatchEvent(new CustomEvent(TB_OPEN_EVENT, { detail: label }))
+    }
+    setOpen(o => !o)
+  }
+  // only one open flyout across every chart pane
+  useEffect(() => {
+    const fn = (ev: Event) => { if ((ev as CustomEvent).detail !== label) setOpen(false) }
+    window.addEventListener(TB_OPEN_EVENT, fn)
+    return () => window.removeEventListener(TB_OPEN_EVENT, fn)
+  }, [label])
+  // outside mousedown / Esc closes
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target as Node
+      if (btnRef.current?.contains(t)) return
+      const fly = document.getElementById('qd-tb-flyout')
+      if (fly?.contains(t)) return
+      setOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
+    document.addEventListener('mousedown', onDoc, true)
+    document.addEventListener('keydown', onKey)
+    return () => { document.removeEventListener('mousedown', onDoc, true); document.removeEventListener('keydown', onKey) }
+  }, [open])
+  useEffect(() => () => clearTimers(), [])
+
   return (
-    <div className="relative" onMouseEnter={enter} onMouseLeave={leave}>
+    <>
       <button
-        className={`p-1 rounded bg-card/85 border border-border backdrop-blur-sm ${tint ?? 'text-muted-foreground'} hover:text-foreground transition-colors`}
-        title={title}
+        ref={btnRef}
+        onClick={toggle}
+        onMouseEnter={onEnter}
+        onMouseLeave={onLeave}
+        title={info}
+        className={`flex items-center gap-1 px-1.5 py-[3px] rounded border shrink-0 transition-colors ${
+          open
+            ? 'bg-primary/25 border-primary/50 text-foreground'
+            : active
+              ? `bg-secondary border-border ${tint ?? 'text-foreground'}`
+              : `bg-card/85 border-border ${tint ?? 'text-muted-foreground'} hover:text-foreground hover:bg-secondary`
+        }`}
       >
         {icon}
+        <span className="text-[9px] font-semibold leading-none whitespace-nowrap">{label}</span>
       </button>
-      {open && (
-        <div
-          onClickCapture={() => setOpen(false)}
-          className={`absolute left-full top-0 ml-1 ${width} rounded-md border border-border bg-popover text-popover-foreground p-1 shadow-xl z-30 text-[10px]`}
-        >
-          {children}
-        </div>
-      )}
-    </div>
+      {open && pos && typeof document !== 'undefined' &&
+        createPortal(
+          <div
+            id="qd-tb-flyout"
+            style={{ position: 'fixed', left: pos.left, top: pos.top }}
+            className={`${width} rounded-md border border-border bg-popover text-popover-foreground p-1 shadow-xl z-[80] text-[10px]`}
+          >
+            {children}
+          </div>,
+          document.body,
+        )}
+      {!open && tip && tipPos && typeof document !== 'undefined' &&
+        createPortal(
+          <div
+            style={{ position: 'fixed', left: tipPos.left, top: tipPos.top }}
+            className="max-w-[290px] rounded-md border border-[#e0a63f]/50 bg-[#1a1f26] text-[#e6e9ec] px-2 py-1 shadow-xl z-[81] text-[10px] leading-snug pointer-events-none"
+          >
+            <span className="font-bold text-[#e0a63f]">{label}</span> — <span className="text-muted-foreground">{info}</span>
+          </div>,
+          document.body,
+        )}
+    </>
   )
+}
+
+/** thin vertical divider between toolbar groups */
+function TbSep() {
+  return <span className="w-px self-stretch my-0.5 bg-border/70 shrink-0" />
 }
 
 // ---------------- indicator math ----------------
@@ -439,6 +624,7 @@ function loadSettings(key: string | undefined, fallback: ChartSettings): ChartSe
       ghostStyle: parsed.ghostStyle ?? fallback.ghostStyle,
       ghostTf: parsed.ghostTf ?? fallback.ghostTf,
       scales: { ...fallback.scales, ...(parsed.scales ?? {}) },
+      breaks: { ...(fallback.breaks ?? { session: false, hour: false, range: false }), ...(parsed.breaks ?? {}) },
     }
   } catch { return fallback }
 }
@@ -522,6 +708,7 @@ export function CanvasChart({
     ghostStyle,
     ghostTf: ghostTf ?? '1m',
     scales: scales ?? { price: true, pct: false, inv: false, pts: false },
+    breaks: { session: false, hour: false, range: false },
   }))
   useEffect(() => {
     const defaults: ChartSettings = {
@@ -531,6 +718,7 @@ export function CanvasChart({
       ghostStyle,
       ghostTf: ghostTf ?? '1m',
       scales: scales ?? { price: true, pct: false, inv: false, pts: false },
+      breaks: { session: false, hour: false, range: false },
     }
     setSettings(loadSettings(settingsKey, defaults))
     setDrawings(loadDrawings(settingsKey))
@@ -555,7 +743,12 @@ export function CanvasChart({
   const pendingRef = useRef<Drawing | null>(null)
   const dragDrawRef = useRef<{ d: Drawing; mode: 'move' | 'pt'; pi?: number; startMouse: { x: number; y: number }; orig: Drawing } | null>(null)
 
+  // text-entry overlay for annotation tools (text / note / comment / callout / pin / table)
+  const [textEdit, setTextEdit] = useState<{ id: string; x: number; y: number; value: string; multiline: boolean } | null>(null)
+
   const setSel = (id: string | null) => { selIdRef.current = id; setSelId(id) }
+  const patternVariantRef = useRef<string>('Double Top')
+  const freeActiveRef = useRef(false)
 
   const commitDrawings = useCallback((next: Drawing[]) => {
     setDrawings(next)
@@ -1081,6 +1274,8 @@ export function CanvasChart({
       // ghostHigher (ghostTf > tf): shells auto-aggregated from base · inner = base
       // Outer shells render HOLLOW (outline + faint fill); inner candles SOLID.
       const innerPerSlot = ghostLower ? tfMs / ghostTfMs : ghostHigher ? ghostTfMs / tfMs : 1
+      // carve gate: inner-bar pitch (px) must fit bar + outline + solid gap
+      const carveOk = ghostLower && cw > 0 && (cw / innerPerSlot) > 6
       let innerW = 0
       if (ghostEff && hoverSlot >= 0 && ghostLower) {
         const t0h = timeOfSlot(hoverSlot), t1h = t0h + tfMs
@@ -1092,28 +1287,29 @@ export function CanvasChart({
       const la = clamp((innerW - 1.3) / 2.2, 0, 1)
       const gw = Math.max(1.2, Math.min(14, innerW))
 
-      // hollow shell painter (outer candle: outline + faint fill)
-      const drawShell = (c: Candle, x: number, wBody: number, emph: boolean) => {
+      // hollow ghost candle painter (ghost = ALWAYS hollow: outline + faint fill)
+      const drawHollow = (c: Candle, x: number, wBody: number, a: number, lw = 1.3) => {
+        if (a <= 0.015) return
         const up = c.c >= c.o
         const col = up ? UP : DOWN
         const yH = yOf(c.h), yL = yOf(c.l)
         const yO = yOf(c.o), yC = yOf(c.c)
         const top = Math.min(yO, yC), bot = Math.max(yO, yC)
         const bx = x - wBody / 2
-        ctx.strokeStyle = col; ctx.fillStyle = col
-        ctx.lineWidth = 1
-        ctx.globalAlpha = emph ? 1 : 0.8
+        ctx.strokeStyle = col
+        ctx.globalAlpha = a
+        ctx.lineWidth = lw
         if (top - yH > 0.3) { ctx.beginPath(); ctx.moveTo(x, yH); ctx.lineTo(x, top + 0.5); ctx.stroke() }
         if (yL - bot > 0.3) { ctx.beginPath(); ctx.moveTo(x, bot - 0.5); ctx.lineTo(x, yL); ctx.stroke() }
-        ctx.globalAlpha = emph ? 0.22 : 0.09 // faint fill = HOLLOW shell
+        ctx.globalAlpha = a * 0.14 // faint fill = hollow interior
+        ctx.fillStyle = col
         ctx.fillRect(bx, top, wBody, Math.max(1, bot - top))
-        ctx.globalAlpha = emph ? 1 : 0.85
-        ctx.lineWidth = emph ? 2 : 1.4
+        ctx.globalAlpha = a
         ctx.strokeRect(bx, top, wBody, Math.max(1, bot - top))
         ctx.globalAlpha = 1
         ctx.lineWidth = 1
       }
-      // solid candle painter (inner candle)
+      // solid candle painter (the LIVE FEED = ALWAYS solid)
       const drawSolid = (c: Candle, x: number, wBody: number, a: number, lw = 1) => {
         if (a <= 0.015) return
         const up = c.c >= c.o
@@ -1127,6 +1323,24 @@ export function CanvasChart({
         ctx.fillRect(x - wBody / 2, Math.min(yO, yC), wBody, Math.max(1, Math.abs(yC - yO)))
         ctx.globalAlpha = 1
         ctx.lineWidth = 1
+      }
+      // CARVE (round-8): when the OUTER candle is SOLID (live feed) and a
+      // hollow ghost bar overlaps it, erase the solid fill under the ghost
+      // body first — the solid candle gets a visible HOLLOW SPACE where the
+      // ghost sits, so the ghost outline reads on ANY colour combination
+      // (same-colour solid + hollow outline used to disappear completely).
+      // Adaptive: only carve when the ghost bar is wide enough for the
+      // hollow to actually read (gw >= 4px) — with many tiny inner bars
+      // (e.g. 15×1m in a 15m shell) per-bar carves would merge and wipe
+      // the whole solid body, so those stay as plain overlays instead.
+      const carveUnderGhost = (c: Candle, x: number, wBody: number) => {
+        const yO = yOf(c.o), yC = yOf(c.c)
+        const top = Math.min(yO, yC), bot = Math.max(yO, yC)
+        ctx.save()
+        ctx.globalCompositeOperation = 'destination-out'
+        ctx.fillStyle = 'rgba(0,0,0,1)'
+        ctx.fillRect(x - wBody / 2 - 1.0, top - 1.0, wBody + 2.0, Math.max(2, bot - top) + 2.0)
+        ctx.restore()
       }
 
       if (ghostEff && la > 0.02 && ghostLower && ind.vol && volH > 0) {
@@ -1152,24 +1366,20 @@ export function CanvasChart({
         ctx.globalAlpha = 1
       }
 
-      // outer shells (hollow) + inner candles (solid)
+      // ================= CANDLES — v4 rule: LIVE = SOLID · GHOST = HOLLOW =================
+      // ghostHigher: hollow ghost shells OUTSIDE, solid live candles inside
+      // ghostLower:  solid live candles, hollow ghost candles INSIDE them
       if (chartKind === 'candles') {
         if (ghostEff) {
-          // alpha floor keeps inner candles readable unless style = 'fade'
-          const floorA = settings.ghostStyle === 'fade' ? la : Math.max(0.55, la)
           if (ghostLower) {
-            vis.forEach((c, i) => { if (c) drawShell(c, xOf(i), bodyW, i === hoverSlot) })
-          } else {
-            const tA = timeOfSlot(0), tB = timeOfSlot(slots - 1) + tfMs
-            const shellW = Math.max(2, Math.min(26, (ghostTfMs / tfMs) * cw * 0.68))
-            for (const sh of ghostShells) {
-              if (sh.t + ghostTfMs < tA || sh.t > tB) continue
-              drawShell(sh, xOfTime(sh.t), shellW, sh.t === hoverShellT)
-            }
-          }
-          // inner candles — SOLID
-          if (la > 0.02) {
-            if (ghostLower) {
+            // 1) live feed candles — SOLID (full alpha, the real data)
+            vis.forEach((c, i) => {
+              if (!c) return
+              drawSolid(c, xOf(i), bodyW, i === hoverSlot ? 1 : 0.95, 1)
+            })
+            // 2) ghost candles — HOLLOW, drawn over their parent slot (inside view)
+            const gAlpha = settings.ghostStyle === 'fade' ? la : Math.max(0.55, la)
+            if (la > 0.02) {
               for (let i = 0; i < slots; i++) {
                 const emph = i === hoverSlot
                 const t0 = timeOfSlot(i), t1 = t0 + tfMs
@@ -1179,11 +1389,27 @@ export function CanvasChart({
                   const x = xOfTime(bar.t)
                   if (x < -6 || x > plotW + 6) continue
                   const isInner = g2 === gi
-                  drawSolid(bar, x, gw, isInner ? 1 : emph ? 0.95 : floorA, isInner ? 1.6 : 1)
+                  // carve the SOLID live candle under this ghost body so the
+                  // hollow outline is always visible over the solid fill.
+                  // Adaptive: carve only when the inner-bar pitch is wide
+                  // enough that carves can't merge and wipe the whole solid
+                  // body (bar = 0.66·pitch; carve needs pitch > ~6px).
+                  if (carveOk) carveUnderGhost(bar, x, gw)
+                  drawHollow(bar, x, gw, isInner ? 1 : emph ? Math.max(0.9, gAlpha) : gAlpha, isInner ? 1.7 : 1.2)
                 }
               }
-            } else {
-              // inner = the chart's own candles, solid inside the higher-tf shells
+              ctx.globalAlpha = 1
+            }
+          } else {
+            // ghost tf > chart tf — hollow shells (outside) + solid live candles inside
+            const tA = timeOfSlot(0), tB = timeOfSlot(slots - 1) + tfMs
+            const shellW = Math.max(2, Math.min(26, (ghostTfMs / tfMs) * cw * 0.68))
+            for (const sh of ghostShells) {
+              if (sh.t + ghostTfMs < tA || sh.t > tB) continue
+              drawHollow(sh, xOfTime(sh.t), shellW, sh.t === hoverShellT ? 1 : settings.ghostStyle === 'fade' ? la : 0.85, sh.t === hoverShellT ? 2 : 1.4)
+            }
+            const floorA = settings.ghostStyle === 'fade' ? la : Math.max(0.55, la)
+            if (la > 0.02) {
               const innerHoverT = ghost[gi]?.t ?? -1
               vis.forEach((c, i) => {
                 if (!c) return
@@ -1191,24 +1417,14 @@ export function CanvasChart({
                 const a = c.t === innerHoverT ? 1 : emph ? 0.95 : floorA
                 drawSolid(c, xOf(i), Math.min(gw, bodyW), a)
               })
+              ctx.globalAlpha = 1
             }
-            ctx.globalAlpha = 1
           }
         } else {
-          // plain candles (or 1m chart / ghost off)
+          // plain candles (or 1m chart / ghost off) — live feed = SOLID
           vis.forEach((c, i) => {
             if (!c) return
-            const x = xOf(i)
-            const up = c.c >= c.o
-            ctx.strokeStyle = up ? UP : DOWN
-            ctx.fillStyle = up ? UP : DOWN
-            ctx.beginPath()
-            ctx.moveTo(x, yOf(c.h)); ctx.lineTo(x, yOf(c.l))
-            ctx.stroke()
-            const yO = yOf(c.o), yC = yOf(c.c)
-            const top = Math.min(yO, yC)
-            const bh = Math.max(1, Math.abs(yC - yO))
-            ctx.fillRect(x - bodyW / 2, top, bodyW, bh)
+            drawSolid(c, xOf(i), bodyW, 1, 1)
           })
         }
       } else {
@@ -1411,6 +1627,93 @@ export function CanvasChart({
       const seg = (x1: number, y1: number, x2: number, y2: number) => {
         ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke()
       }
+
+      // ================= BREAKS — session / hour / prev-day range =================
+      // Per-chart vertical time breaks + range levels (settings.breaks).
+      const breaksCfg = settings.breaks ?? { session: false, hour: false, range: false }
+      if (!mini && (breaksCfg.session || breaksCfg.hour)) {
+        const tStart = timeOfSlot(0), tEnd = timeOfSlot(slots - 1) + tfMs
+        const dayStep = 86400_000
+        for (let day = istMs(tStart, 0) - dayStep; day <= tEnd + dayStep; day += dayStep) {
+          const openT = day + SESSION_OPEN_MIN * 60_000
+          const closeT = day + SESSION_CLOSE_MIN * 60_000
+          if (breaksCfg.session && closeT > tStart && openT < tEnd) {
+            // faint session band + 09:15 / 15:30 divider lines
+            const x0 = clamp(xOfTime(Math.max(openT, tStart)), 0, plotW)
+            const x1 = clamp(xOfTime(Math.min(closeT, tEnd)), 0, plotW)
+            ctx.fillStyle = 'rgba(224,166,63,0.035)'
+            ctx.fillRect(x0, 0, x1 - x0, priceH)
+            for (const [bt, lbl] of [[openT, '09:15'], [closeT, '15:30']] as [number, string][]) {
+              if (bt < tStart || bt > tEnd) continue
+              const x = cr(xOfTime(bt))
+              ctx.strokeStyle = 'rgba(224,166,63,0.5)'
+              ctx.setLineDash([5, 4])
+              ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, priceH); ctx.stroke()
+              ctx.setLineDash([])
+              ctx.fillStyle = 'rgba(224,166,63,0.85)'
+              ctx.textAlign = 'right'; ctx.textBaseline = 'top'
+              ctx.fillText(lbl, x - 3, 2)
+            }
+          }
+          if (breaksCfg.hour) {
+            for (let m = SESSION_OPEN_MIN + 60; m < SESSION_CLOSE_MIN; m += 60) {
+              const bt = day + m * 60_000
+              if (bt < tStart || bt > tEnd) continue
+              const x = cr(xOfTime(bt))
+              ctx.strokeStyle = 'rgba(139,148,158,0.2)'
+              ctx.setLineDash([2, 5])
+              ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, priceH); ctx.stroke()
+              ctx.setLineDash([])
+              ctx.fillStyle = 'rgba(139,148,158,0.45)'
+              ctx.textAlign = 'right'; ctx.textBaseline = 'top'
+              ctx.fillText(`${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`, x - 3, 2)
+            }
+          }
+        }
+      }
+      if (!mini && breaksCfg.range && data.length > 2) {
+        // previous trading day high/low (PDH/PDL) + today's break markers
+        let pdKey: string | null = null
+        let pdH = -Infinity, pdL = Infinity
+        for (let i = data.length - 1; i >= 0; i--) {
+          const k = dayKey(data[i].t)
+          if (k === todayKey) continue
+          if (!pdKey) pdKey = k
+          if (k !== pdKey) break
+          if (data[i].h > pdH) pdH = data[i].h
+          if (data[i].l < pdL) pdL = data[i].l
+        }
+        if (pdH > -Infinity && pdL < Infinity) {
+          for (const [lvl, lbl, col] of [[pdH, 'PDH', UP], [pdL, 'PDL', DOWN]] as [number, string, string][]) {
+            const y = cr(yOf(lvl))
+            if (y < 0 || y > priceH) continue
+            ctx.strokeStyle = col
+            ctx.globalAlpha = 0.38
+            ctx.setLineDash([2, 4])
+            ctx.beginPath(); ctx.moveTo(colW, y); ctx.lineTo(plotW, y); ctx.stroke()
+            ctx.setLineDash([])
+            ctx.globalAlpha = 1
+            ctx.fillStyle = col
+            ctx.textAlign = 'left'; ctx.textBaseline = 'bottom'
+            ctx.fillText(`${lbl} ${lvl.toFixed(2)}`, colW + 4, y - 1)
+            for (let i = 0; i < data.length; i++) {
+              if (dayKey(data[i].t) !== todayKey) continue
+              const brk = lbl === 'PDH'
+                ? data[i].h > lvl && (i === 0 || data[i - 1].h <= lvl)
+                : data[i].l < lvl && (i === 0 || data[i - 1].l >= lvl)
+              if (!brk) continue
+              const x = xOfTime(data[i].t)
+              if (x < 0 || x > plotW) continue
+              const yy = lbl === 'PDH' ? yOf(data[i].h) : yOf(data[i].l)
+              ctx.fillStyle = col
+              ctx.beginPath()
+              if (lbl === 'PDH') { ctx.moveTo(x, yy - 3); ctx.lineTo(x - 4, yy - 10); ctx.lineTo(x + 4, yy - 10) }
+              else { ctx.moveTo(x, yy + 3); ctx.lineTo(x - 4, yy + 10); ctx.lineTo(x + 4, yy + 10) }
+              ctx.closePath(); ctx.fill()
+            }
+          }
+        }
+      }
       // computeVP — fixed-range volume profile (26 bins, POC / VAH / VAL @70%)
       const computeVP = (t0: number, t1: number) => {
         const g0 = Math.max(0, lowerBoundTime(data, t0)), g1 = Math.min(data.length - 1, lowerBoundTime(data, t1))
@@ -1459,7 +1762,7 @@ export function CanvasChart({
         const X0 = xOfTime(P[0].t), Y0 = yOf(P[0].p)
         const X1 = P.length > 1 ? xOfTime(P[1].t) : X0
         const Y1 = P.length > 1 ? yOf(P[1].p) : Y0
-        const col = selected ? '#ffffff' : d.type === 'fib' || d.type === 'pricerange' || d.type === 'long' || d.type === 'short' || d.type === 'vprofile' || d.type === 'vbs' ? DCOL.fib : DCOL.def
+        const col = selected ? '#ffffff' : AMBER_TOOLS.has(d.type) ? DCOL.fib : DCOL.def
         ctx.save()
         ctx.strokeStyle = col
         ctx.fillStyle = col
@@ -1508,6 +1811,245 @@ export function CanvasChart({
               ctx.fillText(`${lv}  ${pr.toFixed(2)}`, xa + 4, y - 2)
             }
             ctx.globalAlpha = 1
+            break
+          }
+          case 'vline':
+            ctx.setLineDash([2, 3])
+            seg(cr(X0), 0, cr(X0), priceH)
+            ctx.setLineDash([])
+            ctx.textAlign = 'right'; ctx.textBaseline = 'top'
+            ctx.fillText(fmtAxisTime(P[0].t, tf, true), X0 - 3, 2)
+            break
+          case 'hray':
+            seg(cr(X0), cr(Y0), plotW, cr(Y0))
+            ctx.textAlign = 'left'; ctx.textBaseline = 'bottom'
+            ctx.fillText(P[0].p.toFixed(2), 4, Y0 - 2)
+            break
+          case 'arrow': {
+            seg(cr(X0), cr(Y0), cr(X1), cr(Y1))
+            const angA = Math.atan2(Y1 - Y0, X1 - X0)
+            ctx.beginPath()
+            ctx.moveTo(X1, Y1)
+            ctx.lineTo(X1 - 10 * Math.cos(angA - Math.PI / 7), Y1 - 10 * Math.sin(angA - Math.PI / 7))
+            ctx.lineTo(X1 - 10 * Math.cos(angA + Math.PI / 7), Y1 - 10 * Math.sin(angA + Math.PI / 7))
+            ctx.closePath()
+            ctx.fill()
+            break
+          }
+          case 'ellipse': {
+            const x0 = Math.min(X0, X1), x1 = Math.max(X0, X1)
+            const y0 = Math.min(Y0, Y1), y1 = Math.max(Y0, Y1)
+            ctx.globalAlpha = 0.08
+            ctx.beginPath()
+            ctx.ellipse((x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2, 0, 0, Math.PI * 2)
+            ctx.fill()
+            ctx.globalAlpha = 1
+            ctx.stroke()
+            break
+          }
+          case 'fibext': {
+            const xa = Math.min(X0, X1), xb = Math.max(X0, X1)
+            const p0 = P[0].p, p1 = P[1].p
+            seg(cr(xa), cr(Y0), cr(xb), cr(Y1))
+            ctx.textAlign = 'left'; ctx.textBaseline = 'bottom'
+            for (const lv of FIB_EXT) {
+              const pr = p1 + (p0 - p1) * lv
+              const y = cr(yOf(pr))
+              if (y < -4 || y > priceH + 4) continue
+              ctx.globalAlpha = lv === 1 ? 0.95 : 0.6
+              ctx.setLineDash(lv === 1 ? [] : [4, 3])
+              seg(xa - 4, y, xb + 4, y)
+              ctx.setLineDash([])
+              ctx.fillText(`${lv}  ${pr.toFixed(2)}`, xa + 4, y - 2)
+            }
+            ctx.globalAlpha = 1
+            break
+          }
+          case 'fibtz': {
+            // vertical fib time-zone bars from P0, spaced by the P0→P1 span × fib seq
+            const dt = P[1].t - P[0].t
+            for (const f of [1, 2, 3, 5, 8, 13, 21, 34, 55, 89]) {
+              const x = cr(xOfTime(P[0].t + dt * f))
+              if (x < 0 || x > plotW) continue
+              ctx.strokeStyle = selected ? '#ffffff' : 'rgba(224,166,63,0.55)'
+              ctx.setLineDash([3, 3])
+              seg(x, 0, x, priceH)
+              ctx.setLineDash([])
+              ctx.fillStyle = selected ? '#ffffff' : 'rgba(224,166,63,0.8)'
+              ctx.textAlign = 'left'; ctx.textBaseline = 'top'
+              ctx.fillText(String(f), x + 2, 2)
+            }
+            seg(cr(X0), cr(Y0), cr(X1), cr(Y1))
+            break
+          }
+          case 'fan': {
+            // rays from P0 through fib-scaled projections of P1
+            const dxT = P[1].t - P[0].t
+            const dp = P[1].p - P[0].p
+            seg(cr(X0), cr(Y0), cr(X1), cr(Y1))
+            for (const lv of [0.382, 0.5, 0.618, 0.786, 1.618]) {
+              const x2 = xOfTime(P[0].t + dxT)
+              const y2 = yOf(P[0].p + dp * lv)
+              const k = x2 !== X0 ? (plotW - X0) / (x2 - X0) : 1e9
+              const ke = Math.max(1, Math.min(20, k))
+              ctx.globalAlpha = 0.5
+              seg(cr(X0), cr(Y0), cr(X0 + (x2 - X0) * ke), cr(Y0 + (y2 - Y0) * ke))
+              ctx.globalAlpha = 1
+              ctx.fillStyle = selected ? '#ffffff' : 'rgba(224,166,63,0.7)'
+              ctx.textAlign = 'left'; ctx.textBaseline = 'bottom'
+              ctx.fillText(String(lv), Math.min(plotW - 24, Math.max(2, x2 + 2)), y2 - 2)
+            }
+            break
+          }
+          case 'pricedate': {
+            const x0 = Math.min(X0, X1), x1 = Math.max(X0, X1)
+            const ya = cr(Y0), yb = cr(Y1)
+            ctx.setLineDash([3, 3])
+            ctx.strokeRect(cr(x0), Math.min(ya, yb), cr(x1) - cr(x0), Math.abs(yb - ya))
+            ctx.setLineDash([])
+            const dp2 = P[1].p - P[0].p
+            const pct2 = P[0].p ? (dp2 / P[0].p) * 100 : 0
+            const barsN = Math.round(Math.abs(P[1].t - P[0].t) / (geoRef.current.tfMs || 1))
+            const mins = Math.round(Math.abs(P[1].t - P[0].t) / 60000)
+            const dur = mins >= 1440 ? `${(mins / 1440).toFixed(1)}d` : mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`
+            ctx.font = '600 9px ui-monospace, monospace'
+            ctx.textAlign = 'center'; ctx.textBaseline = 'bottom'
+            ctx.fillText(`${dp2 >= 0 ? '+' : ''}${dp2.toFixed(2)} (${pct2 >= 0 ? '+' : ''}${pct2.toFixed(2)}%) · ${barsN} bars · ${dur}`, (x0 + x1) / 2, Math.min(ya, yb) - 3)
+            ctx.font = '9px ui-monospace, monospace'
+            break
+          }
+          case 'forecast': {
+            // projected Δ box after P1 (same price delta + same time span)
+            const dpF = P[1].p - P[0].p
+            const dtF = P[1].t - P[0].t
+            const y1F = yOf(P[1].p)
+            const py0 = yOf(P[1].p + dpF)
+            const px0 = X1
+            const px1 = xOfTime(P[1].t + dtF)
+            ctx.fillStyle = 'rgba(91,176,216,0.1)'
+            ctx.fillRect(px0, Math.min(y1F, py0), Math.max(4, px1 - px0), Math.abs(py0 - y1F))
+            ctx.strokeStyle = 'rgba(91,176,216,0.55)'
+            ctx.setLineDash([4, 3])
+            ctx.strokeRect(cr(px0), Math.min(y1F, py0), Math.max(4, cr(px1) - cr(px0)), Math.abs(py0 - y1F))
+            ctx.setLineDash([])
+            const pctF = P[0].p ? (dpF / P[0].p) * 100 : 0
+            ctx.fillStyle = selected ? '#ffffff' : 'rgba(91,176,216,0.95)'
+            ctx.font = '600 9px ui-monospace, monospace'
+            ctx.textAlign = 'left'; ctx.textBaseline = 'bottom'
+            ctx.fillText(`fcst ${dpF >= 0 ? '+' : ''}${dpF.toFixed(2)} (${pctF >= 0 ? '+' : ''}${pctF.toFixed(2)}%)`, px0 + 2, Math.min(y1F, py0) - 3)
+            ctx.font = '9px ui-monospace, monospace'
+            break
+          }
+          case 'text': {
+            const lines = (d.text || 'Text').split('\n')
+            ctx.font = '10px ui-monospace, monospace'
+            ctx.textAlign = 'left'; ctx.textBaseline = 'middle'
+            ctx.fillStyle = selected ? '#ffffff' : '#ffd166'
+            lines.forEach((ln, i) => ctx.fillText(ln, X0 + 2, Y0 + i * 12 - (lines.length - 1) * 6))
+            break
+          }
+          case 'pricenote': {
+            const txt = d.text || ''
+            ctx.font = 'bold 9px ui-monospace, monospace'
+            const label = `${P[0].p.toFixed(2)}${txt ? ' · ' + txt : ''}`
+            const w = ctx.measureText(label).width + 10
+            ctx.fillStyle = selected ? '#ffffff' : '#e0a63f'
+            ctx.fillRect(X0, Y0 - 9, w, 16)
+            ctx.fillStyle = '#0b0e11'
+            ctx.textAlign = 'left'; ctx.textBaseline = 'middle'
+            ctx.fillText(label, X0 + 5, Y0 - 1)
+            ctx.strokeStyle = '#e0a63f'
+            seg(cr(X0 + 1), cr(Y0 + 7), cr(X0 + 1), cr(Y0 + 14))
+            ctx.font = '9px ui-monospace, monospace'
+            break
+          }
+          case 'pin': {
+            ctx.fillStyle = selected ? '#ffffff' : '#e06c9f'
+            ctx.beginPath(); ctx.arc(X0, Y0, 3.5, 0, Math.PI * 2); ctx.fill()
+            ctx.beginPath(); ctx.moveTo(X0, Y0 + 4); ctx.lineTo(X0 + 12, Y0 + 8); ctx.lineTo(X0, Y0 + 12); ctx.closePath(); ctx.fill()
+            if (d.text) {
+              ctx.fillStyle = '#e06c9f'
+              ctx.textAlign = 'left'; ctx.textBaseline = 'middle'
+              ctx.fillText(d.text, X0 + 15, Y0 + 8)
+            }
+            break
+          }
+          case 'comment':
+          case 'callout': {
+            if (d.type === 'comment') {
+              ctx.setLineDash([3, 3])
+              seg(cr(X0), cr(Y0), cr(X1), cr(Y1))
+              ctx.setLineDash([])
+              ctx.beginPath(); ctx.arc(X0, Y0, 2.5, 0, Math.PI * 2); ctx.fill()
+            } else {
+              seg(cr(X0), cr(Y0), cr(X1), cr(Y1))
+              const angC = Math.atan2(Y0 - Y1, X0 - X1)
+              ctx.beginPath()
+              ctx.moveTo(X0, Y0)
+              ctx.lineTo(X0 + 9 * Math.cos(angC - Math.PI / 7), Y0 + 9 * Math.sin(angC - Math.PI / 7))
+              ctx.lineTo(X0 + 9 * Math.cos(angC + Math.PI / 7), Y0 + 9 * Math.sin(angC + Math.PI / 7))
+              ctx.closePath()
+              ctx.fill()
+            }
+            const txt = (d.text || 'note').split('\n')
+            let bw = 0
+            for (const ln of txt) bw = Math.max(bw, ctx.measureText(ln).width)
+            const bh = txt.length * 12 + 6
+            ctx.fillStyle = selected ? 'rgba(255,255,255,0.9)' : 'rgba(42,52,65,0.92)'
+            ctx.fillRect(X1, Y1 - bh, bw + 10, bh)
+            ctx.strokeStyle = selected ? '#ffffff' : 'rgba(139,148,158,0.6)'
+            ctx.strokeRect(cr(X1), cr(Y1 - bh), cr(bw + 10), cr(bh))
+            ctx.fillStyle = selected ? '#0b0e11' : '#e6e9ec'
+            ctx.textAlign = 'left'; ctx.textBaseline = 'top'
+            txt.forEach((ln, i) => ctx.fillText(ln, X1 + 5, Y1 - bh + 4 + i * 12))
+            break
+          }
+          case 'table': {
+            const rows = (d.text || 'col A | col B\nrow 1 | 0').split('\n').map(r => r.split('|').map(c => c.trim()))
+            const colWs: number[] = []
+            for (const r of rows) r.forEach((c, i) => { colWs[i] = Math.max(colWs[i] ?? 0, ctx.measureText(c).width + 12) })
+            const rh = 14
+            const tw = colWs.reduce((a, b) => a + b, 0)
+            const th = rows.length * rh
+            ctx.fillStyle = selected ? 'rgba(255,255,255,0.14)' : 'rgba(18,22,28,0.88)'
+            ctx.fillRect(X0, Y0, tw, th)
+            ctx.strokeStyle = selected ? '#ffffff' : 'rgba(139,148,158,0.5)'
+            ctx.strokeRect(cr(X0), cr(Y0), cr(tw), cr(th))
+            ctx.textAlign = 'left'; ctx.textBaseline = 'middle'
+            rows.forEach((r, ri) => {
+              let cx = X0
+              for (let ci = 0; ci < colWs.length; ci++) {
+                if (ri === 0) { ctx.fillStyle = 'rgba(224,166,63,0.95)'; ctx.fillRect(cx, Y0 + ri * rh, colWs[ci], rh) }
+                ctx.strokeStyle = 'rgba(139,148,158,0.25)'
+                ctx.strokeRect(cr(cx), cr(Y0 + ri * rh), cr(colWs[ci]), cr(rh))
+                ctx.fillStyle = ri === 0 ? '#0b0e11' : '#d6dae0'
+                ctx.fillText(r[ci] ?? '', cx + 5, Y0 + ri * rh + rh / 2 + 0.5)
+                cx += colWs[ci]
+              }
+            })
+            break
+          }
+          case 'pattern': {
+            ctx.beginPath()
+            P.forEach((pt, i) => { const x = xOfTime(pt.t), y = yOf(pt.p); if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y) })
+            ctx.stroke()
+            const name = d.variant || 'Pattern'
+            const cx = P.reduce((s, p) => s + xOfTime(p.t), 0) / P.length
+            const cy = P.reduce((s, p) => s + yOf(p.p), 0) / P.length
+            ctx.font = '600 9px ui-monospace, monospace'
+            const w = ctx.measureText(name).width + 8
+            ctx.fillStyle = selected ? '#ffffff' : 'rgba(224,166,63,0.85)'
+            ctx.fillRect(cx - w / 2, cy - 8, w, 14)
+            ctx.fillStyle = '#0b0e11'
+            ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+            ctx.fillText(name, cx, cy - 1)
+            ctx.font = '9px ui-monospace, monospace'
+            break
+          }
+          case 'free': {
+            ctx.beginPath()
+            P.forEach((pt, i) => { const x = xOfTime(pt.t), y = yOf(pt.p); if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y) })
+            ctx.stroke()
             break
           }
           case 'pricerange': {
@@ -1650,12 +2192,17 @@ export function CanvasChart({
       }
 
       for (const d of drawingsRef.current) renderDrawing(d, d.id === selIdRef.current)
-      // pending preview (2-pt tools armed, first point set)
+      // pending preview (2-pt tools armed, first point set · pattern adds a moving vertex)
       const pend = pendingRef.current
       if (pend) {
+        const mousePt = inPlot ? { t: mouseT, p: pMax - (mouse!.y / priceH) * (pMax - pMin) } : null
         const preview: Drawing = { ...pend }
-        if (pend.pts.length === 1 && inPlot) preview.pts = [pend.pts[0], { t: mouseT, p: pMax - (mouse!.y / priceH) * (pMax - pMin) }]
-        renderDrawing(preview, true)
+        if (pend.type === 'pattern') {
+          preview.pts = mousePt ? [...pend.pts, mousePt] : pend.pts
+        } else if (pend.pts.length === 1 && inPlot) {
+          preview.pts = [pend.pts[0], mousePt ?? pend.pts[0]]
+        }
+        if (pend.type !== 'free') renderDrawing(preview, true)
         if (pend.pts.length === 1 && inPlot) {
           ctx.fillStyle = '#e0a63f'
           ctx.beginPath(); ctx.arc(xOfTime(pend.pts[0].t), yOf(pend.pts[0].p), 3, 0, Math.PI * 2); ctx.fill()
@@ -1858,25 +2405,61 @@ export function CanvasChart({
       switch (d.type) {
         case 'trend':
         case 'ray':
+        case 'arrow':
           hit = distSeg(x, y, X0, Y0, X1, Y1) < 5
           break
+        case 'free':
+        case 'pattern': {
+          for (let pi2 = 1; pi2 < P.length; pi2++) {
+            if (distSeg(x, y, X(P[pi2 - 1].t), Y(P[pi2 - 1].p), X(P[pi2].t), Y(P[pi2].p)) < 5) { hit = true; break }
+          }
+          break
+        }
         case 'hline':
           hit = Math.abs(y - Y0) < 5
           break
-        case 'rect': {
+        case 'hray':
+          hit = Math.abs(y - Y0) < 5 && x >= X0 - 4
+          break
+        case 'vline':
+          hit = Math.abs(x - X0) < 5
+          break
+        case 'rect':
+        case 'ellipse':
+        case 'pricedate':
+        case 'forecast': {
           const xa = Math.min(X0, X1), xb = Math.max(X0, X1)
           const ya = Math.min(Y0, Y1), yb = Math.max(Y0, Y1)
           hit = ((Math.abs(y - ya) < 5 || Math.abs(y - yb) < 5) && x >= xa - 4 && x <= xb + 4)
             || ((Math.abs(x - xa) < 5 || Math.abs(x - xb) < 5) && y >= ya - 4 && y <= yb + 4)
           break
         }
-        case 'fib': {
+        case 'fib':
+        case 'fibext': {
           const xa = Math.min(X0, X1), xb = Math.max(X0, X1)
           if (x < xa - 6 || x > xb + 6) break
           const p0 = P[0].p, p1 = P[1].p
-          for (const lv of FIBL) {
+          const levels = d.type === 'fib' ? FIBL : FIB_EXT
+          for (const lv of levels) {
             if (Math.abs(y - Y(p1 + (p0 - p1) * lv)) < 4) { hit = true; break }
           }
+          break
+        }
+        case 'fibtz': {
+          const dt = P[1].t - P[0].t
+          for (const f of [1, 2, 3, 5, 8, 13, 21, 34, 55, 89]) {
+            if (Math.abs(x - X(P[0].t + dt * f)) < 4) { hit = true; break }
+          }
+          break
+        }
+        case 'fan': {
+          const p0 = P[0].p, p1 = P[1].p
+          const x2 = X(P[1].t)
+          for (const lv of [0.382, 0.5, 0.618, 0.786, 1.618]) {
+            const y2 = Y(p0 + (p1 - p0) * lv)
+            if (distSeg(x, y, X0, Y0, Math.min(x2, g.plotW + 50), y2) < 5) { hit = true; break }
+          }
+          if (!hit) hit = distSeg(x, y, X0, Y0, X1, Y1) < 5
           break
         }
         case 'pricerange': {
@@ -1897,6 +2480,24 @@ export function CanvasChart({
           hit = Math.abs(y - Y(pE)) < 5 || Math.abs(y - Y(pS)) < 5 || Math.abs(y - Y(pT)) < 5
           break
         }
+        case 'text':
+          hit = Math.abs(y - Y0) < 14 && x >= X0 && x <= X0 + 140
+          break
+        case 'pricenote':
+          hit = y >= Y0 - 11 && y <= Y0 + 16 && x >= X0 && x <= X0 + 130
+          break
+        case 'pin':
+          hit = Math.hypot(x - X0, y - Y0) < 9 || (y >= Y0 && y <= Y0 + 14 && x >= X0 && x <= X0 + 14)
+          break
+        case 'comment':
+        case 'callout': {
+          hit = distSeg(x, y, X0, Y0, X1, Y1) < 5
+            || (x >= X1 - 3 && x <= X1 + 140 && y >= Y1 - 30 && y <= Y1 + 4)
+          break
+        }
+        case 'table':
+          hit = x >= X0 && x <= X0 + 150 && y >= Y0 && y <= Y0 + 60
+          break
         case 'vprofile':
         case 'vbs': {
           const xa = Math.min(X0, X1), xb = Math.max(X0, X1)
@@ -1912,17 +2513,48 @@ export function CanvasChart({
   const finishPending = (secondPt: DrawPt) => {
     const pend = pendingRef.current
     pendingRef.current = null
-    if (!pend) return
+    if (!pend) return null
     const P = [pend.pts[0], secondPt]
     if (pend.type === 'vprofile' || pend.type === 'vbs') {
       const bars = Math.abs(P[1].t - P[0].t) / (geoRef.current.tfMs || 1)
-      if (bars < 3) { setToolBoth('cursor'); return } // too narrow — cancel
-    } else if (pend.type === 'fib' || pend.type === 'pricerange') {
-      if (Math.abs(P[1].p - P[0].p) < 1e-9) { setToolBoth('cursor'); return }
+      if (bars < 3) { setToolBoth('cursor'); return null } // too narrow — cancel
+    } else if (pend.type === 'fib' || pend.type === 'fibext' || pend.type === 'fibtz' || pend.type === 'fan' || pend.type === 'pricerange' || pend.type === 'pricedate' || pend.type === 'forecast') {
+      if (Math.abs(P[1].p - P[0].p) < 1e-9) { setToolBoth('cursor'); return null }
     } else if (Math.abs(P[1].t - P[0].t) < 1e-6 && Math.abs(P[1].p - P[0].p) < 1e-9) {
-      setToolBoth('cursor'); return
+      setToolBoth('cursor'); return null
     }
-    newDrawing({ type: pend.type, pts: P, dir: pend.dir })
+    return newDrawing({ type: pend.type, pts: P, dir: pend.dir })
+  }
+
+  /** Finish a multi-point pattern drawing (dbl-click / Enter / right-click). */
+  const finishPattern = () => {
+    const pend = pendingRef.current
+    if (!pend || pend.type !== 'pattern') return
+    pendingRef.current = null
+    if (pend.pts.length >= 2) newDrawing({ type: 'pattern', pts: pend.pts, variant: patternVariantRef.current })
+    setToolBoth('cursor')
+  }
+
+  /** Open the text overlay for a freshly placed annotation. */
+  const openTextFor = (d: Drawing) => {
+    const g = geoRef.current
+    const x = g.cw / 2 + ((d.pts[0].t - g.t0) / g.tfMs) * g.cw
+    const y = g.priceH * ((g.pMax - d.pts[0].p) / (g.pMax - g.pMin))
+    setTextEdit({ id: d.id, x: Math.round(x) + 4, y: Math.round(y) - 10, value: d.type === 'table' ? 'col A | col B\nrow 1 | 0' : d.text ?? '', multiline: d.type === 'table' || d.type === 'comment' || d.type === 'callout' })
+  }
+
+  const commitText = () => {
+    if (!textEdit) return
+    const te = textEdit
+    setTextEdit(null)
+    const val = te.value.trim()
+    if (!val) {
+      // empty annotation — remove the placeholder drawing
+      commitDrawings(drawingsRef.current.filter(d => d.id !== te.id))
+      return
+    }
+    commitDrawings(drawingsRef.current.map(d => (d.id === te.id ? { ...d, text: te.value } : d)))
+    setToolBoth('cursor')
   }
 
   const onWheel = (e: React.WheelEvent) => {
@@ -1966,16 +2598,39 @@ export function CanvasChart({
     if (toolRef.current !== 'cursor' && x < win.plotW && y < win.priceH) {
       const t = toolRef.current as DrawTool
       const pt = dataPt(x, y)
-      if (pendingRef.current && pendingRef.current.pts.length === 1) {
-        finishPending(pt)
+      if (pendingRef.current && pendingRef.current.type === 'pattern') {
+        // pattern: each click adds a vertex
+        pendingRef.current = { ...pendingRef.current, pts: [...pendingRef.current.pts, pt] }
+        forceRender(n => n + 1)
         return
       }
-      if (TWO_PT_TOOLS.has(t)) {
+      if (pendingRef.current && pendingRef.current.pts.length === 1) {
+        const finished = finishPending(pt)
+        if (finished && (t === 'comment' || t === 'callout')) openTextFor(finished)
+        return
+      }
+      if (TWO_PT_TOOLS.has(t) || t === 'comment' || t === 'callout') {
         pendingRef.current = { id: 'pending', type: t, pts: [pt] }
         return
       }
-      if (t === 'hline') {
-        newDrawing({ type: 'hline', pts: [pt] })
+      if (t === 'hline' || t === 'vline' || t === 'hray') {
+        newDrawing({ type: t, pts: [pt] })
+        return
+      }
+      if (TEXT_TOOLS.has(t)) {
+        // single-click annotation — place, then open the text overlay
+        const d = newDrawing({ type: t, pts: [pt] })
+        openTextFor(d)
+        return
+      }
+      if (t === 'pattern') {
+        pendingRef.current = { id: 'pending', type: 'pattern', pts: [pt] }
+        forceRender(n => n + 1)
+        return
+      }
+      if (t === 'free') {
+        pendingRef.current = { id: 'pending', type: 'free', pts: [pt] }
+        freeActiveRef.current = true
         return
       }
       if (t === 'long' || t === 'short') {
@@ -2035,6 +2690,13 @@ export function CanvasChart({
     const y = e.clientY - rect.top
     const win = winRef.current
     crossRef.current = { x, y, inPlot: x < win.plotW && y < win.priceH }
+
+    // pencil (free hand): append points while the button is down
+    if (freeActiveRef.current && pendingRef.current?.type === 'free') {
+      pendingRef.current = { ...pendingRef.current, pts: [...pendingRef.current.pts, dataPt(x, y)] }
+      forceRender(n => n + 1)
+      return
+    }
 
     // live marker drag (mutates the ref so the RAF loop re-renders the line)
     const md = markerDragRef.current
@@ -2112,6 +2774,16 @@ export function CanvasChart({
       if (md.kind && onMarkerDrop) onMarkerDrop(md.kind, md.price)
       return
     }
+    // pencil stroke ends → commit the free-hand drawing
+    if (freeActiveRef.current) {
+      freeActiveRef.current = false
+      const pend = pendingRef.current
+      pendingRef.current = null
+      if (pend && pend.type === 'free' && pend.pts.length > 1) {
+        commitDrawings([...drawingsRef.current, { ...pend, id: `d${Date.now().toString(36)}${Math.floor(Math.random() * 1e4)}` }].slice(-120))
+      }
+      return
+    }
     // finish a live drawing edit
     if (dragDrawRef.current) {
       dragDrawRef.current = null
@@ -2120,7 +2792,7 @@ export function CanvasChart({
     }
     // 2-pt tool: drag-release commits when the drag covered >24px
     const pend = pendingRef.current
-    if (pend && pend.pts.length === 1) {
+    if (pend && pend.pts.length === 1 && pend.type !== 'pattern') {
       const rect = canvasRef.current!.getBoundingClientRect()
       const x = e.clientX - rect.left
       const y = e.clientY - rect.top
@@ -2128,7 +2800,8 @@ export function CanvasChart({
       const sx = g.cw / 2 + ((pend.pts[0].t - g.t0) / g.tfMs) * g.cw
       const sy = g.priceH * ((g.pMax - pend.pts[0].p) / (g.pMax - g.pMin))
       if (Math.hypot(x - sx, y - sy) > 24) {
-        finishPending(dataPt(x, y))
+        const finished = finishPending(dataPt(x, y))
+        if (finished && (pend.type === 'comment' || pend.type === 'callout')) openTextFor(finished)
       }
       return // else stay pending — click-click mode
     }
@@ -2166,6 +2839,8 @@ export function CanvasChart({
         setSel(null)
         e.preventDefault()
       }
+    } else if (e.key === 'Enter') {
+      if (pendingRef.current?.type === 'pattern') { finishPattern(); e.preventDefault() }
     } else if (e.key === 'Escape') {
       pendingRef.current = null
       setSel(null)
@@ -2174,6 +2849,7 @@ export function CanvasChart({
   }
   const onContextMenu = (e: React.MouseEvent) => {
     e.preventDefault()
+    if (pendingRef.current?.type === 'pattern') { finishPattern(); return }
     pendingRef.current = null
     setSel(null)
     setToolBoth('cursor')
@@ -2188,6 +2864,8 @@ export function CanvasChart({
   }
 
   const onDoubleClick = (e: React.MouseEvent) => {
+    // pattern in progress → finish it (do NOT reset the view)
+    if (pendingRef.current?.type === 'pattern') { finishPattern(); return }
     // dbl-click on a draggable grip removes the level; otherwise reset view
     const rect = canvasRef.current!.getBoundingClientRect()
     const x = e.clientX - rect.left
@@ -2225,38 +2903,57 @@ export function CanvasChart({
         onContextMenu={onContextMenu}
       />
 
-      {/* ---- per-chart control column (#chartbar) — LEFT, under the legend rows;
-           every menu opens on MOUSE OVER (no click needed) ---- */}
+      {/* ---- per-chart control BAR (#chartbar) — ONE ROW of grouped
+           icon+text buttons under the legend rows. Mouse-over an icon
+           shows its INFO NOTE; CLICK opens the group flyout (items
+           commit on click, flyout stays open until outside click/Esc). ---- */}
       {showControls && (
-        <div className="absolute left-1 top-[30px] flex flex-col items-start gap-0.5 z-10">
+        <div className="absolute left-1 top-[30px] z-10 flex items-stretch gap-[3px] max-w-[calc(100%-110px)] overflow-x-auto pb-px">
+          {/* cursor / select */}
+          <button
+            onClick={() => { setToolBoth('cursor'); pendingRef.current = null }}
+            title="Cursor / select — click a drawing to move or edit it · Del removes · Esc cancels"
+            className={`flex items-center gap-1 px-1.5 py-[3px] rounded border shrink-0 transition-colors ${
+              tool === 'cursor' ? 'bg-primary/25 border-primary/50 text-foreground' : 'bg-card/85 border-border text-muted-foreground hover:text-foreground hover:bg-secondary'
+            }`}
+          >
+            <MousePointer2 className="h-3 w-3" />
+            <span className="text-[9px] font-semibold leading-none whitespace-nowrap">Cursor</span>
+          </button>
+          <TbSep />
+
           {/* chart type */}
-          <HoverMenu
-            title="Chart type — hover to pick"
+          <ToolMenu
+            label="Type"
+            info="Chart type — candles / line / area (per chart)"
+            active={settings.chartType !== 'candles'}
             icon={settings.chartType === 'candles' ? <CandlestickChart className="h-3 w-3" /> : settings.chartType === 'line' ? <LineChart className="h-3 w-3" /> : <AreaChart className="h-3 w-3" />}
           >
-            {([['candles', 'Candles', CandlestickChart], ['line', 'Line', LineChart], ['area', 'Area', AreaChart]] as const).map(([t, label, Icon]) => (
+            {([['candles', 'Candles', CandlestickChart], ['line', 'Line', LineChart], ['area', 'Area', AreaChart]] as const).map(([t, lbl, Icon]) => (
               <button
                 key={t}
                 onClick={() => patchSettings({ chartType: t as ChartType })}
                 className={`w-full flex items-center gap-2 px-2 py-1 rounded ${settings.chartType === t ? 'bg-primary/20 text-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
               >
-                <Icon className="h-3.5 w-3.5" /> {label}
+                <Icon className="h-3.5 w-3.5" /> {lbl}
               </button>
             ))}
-          </HoverMenu>
+          </ToolMenu>
 
           {/* indicators (per chart) */}
-          <HoverMenu
-            title="Indicators — hover to pick (per-chart)"
+          <ToolMenu
+            label="Ind"
+            width="w-48"
+            active={Object.values(settings.ind).some(Boolean)}
             tint={Object.values(settings.ind).some(Boolean) ? 'text-[#4dd0e1]' : undefined}
             icon={<Sigma className="h-3 w-3" />}
-            width="w-48"
+            info="Indicators (per chart) — overlays MA20/50, EMA 9/21, VWAP, Bollinger · sub-panels RSI 14, MACD, ADX, Volume"
           >
             <div className="text-[8px] uppercase tracking-wide text-muted-foreground px-2 pt-1">overlays</div>
             {([
               ['sma20', 'MA 20'], ['sma50', 'MA 50'], ['ema', 'EMA 9/21'],
               ['vwap', 'VWAP (session)'], ['boll', 'Bollinger 20·2'],
-            ] as [keyof IndicatorCfg, string][]).map(([k, label]) => (
+            ] as [keyof IndicatorCfg, string][]).map(([k, lbl]) => (
               <label key={k} className="flex items-center gap-2 px-2 py-1 cursor-pointer rounded hover:bg-secondary">
                 <input
                   type="checkbox"
@@ -2264,13 +2961,13 @@ export function CanvasChart({
                   onChange={ev => patchSettings({ ind: { ...settings.ind, [k]: ev.target.checked } })}
                   className="accent-[#3b82f6] h-3 w-3"
                 />
-                <span>{label}</span>
+                <span>{lbl}</span>
               </label>
             ))}
             <div className="text-[8px] uppercase tracking-wide text-muted-foreground px-2 pt-1">sub-panels</div>
             {([
               ['rsi', 'RSI 14'], ['macd', 'MACD 12·26·9'], ['adx', 'ADX 14 (+DI/-DI)'], ['vol', 'Volume'],
-            ] as [keyof IndicatorCfg, string][]).map(([k, label]) => (
+            ] as [keyof IndicatorCfg, string][]).map(([k, lbl]) => (
               <label key={k} className="flex items-center gap-2 px-2 py-1 cursor-pointer rounded hover:bg-secondary">
                 <input
                   type="checkbox"
@@ -2278,25 +2975,27 @@ export function CanvasChart({
                   onChange={ev => patchSettings({ ind: { ...settings.ind, [k]: ev.target.checked } })}
                   className="accent-[#3b82f6] h-3 w-3"
                 />
-                <span>{label}</span>
+                <span>{lbl}</span>
               </label>
             ))}
-          </HoverMenu>
+          </ToolMenu>
 
           {/* ghost candles — any timeframe, both directions */}
-          <HoverMenu
-            title="Ghost candles — inner timeframe (auto-calc, works lower OR higher than the chart tf)"
-            tint={settings.ghost ? 'text-[#e0a63f] border-[#e0a63f]/40' : undefined}
+          <ToolMenu
+            label="Ghost"
+            width="w-56"
+            active={settings.ghost}
+            tint={settings.ghost ? 'text-[#e0a63f]' : undefined}
             icon={<Ghost className="h-3 w-3" />}
-            width="w-52"
+            info="Ghost candles — live feed ALWAYS SOLID · ghost ALWAYS HOLLOW · pick any tf either way (5m live + 1m ghost, or 1m live + 5m ghost). Solid candles are carved hollow where the ghost overlaps so the ghost always reads."
           >
             <button
               onClick={() => patchSettings({ ghost: !settings.ghost })}
               className={`w-full px-2 py-1 rounded font-semibold ${settings.ghost ? 'bg-[#e0a63f]/20 text-[#e0a63f]' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
             >
-              {settings.ghost ? `Ghost ON — inner ${settings.ghostTf}` : 'Ghost OFF — enable'}
+              {settings.ghost ? `Ghost ON — ghost tf ${settings.ghostTf}` : 'Ghost OFF — enable'}
             </button>
-            <div className="px-2 pt-1 text-[8px] uppercase tracking-wide text-muted-foreground">inner timeframe</div>
+            <div className="px-2 pt-1 text-[8px] uppercase tracking-wide text-muted-foreground">ghost timeframe (lower or higher than the chart)</div>
             <div className="flex gap-0.5 px-1.5 pb-1">
               {(['1m', '3m', '5m', '15m', '1h'] as const).map(g => (
                 <button
@@ -2313,23 +3012,29 @@ export function CanvasChart({
                   key={s}
                   onClick={() => patchSettings({ ghostStyle: s })}
                   className={`flex-1 px-1 py-0.5 rounded text-[9px] ${(settings.ghostStyle ?? 'hollow') === s ? 'bg-primary text-primary-foreground' : 'bg-secondary/70 text-muted-foreground hover:text-foreground'}`}
-                >{s === 'hollow' ? 'Hollow shells' : 'Fade inner'}</button>
+                >{s === 'hollow' ? 'Hollow' : 'Fade'}</button>
               ))}
             </div>
             <div className="px-2 pb-1 text-[8px] text-muted-foreground leading-snug">
-              ghost tf &lt; chart: solid inner bars in hollow shells · ghost tf &gt; chart: shells auto-calc from the chart bars
+              live feed = SOLID · ghost = HOLLOW (always). ghost tf &gt; chart → hollow shells wrap the solid bars · ghost tf &lt; chart → hollow inside, solid candle carved open under each ghost bar.
             </div>
-          </HoverMenu>
+          </ToolMenu>
 
           {/* scales */}
-          <HoverMenu title="Axis scales — price / % / inverted % / points + baseline" icon={<Ruler className="h-3 w-3" />} width="w-60">
+          <ToolMenu
+            label="Scale"
+            width="w-60"
+            active={!!settings.scales && Object.entries(settings.scales).filter(([k]) => k !== 'price').some(([, v]) => v)}
+            icon={<Ruler className="h-3 w-3" />}
+            info="Axis scales — price / % / inverted % / points + draggable baseline (topmost enabled = right axis, others = left column)"
+          >
             <div className="text-[8px] uppercase tracking-wide text-muted-foreground px-2 pt-1">topmost enabled = right axis · others = left column</div>
             {([
               ['price', 'Price'],
               ['pct', 'Percent'],
               ['inv', 'Inverted % (sellers)'],
               ['pts', 'Points'],
-            ] as [keyof ScalesCfg, string][]).map(([k, label]) => (
+            ] as [keyof ScalesCfg, string][]).map(([k, lbl]) => (
               <label key={k} className="flex items-center gap-2 px-2 py-1 cursor-pointer rounded hover:bg-secondary">
                 <input
                   type="checkbox"
@@ -2337,7 +3042,7 @@ export function CanvasChart({
                   onChange={ev => patchSettings({ scales: { ...(settings.scales ?? { price: true, pct: false, inv: false, pts: false }), [k]: ev.target.checked } })}
                   className="accent-[#3b82f6]"
                 />
-                <span>{label}</span>
+                <span>{lbl}</span>
               </label>
             ))}
             <button
@@ -2346,42 +3051,127 @@ export function CanvasChart({
             >
               Set baseline — then click this chart
             </button>
-          </HoverMenu>
+          </ToolMenu>
 
-          {/* draw tools */}
-          <HoverMenu
-            title="Draw tools — hover to pick"
-            tint={tool !== 'cursor' || drawings.length > 0 ? 'text-[#5fb0d8]' : undefined}
-            icon={<PenLine className="h-3 w-3" />}
-            width="w-64"
+          {/* breaks — session / hour / prev-day range (per chart) */}
+          <ToolMenu
+            label="Breaks"
+            width="w-56"
+            active={Object.values(settings.breaks ?? {}).some(Boolean)}
+            tint={Object.values(settings.breaks ?? {}).some(Boolean) ? 'text-[#e0a63f]' : undefined}
+            icon={<span className="h-3 w-3 leading-none font-bold text-[10px]">⑂</span>}
+            info="Breaks — session 09:15 / 15:30 lines + shading · hourly dividers · prev-day range PDH/PDL with break markers (per chart)"
           >
-            <button
-              onClick={() => setToolBoth('cursor')}
-              className={`w-full flex items-center gap-2 px-2 py-1 rounded ${tool === 'cursor' ? 'bg-primary/20 text-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
-            >
-              <MousePointer2 className="h-3 w-3" /> Cursor / select
-            </button>
-            {TOOL_META.map(t => (
-              <button
-                key={t.id}
-                onClick={() => { setToolBoth(t.id); pendingRef.current = null }}
-                className={`w-full flex items-center justify-between gap-2 px-2 py-1 rounded ${tool === t.id ? 'bg-primary/20 text-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
-              >
-                <span>{t.label}</span>
-                <span className="text-[8px] text-muted-foreground/70">{t.hint}</span>
-              </button>
+            {([
+              ['session', 'Session breaks', '09:15 / 15:30 IST lines + band'],
+              ['hour', 'Hour breaks', 'dashed line each IST hour in-session'],
+              ['range', 'Range breaks', 'PDH/PDL lines + break markers'],
+            ] as [keyof ChartSettings['breaks'], string, string][]).map(([k, lbl, hint]) => (
+              <label key={k} className="flex items-start gap-2 px-2 py-1 cursor-pointer rounded hover:bg-secondary">
+                <input
+                  type="checkbox"
+                  checked={!!settings.breaks?.[k]}
+                  onChange={ev => patchSettings({ breaks: { ...(settings.breaks ?? { session: false, hour: false, range: false }), [k]: ev.target.checked } })}
+                  className="accent-[#e0a63f] h-3 w-3 mt-0.5"
+                />
+                <span>
+                  <span className="block">{lbl}</span>
+                  <span className="block text-[8px] text-muted-foreground">{hint}</span>
+                </span>
+              </label>
             ))}
-            <div className="border-t border-border mt-1 pt-1 flex items-center justify-between px-2">
-              <span className="text-[8px] text-muted-foreground">{drawings.length} object(s) · Del removes selected</span>
-              <button
-                onClick={() => { commitDrawings([]); setSel(null) }}
-                className="p-1 rounded text-muted-foreground hover:text-[#ff4d5e]"
-                title="Clear all drawings on this chart"
+          </ToolMenu>
+
+          <TbSep />
+
+          {/* draw tool groups — single row, icon + group text */}
+          {TOOL_GROUP_ORDER.map(group => {
+            const items = TOOL_META.filter(t => t.group === group)
+            const grpActive = tool !== 'cursor' && TOOL_META.find(t => t.id === tool)?.group === group
+            return (
+              <ToolMenu
+                key={group}
+                label={group}
+                width="w-72"
+                active={grpActive}
+                tint={grpActive ? 'text-[#5fb0d8]' : undefined}
+                icon={TOOL_GROUP_ICONS[group]}
+                info={`${group} tools — ${items.map(t => t.label).join(' · ')}. Click a tool, then draw on the chart. Del removes selected · Esc cancels.`}
               >
-                <Trash2 className="h-3 w-3" />
-              </button>
-            </div>
-          </HoverMenu>
+                {items.map(t => (
+                  <button
+                    key={t.id}
+                    onClick={() => { setToolBoth(t.id); pendingRef.current = null }}
+                    className={`w-full flex items-center justify-between gap-2 px-2 py-0.5 rounded ${tool === t.id ? 'bg-primary/20 text-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
+                  >
+                    <span>{t.label}</span>
+                    <span className="text-[8px] text-muted-foreground/70 text-right">{t.hint}</span>
+                  </button>
+                ))}
+                {group === 'Pattern' && (
+                  <div className="border-t border-border mt-1 pt-1 px-1.5 pb-1">
+                    <div className="text-[8px] uppercase tracking-wide text-muted-foreground pb-0.5">pattern label</div>
+                    <select
+                      value={patternVariantRef.current}
+                      onChange={e => { patternVariantRef.current = e.target.value; forceRender(n => n + 1) }}
+                      className="w-full h-5 rounded bg-secondary/60 px-1 text-[9px] outline-none"
+                    >
+                      {PATTERN_NAMES.map(p => <option key={p} value={p}>{p}</option>)}
+                    </select>
+                  </div>
+                )}
+              </ToolMenu>
+            )
+          })}
+
+          <TbSep />
+
+          {/* clear all drawings */}
+          <button
+            onClick={() => { commitDrawings([]); setSel(null) }}
+            title={`Clear all drawings on this chart (${drawings.length} object(s) · Del removes just the selected one)`}
+            className={`flex items-center gap-1 px-1.5 py-[3px] rounded border shrink-0 transition-colors ${
+              drawings.length > 0 ? 'bg-card/85 border-border text-muted-foreground hover:text-[#ff4d5e] hover:bg-secondary' : 'bg-card/40 border-border/50 text-muted-foreground/50'
+            }`}
+          >
+            <Trash2 className="h-3 w-3" />
+            <span className="text-[9px] font-semibold leading-none">Clear</span>
+            {drawings.length > 0 && <span className="text-[8px] tabular opacity-70">{drawings.length}</span>}
+          </button>
+        </div>
+      )}
+
+      {/* annotation text entry (text / note / comment / callout / pin / table) */}
+      {textEdit && (
+        <div className="absolute z-30" style={{ left: Math.max(2, textEdit.x), top: Math.max(2, textEdit.y) }}>
+          {textEdit.multiline ? (
+            <textarea
+              autoFocus
+              value={textEdit.value}
+              onChange={ev => setTextEdit({ ...textEdit, value: ev.target.value })}
+              onBlur={commitText}
+              onKeyDown={ev => {
+                if (ev.key === 'Escape') { setTextEdit(null); commitDrawings(drawingsRef.current.filter(d => d.id !== textEdit.id)) }
+                if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) { ev.preventDefault(); commitText() }
+              }}
+              rows={3}
+              cols={22}
+              className="rounded border border-[#e0a63f]/60 bg-popover text-popover-foreground text-[10px] p-1 outline-none shadow-xl"
+            />
+          ) : (
+            <input
+              autoFocus
+              value={textEdit.value}
+              onChange={ev => setTextEdit({ ...textEdit, value: ev.target.value })}
+              onBlur={commitText}
+              onKeyDown={ev => {
+                if (ev.key === 'Enter') { ev.preventDefault(); commitText() }
+                if (ev.key === 'Escape') { setTextEdit(null); commitDrawings(drawingsRef.current.filter(d => d.id !== textEdit.id)) }
+              }}
+              placeholder={textEdit.multiline ? 'rows…' : 'type…'}
+              className="rounded border border-[#e0a63f]/60 bg-popover text-popover-foreground text-[10px] px-1.5 py-0.5 outline-none shadow-xl w-36"
+            />
+          )}
         </div>
       )}
 

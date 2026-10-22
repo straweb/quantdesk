@@ -1,5 +1,6 @@
 import { db } from '../db'
 import { leverageFor, round2 } from '../charges'
+import { getCash } from '@brokers/database'
 import type { CapitalMode } from '../types'
 
 // ============================================================
@@ -11,11 +12,25 @@ import type { CapitalMode } from '../types'
 // INITIAL_WITH_LOSS_REDUCTION : deployable = initial, reduced by every loss
 //                               incl. brokerage/charges/tax; profits do not add.
 // All modes respect margin currently locked in open positions (deployed).
+//
+// CAPITAL SOURCE (round-8): the initial capital itself can be
+//   · FIXED               — a fixed rupee amount (initialCapital), or
+//   · AVAILABLE_CASH_PCT  — capitalPct % of the account's LIVE available
+//                           cash (broker funds), recomputed on every read
+//                           so sizing always tracks the real balance.
 // ============================================================
+
+export type CapitalBase = 'FIXED' | 'AVAILABLE_CASH_PCT'
 
 export interface CapitalState {
   mode: CapitalMode
   initialCapital: number
+  /** resolved initial capital (base applied) — what sizing actually uses */
+  effectiveInitial: number
+  /** the account's live available cash (broker funds) when known */
+  availableCash: number | null
+  capitalBase: CapitalBase
+  capitalPct: number
   realizedPnl: number
   chargesPaid: number
   deployed: number
@@ -25,9 +40,24 @@ export interface CapitalState {
 export async function getCapitalState(accountId: string): Promise<CapitalState | null> {
   const c = await db.capitalConfig.findUnique({ where: { accountId } })
   if (!c) return null
+  const capitalBase = (c.capitalBase as CapitalBase) ?? 'FIXED'
+  const capitalPct = c.capitalPct ?? 100
+  // always resolve the live available cash (UI shows it + % preview)
+  let availableCash: number | null = null
+  try {
+    const acc = await db.brokerAccount.findUnique({ where: { id: accountId }, select: { brokerType: true } })
+    if (acc) availableCash = getCash(acc.brokerType, accountId)
+  } catch { availableCash = null }
+  const effectiveInitial = capitalBase === 'AVAILABLE_CASH_PCT' && availableCash != null
+    ? round2(Math.max(0, availableCash * (capitalPct / 100)))
+    : c.initialCapital
   return {
     mode: c.mode as CapitalMode,
     initialCapital: c.initialCapital,
+    effectiveInitial,
+    availableCash,
+    capitalBase,
+    capitalPct,
     realizedPnl: c.realizedPnl,
     chargesPaid: c.chargesPaid,
     deployed: c.deployed,
@@ -36,16 +66,23 @@ export async function getCapitalState(accountId: string): Promise<CapitalState |
 }
 
 export function computeUsableCapital(s: CapitalState): number {
+  const initial = s.effectiveInitial ?? s.initialCapital
+  // % of available cash: the cash balance IS the live pot (PnL already
+  // inside it) — usable = share of cash − margin deployed. The house
+  // sizing modes apply to the FIXED rupee base only.
+  if (s.capitalBase === 'AVAILABLE_CASH_PCT' && s.availableCash != null) {
+    return round2(Math.max(0, initial - s.deployed))
+  }
   let base: number
   switch (s.mode) {
     case 'PROFIT_ONLY':
-      base = s.firstTradeDone ? s.realizedPnl : s.initialCapital
+      base = s.firstTradeDone ? s.realizedPnl : initial
       break
     case 'INITIAL_PLUS_PNL':
-      base = s.initialCapital + s.realizedPnl
+      base = initial + s.realizedPnl
       break
     case 'INITIAL_WITH_LOSS_REDUCTION':
-      base = s.initialCapital + Math.min(0, s.realizedPnl)
+      base = initial + Math.min(0, s.realizedPnl)
       break
   }
   return round2(Math.max(0, base - s.deployed))
@@ -53,15 +90,20 @@ export function computeUsableCapital(s: CapitalState): number {
 
 export function explainCapital(s: CapitalState): string {
   const usable = computeUsableCapital(s)
+  const initial = s.effectiveInitial ?? s.initialCapital
+  if (s.capitalBase === 'AVAILABLE_CASH_PCT') {
+    return `${s.capitalPct}% of available cash ₹${round2(s.availableCash ?? 0)} = ₹${round2(initial)} − deployed ₹${round2(s.deployed)} (tracks the live balance; sizing mode bypassed)`
+  }
+  const baseTxt = `Initial ₹${round2(initial)}`
   switch (s.mode) {
     case 'PROFIT_ONLY':
       return s.firstTradeDone
         ? `First trade done — deployable = net profit pool ₹${round2(s.realizedPnl)} (− deployed ₹${round2(s.deployed)})`
-        : `First trade pending — full initial ₹${round2(s.initialCapital)} deployable`
+        : `First trade pending — full ${baseTxt} deployable`
     case 'INITIAL_PLUS_PNL':
-      return `Initial ₹${round2(s.initialCapital)} + PnL ₹${round2(s.realizedPnl)} − deployed ₹${round2(s.deployed)}`
+      return `${baseTxt} + PnL ₹${round2(s.realizedPnl)} − deployed ₹${round2(s.deployed)}`
     case 'INITIAL_WITH_LOSS_REDUCTION':
-      return `Initial ₹${round2(s.initialCapital)} reduced by losses/charges ₹${round2(Math.max(0, -s.realizedPnl))} − deployed ₹${round2(s.deployed)}`
+      return `${baseTxt} reduced by losses/charges ₹${round2(Math.max(0, -s.realizedPnl))} − deployed ₹${round2(s.deployed)}`
   }
   return `Usable ₹${usable}`
 }

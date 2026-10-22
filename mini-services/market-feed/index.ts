@@ -951,7 +951,7 @@ function buildCorePayload(): SyncCoreRow | null {
     accounts = master.prepare(`
       SELECT ba.id, ba.label, ba.brokerType, ba.status, ba.isActive, ba.isOrderEnabled,
              ba.isLiveDataSource, ba.isCopyMaster, ba.clientId,
-             cc.initialCapital, cc.mode, cc.realizedPnl, cc.chargesPaid, cc.deployed, cc.firstTradeDone
+             cc.initialCapital, cc.mode, cc.capitalBase, cc.capitalPct, cc.realizedPnl, cc.chargesPaid, cc.deployed, cc.firstTradeDone
       FROM BrokerAccount ba LEFT JOIN CapitalConfig cc ON cc.accountId = ba.id
       ORDER BY ba.sortOrder ASC
     `).all() as SyncCoreRow[]
@@ -970,16 +970,32 @@ function buildCorePayload(): SyncCoreRow | null {
 
   for (const a of accounts) {
     const mode = String(a.mode ?? 'INITIAL_PLUS_PNL')
-    const initialCapital = Number(a.initialCapital ?? 0)
     const realizedPnl = Number(a.realizedPnl ?? 0)
     const deployed = Number(a.deployed ?? 0)
+    // broker DB (opened first so the %-of-cash base can read live funds)
+    const brokerDb = openRO(path.join(FEED_PROJECT_ROOT, 'db', 'brokers', String(a.brokerType).toLowerCase(), `${a.id}.db`))
+    // capital source: FIXED rupee amount or % of the account's live available cash
+    const capitalBase = String(a.capitalBase ?? 'FIXED')
+    const capitalPct = Number(a.capitalPct ?? 100)
+    let availableCash: number | null = null
+    if (brokerDb && capitalBase === 'AVAILABLE_CASH_PCT') {
+      try {
+        const f = brokerDb.prepare('SELECT cash FROM funds WHERE id = 1').get() as { cash: number } | undefined
+        availableCash = Number(f?.cash ?? 0)
+      } catch { availableCash = null }
+    }
+    const initialCapital = capitalBase === 'AVAILABLE_CASH_PCT' && availableCash != null
+      ? r2(Math.max(0, availableCash * (capitalPct / 100)))
+      : Number(a.initialCapital ?? 0)
     let base: number
-    if (mode === 'PROFIT_ONLY') base = a.firstTradeDone ? realizedPnl : initialCapital
+    if (capitalBase === 'AVAILABLE_CASH_PCT' && availableCash != null) {
+      // % of live cash: the balance already contains PnL — usable = share − deployed
+      base = initialCapital
+    } else if (mode === 'PROFIT_ONLY') base = a.firstTradeDone ? realizedPnl : initialCapital
     else if (mode === 'INITIAL_WITH_LOSS_REDUCTION') base = initialCapital + Math.min(0, realizedPnl)
     else base = initialCapital + realizedPnl
     const usable = r2(Math.max(0, base - deployed))
 
-    const brokerDb = openRO(path.join(FEED_PROJECT_ROOT, 'db', 'brokers', String(a.brokerType).toLowerCase(), `${a.id}.db`))
     let openPos = 0, openOrd = 0
     let aUnreal = 0
     if (brokerDb) {
@@ -1061,6 +1077,7 @@ function buildCorePayload(): SyncCoreRow | null {
       isActive: !!a.isActive, isLiveDataSource: !!a.isLiveDataSource, isOrderEnabled: !!a.isOrderEnabled,
       isCopyMaster: !!a.isCopyMaster, clientId: a.clientId ?? null,
       usableCapital: usable, initialCapital: r2(initialCapital), realizedPnl: r2(realizedPnl),
+      capitalBase, capitalPct, availableCash: availableCash != null ? r2(availableCash) : null,
       chargesPaid: r2(Number(a.chargesPaid ?? 0)), deployed: r2(deployed),
       mode, modeLabel: mode, firstTradeDone: !!a.firstTradeDone,
       openPositions: openPos, openOrders: openOrd,

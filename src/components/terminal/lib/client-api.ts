@@ -162,10 +162,13 @@ export interface ChainStrikeRow {
 async function j<T>(res: Response): Promise<T> {
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
-    const apiErr = (data as { error?: string }).error
+    const d = data as { error?: string; message?: string }
     // Gateway/proxy error pages return HTML (not JSON) — surface a readable message
-    if (!apiErr && res.status >= 502) throw new Error(`Server unreachable (HTTP ${res.status}) — try again in a few seconds`)
-    throw new Error(apiErr || `HTTP ${res.status}`)
+    if (!d.error && !d.message && res.status >= 502) throw new Error(`Server unreachable (HTTP ${res.status}) — try again in a few seconds`)
+    // /api/orders returns 422 with the master-order result — lead with its message
+    const legs = (data as { legs?: { message?: string }[] }).legs
+    const legMsg = legs?.find(l => l.message)?.message
+    throw new Error(d.message || d.error || (legMsg ? `order rejected — ${legMsg}` : `HTTP ${res.status}`))
   }
   return data as T
 }
@@ -298,6 +301,14 @@ export const api = {
   patchGtt: (id: string, body: Record<string, unknown>) =>
     fetch(`/api/gtt/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => j<{ ok: boolean; rule: GttRuleRow }>(r)),
   deleteGtt: (id: string) => fetch(`/api/gtt/${id}`, { method: 'DELETE' }).then(r => j<{ ok: boolean }>(r)),
+
+  // ---- broker session auth (OAuth-style: ICICI Breeze / Dhan / Shoonya) ----
+  brokerAuthStatus: (accountId: string) =>
+    fetch(`/api/broker-auth?accountId=${encodeURIComponent(accountId)}`).then(r => j<BrokerAuthStatus>(r)),
+  brokerAuthConsent: (accountId: string) =>
+    fetch('/api/broker-auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accountId, action: 'consent' }) }).then(r => j<{ ok: boolean; loginUrl?: string; message: string }>(r)),
+  brokerAuthComplete: (accountId: string, code: string) =>
+    fetch('/api/broker-auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accountId, action: 'complete', code }) }).then(r => j<{ ok: boolean; message: string }>(r)),
   marginCalc: (body: { accountId: string; symbol: string; side: string; qty: number; price: number; productType?: string }) =>
     fetch('/api/margin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => j<MarginResp>(r)),
 }
@@ -326,6 +337,22 @@ export interface PortfolioResp {
   portfolio: PortfolioAccount[]
   positions: { accountId: string; accountLabel: string; symbol: string; netQty: number; avgPrice: number; ltp: number; lotSize: number }[]
   ts: string
+}
+
+/** Broker session-auth flow descriptor (GET /api/broker-auth). */
+export interface BrokerAuthStatus {
+  accountId: string
+  label: string
+  brokerType: string
+  sessionKind: 'daily' | 'fixed' | 'none'
+  hasSession: boolean
+  sessionMasked: string | null
+  userId: string | null
+  liveCapable: boolean
+  mode: string
+  loginUrl: string | null
+  instructions: string[]
+  fieldsNeeded: string[]
 }
 
 export interface GttRuleRow {

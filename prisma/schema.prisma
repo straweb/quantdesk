@@ -54,6 +54,10 @@ model CapitalConfig {
   account        BrokerAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
   initialCapital Float
   mode           String   @default("INITIAL_PLUS_PNL")
+  // capital source (round-8): FIXED rupee amount, or a % of the account's
+  // LIVE available cash (broker funds) recomputed on every sizing call
+  capitalBase    String   @default("FIXED") // FIXED | AVAILABLE_CASH_PCT
+  capitalPct     Float    @default(100)     // % of available cash when capitalBase = AVAILABLE_CASH_PCT
   realizedPnl    Float    @default(0) // net realized pnl (trades only)
   chargesPaid    Float    @default(0) // cumulative brokerage+taxes+charges
   deployed       Float    @default(0) // margin locked in open positions

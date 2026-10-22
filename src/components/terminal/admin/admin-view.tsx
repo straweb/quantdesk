@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { RefreshCw, Trash2, Download, Radio, ShieldAlert, ShieldCheck, X } from 'lucide-react'
+import { KeyRound, RefreshCw, Trash2, Download, Radio, ShieldAlert, ShieldCheck, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
@@ -228,12 +228,22 @@ function TickRecorder() {
 }
 
 // ---------------- Broker accounts ----------------
+// OAuth-style session model (aligned with straweb/hedging broker flows):
+//  · ICICI Breeze — API key (+secret) → login redirect ?apisession= →
+//    customerdetails exchange → session_key
+//  · Dhan — app_id/app_secret → generate-consent → consentApp-login →
+//    consumeApp-consent (tokenId) → accessToken (or paste a direct JWT)
+//  · Shoonya — api_key/client_id + secret → prism login ?code= →
+//    GenAcsTok (sha256 checksum) → susertoken (or QuickAuth uid+pwd+PAN)
 function AccountsManager() {
   const qc = useQueryClient()
   const { data } = useQuery({ queryKey: ['accounts'], queryFn: () => api.accounts(), refetchInterval: 5000 })
   const [dlgOpen, setDlgOpen] = useState(false)
-  const [form, setForm] = useState<{ label: string; brokerType: BrokerType; clientId: string; initialCapital: string; mode: CapitalMode; apiKey: string; secret: string }>({
-    label: '', brokerType: 'SIMFEED', clientId: '', initialCapital: '500000', mode: 'INITIAL_PLUS_PNL', apiKey: '', secret: '',
+  const [form, setForm] = useState<{
+    label: string; brokerType: BrokerType; clientId: string; initialCapital: string; mode: CapitalMode
+    apiKey: string; secret: string; extra: string
+  }>({
+    label: '', brokerType: 'SIMFEED', clientId: '', initialCapital: '500000', mode: 'INITIAL_PLUS_PNL', apiKey: '', secret: '', extra: '',
   })
 
   const accounts = data?.accounts ?? []
@@ -241,8 +251,9 @@ function AccountsManager() {
   const create = async () => {
     try {
       const credentials: Record<string, string> = {}
-      if (form.apiKey) credentials[credentialKeyFor(form.brokerType)] = form.apiKey
-      if (form.secret) credentials[secretKeyFor(form.brokerType)] = form.secret
+      for (const [k, v] of Object.entries(oauthFieldsFor(form.brokerType, form))) {
+        if (v?.trim()) credentials[k] = v.trim()
+      }
       await api.createAccount({
         label: form.label,
         brokerType: form.brokerType,
@@ -253,7 +264,7 @@ function AccountsManager() {
       })
       toast.success(`Account "${form.label}" added`)
       setDlgOpen(false)
-      setForm({ ...form, label: '', clientId: '', apiKey: '', secret: '' })
+      setForm({ ...form, label: '', clientId: '', apiKey: '', secret: '', extra: '' })
       qc.invalidateQueries({ queryKey: ['accounts'] })
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed')
@@ -312,12 +323,19 @@ function AccountsManager() {
                   </Select>
                 </Field>
               </div>
-              <Field label={credentialLabelFor(form.brokerType)} hint="Encrypted at rest (AES-256-GCM). Leave blank for sandbox mode.">
+              <Field label={credFieldLabel(form.brokerType)} hint="Encrypted at rest (AES-256-GCM). OAuth session tokens are created per-day via the Session button after adding.">
                 <Input value={form.apiKey} onChange={e => setForm({ ...form, apiKey: e.target.value })} className="h-8" />
               </Field>
-              <Field label={secretLabelFor(form.brokerType)}>
-                <Input type="password" value={form.secret} onChange={e => setForm({ ...form, secret: e.target.value })} className="h-8" />
-              </Field>
+              {form.brokerType !== 'SIMFEED' && (
+                <Field label={secretFieldLabel(form.brokerType)}>
+                  <Input type="password" value={form.secret} onChange={e => setForm({ ...form, secret: e.target.value })} className="h-8" />
+                </Field>
+              )}
+              {extraFieldLabel(form.brokerType) && (
+                <Field label={extraFieldLabel(form.brokerType)!}>
+                  <Input value={form.extra} onChange={e => setForm({ ...form, extra: e.target.value })} className="h-8" />
+                </Field>
+              )}
               <Button className="h-8 text-xs" onClick={create} disabled={!form.label}>Add Account</Button>
             </div>
           </DialogContent>
@@ -358,6 +376,7 @@ function AccountsManager() {
             </div>
             <div className="flex items-center gap-1 ml-auto">
               <ModeSelect id={a.id} current={a.modeLabel} />
+              {a.brokerType !== 'SIMFEED' && <SessionDialog accountId={a.id} label={a.label} brokerType={a.brokerType} />}
               <Button variant="ghost" size="sm" className="h-7 px-1.5" title="Delete"
                 onClick={() => remove(a.id, a.label)}>
                 <Trash2 className="h-3.5 w-3.5 text-[#ff4d5e]" />
@@ -370,17 +389,119 @@ function AccountsManager() {
   )
 }
 
-function credentialKeyFor(b: BrokerType) {
-  return b === 'DHAN' ? 'accessToken' : b === 'SHOONYA' ? 'sessionId' : b === 'ICICI_BREEZE' ? 'sessionToken' : 'apiKey'
+/** Map the add-account form to the broker's OAuth credential schema
+ *  (app credentials — session tokens are created via the Session dialog). */
+function oauthFieldsFor(b: BrokerType, form: { apiKey: string; secret: string; extra: string; clientId: string }): Record<string, string> {
+  switch (b) {
+    case 'ICICI_BREEZE':
+      return { apiKey: form.apiKey, apiSecret: form.secret }
+    case 'DHAN':
+      return { appId: form.apiKey, appSecret: form.secret, clientId: form.extra || form.clientId }
+    case 'SHOONYA':
+      return { userId: form.extra || form.clientId, apiKey: form.apiKey, apiSecret: form.secret }
+    default:
+      return { apiKey: form.apiKey, secret: form.secret }
+  }
 }
-function secretKeyFor(b: BrokerType) {
-  return b === 'DHAN' ? 'clientId' : b === 'SHOONYA' ? 'userId' : b === 'ICICI_BREEZE' ? 'apiKey' : 'secret'
+function credFieldLabel(b: BrokerType) {
+  return b === 'DHAN' ? 'App ID (API key)' : b === 'SHOONYA' ? 'API key (app client_id)' : b === 'ICICI_BREEZE' ? 'API key (Breeze AppKey)' : 'API Key'
 }
-function credentialLabelFor(b: BrokerType) {
-  return b === 'DHAN' ? 'Access Token' : b === 'SHOONYA' ? 'Session Token (jKey)' : b === 'ICICI_BREEZE' ? 'Session Token' : 'API Key'
+function secretFieldLabel(b: BrokerType) {
+  return b === 'DHAN' ? 'App Secret' : b === 'SHOONYA' ? 'API Secret' : b === 'ICICI_BREEZE' ? 'API Secret' : 'Secret'
 }
-function secretLabelFor(b: BrokerType) {
-  return b === 'DHAN' ? 'Dhan Client ID' : b === 'SHOONYA' ? 'User ID' : b === 'ICICI_BREEZE' ? 'API Key' : 'Secret'
+function extraFieldLabel(b: BrokerType): string | null {
+  return b === 'DHAN' ? 'Dhan Client ID' : b === 'SHOONYA' ? 'User ID (login id)' : null
+}
+
+// ---------------- Broker session (OAuth) dialog ----------------
+// Per-broker day-session creation: open the login URL → paste the
+// redirect code/token → the server exchanges it for session tokens.
+function SessionDialog({ accountId, label, brokerType }: { accountId: string; label: string; brokerType: string }) {
+  const [open, setOpen] = useState(false)
+  const [code, setCode] = useState('')
+  const [busy, setBusy] = useState(false)
+  const qc = useQueryClient()
+  const { data: st } = useQuery({
+    queryKey: ['broker-auth', accountId],
+    queryFn: () => api.brokerAuthStatus(accountId),
+    enabled: open,
+    refetchInterval: 15_000,
+  })
+  const isDhan = brokerType === 'DHAN'
+  const isShoonya = brokerType === 'SHOONYA'
+  const isIcici = brokerType === 'ICICI_BREEZE'
+
+  const run = async (fn: () => Promise<{ ok: boolean; message: string }>) => {
+    setBusy(true)
+    try {
+      const r = await fn()
+      r.ok ? toast.success(r.message) : toast.error(r.message)
+      if (r.ok) { setCode(''); qc.invalidateQueries({ queryKey: ['broker-auth', accountId] }) }
+    } catch (e) { toast.error(e instanceof Error ? e.message : 'failed') }
+    setBusy(false)
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button variant="ghost" size="sm" className="h-7 px-1.5 gap-1" title={`Create the ${brokerType} API session`}>
+          <KeyRound className={`h-3.5 w-3.5 ${st?.hasSession ? 'text-[#00c896]' : 'text-muted-foreground'}`} />
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="bg-popover max-w-lg">
+        <DialogHeader><DialogTitle>Broker session — {label}</DialogTitle></DialogHeader>
+        <div className="space-y-3 text-xs">
+          {st && (
+            <div className="flex flex-wrap items-center gap-2 text-[10px]">
+              <span className={`px-1.5 py-0.5 rounded ${st.hasSession ? 'bg-up text-[#00c896]' : 'bg-secondary text-muted-foreground'}`}>
+                {st.hasSession ? `session ${st.sessionMasked}` : 'no session'}
+              </span>
+              <span className="text-muted-foreground">{st.mode}</span>
+              <span className="text-muted-foreground">· session kind: {st.sessionKind}</span>
+            </div>
+          )}
+          <ol className="list-decimal list-inside space-y-0.5 text-[10px] text-muted-foreground">
+            {(st?.instructions ?? []).map((s, i) => <li key={i}>{s}</li>)}
+          </ol>
+          {st?.loginUrl && (
+            <div className="flex items-center gap-1.5">
+              <a href={st.loginUrl} target="_blank" rel="noreferrer" className="text-[10px] underline text-[#4dd0e1] truncate flex-1" title={st.loginUrl}>
+                {st.loginUrl}
+              </a>
+              <Button size="sm" variant="secondary" className="h-6 text-[10px]" onClick={() => { void navigator.clipboard?.writeText(st.loginUrl!); toast.info('Login URL copied') }}>copy</Button>
+            </div>
+          )}
+          {isDhan && (
+            <Button size="sm" variant="secondary" className="h-7 text-[10px]" disabled={busy}
+              onClick={() => run(() => api.brokerAuthConsent(accountId))}>
+              1 · Generate consent (app_id + app_secret)
+            </Button>
+          )}
+          <div className="space-y-1">
+            <div className="text-[10px] text-muted-foreground">
+              {isIcici ? '2 · Paste the apisession from the redirect URL'
+                : isDhan ? '3 · Paste the tokenId (or a direct access token)'
+                : isShoonya ? '2 · Paste the code from the redirect URL (or use QuickAuth below)'
+                : 'Paste the session token'}
+            </div>
+            <div className="flex gap-1.5">
+              <Input value={code} onChange={e => setCode(e.target.value.trim())} placeholder="code / token…" className="h-8 text-[11px]" />
+              <Button size="sm" className="h-8 text-[11px]" disabled={busy || !code}
+                onClick={() => run(() => api.brokerAuthComplete(accountId, code))}>
+                Create session
+              </Button>
+            </div>
+          </div>
+          {isShoonya && (
+            <div className="border-t border-border pt-2 text-[10px] text-muted-foreground">
+              Direct QuickAuth (no browser): save the account with User ID + API secret, then paste
+              <b> pwd:factor2 </b>(password:PAN/DOB, optionally <b>:totp</b>) as the code above — e.g. <code>mypass:ABCD1</code>.
+            </div>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {

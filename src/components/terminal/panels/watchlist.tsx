@@ -36,6 +36,30 @@ type BuiltinTab = 'watch' | 'index' | 'fno'
 type TabKey = BuiltinTab | `user:${string}`
 
 type SortKey = 'sym' | 'ltp' | 'chg'
+type ConstitSortKey = 'pts' | 'sym' | 'ltp' | 'chg' | 'vol'
+
+/** Depth-add icon for any watchlist row — loads the symbol into the ACTIVE
+ *  workspace's bottom-left depth panel stack. */
+function DepthAddIcon({ symbol }: { symbol: string }) {
+  const add = () => {
+    const st = useTerminal.getState()
+    const cur = st.workspaces.find(w => w.id === st.activeWs)
+    if (!cur) return
+    const { patch, error } = addDepthPanelTo(cur, symbol)
+    if (error) { toast.info(error); return }
+    st.patchWs(cur.id, patch)
+    toast.success(`Depth panel added — ${symbol}`)
+  }
+  return (
+    <button
+      onClick={e => { e.stopPropagation(); add() }}
+      title={`Load ${symbol} market depth panel`}
+      className="p-0.5 rounded shrink-0 text-muted-foreground/45 hover:text-foreground hover:bg-secondary/60"
+    >
+      <Layers className="h-3 w-3" />
+    </button>
+  )
+}
 
 export function Watchlist() {
   const [q, setQ] = useState('')
@@ -205,6 +229,9 @@ export function Watchlist() {
   useEffect(() => onTicks(setTicks), [])
 
   const openWs = (symbol: string) => openSymbolWorkspace(symbol, fnoSet.has(symbol))
+  // indices ALWAYS open the spot + ATM CE/PE workspace (charts + right strikes
+  // tab), even when the sim chain is missing — panes show placeholders then
+  const openIdxWs = (symbol: string) => openSymbolWorkspace(symbol, true)
 
   /** star = add/remove in the ACTIVE user tab; on builtin tabs = the Watch list */
   const starFor = (symbol: string): { on: boolean; fn: () => void; title: string } => {
@@ -311,8 +338,8 @@ export function Watchlist() {
                 active={r.symbol === selectedSymbol}
                 starred={watchSymbols.includes(r.symbol)}
                 onStar={() => toggleWatch(r.symbol)}
-                onOpen={() => openWs(r.symbol)}
-                onOpenSymbol={sym => openSymbolWorkspace(sym, false)}
+                onOpen={() => openIdxWs(r.symbol)}
+                onOpenSymbol={sym => openWs(sym)}
                 expanded={expandedIdx === r.symbol}
                 onToggle={() => setExpandedIdx(expandedIdx === r.symbol ? null : r.symbol)}
               />
@@ -424,6 +451,7 @@ function SymbolRowItem({ row, tick, active, starred, onStar, onOpen, fallbackLtp
             {tick?.high ? <span className="text-muted-foreground"> · {tick.high.toFixed(0)}/{tick.low.toFixed(0)}</span> : null}
           </div>
         </div>
+        <DepthAddIcon symbol={row.symbol} />
         {starBtn(starred, onStar)}
       </div>
     </div>
@@ -462,6 +490,7 @@ function FnoRowItem({ row, active, starred, onStar, onOpen }: {
             {row.ltp ? `${row.chgPct >= 0 ? '+' : ''}${row.chgPct.toFixed(2)}%` : '—'}
           </div>
         </div>
+        <DepthAddIcon symbol={row.symbol} />
         {starBtn(starred, onStar)}
       </div>
     </div>
@@ -481,6 +510,8 @@ function IndexRow({ symbol, name, lotSize, tick, active, starred, onStar, onOpen
   expanded: boolean
   onToggle: () => void
 }) {
+  // per-index constituent sort (pts default — biggest contributors first)
+  const [constitSort, setConstitSort] = useState<{ key: ConstitSortKey; asc: boolean }>({ key: 'pts', asc: false })
   const ltp = tick?.ltp ?? 0
   const chg = tick && tick.prevClose ? ((tick.ltp - tick.prevClose) / tick.prevClose) * 100 : 0
   const up = chg >= 0
@@ -515,15 +546,31 @@ function IndexRow({ symbol, name, lotSize, tick, active, starred, onStar, onOpen
             </div>
           </div>
           {starBtn(starred, onStar)}
+          <DepthAddIcon symbol={symbol} />
         </div>
       </div>
-      {expanded && <ConstituentList symbol={symbol} onOpenSymbol={onOpenSymbol} />}
+      {expanded && (
+        <>
+          <div className="flex items-center justify-end gap-0.5 px-2.5 pb-0.5">
+            <span className="text-[8px] text-muted-foreground mr-auto">sort</span>
+            {([['pts', 'pts'], ['sym', 'sym'], ['ltp', 'LTP'], ['chg', 'chg%'], ['vol', 'vol']] as [ConstitSortKey, string][]).map(([k, lbl]) => (
+              <button
+                key={k}
+                onClick={() => { if (k === constitSort.key) setConstitSort(s => ({ ...s, asc: !s.asc })); else setConstitSort({ key: k, asc: k === 'sym' }) }}
+                className={`px-1 py-0.5 rounded text-[8px] ${constitSort.key === k ? 'bg-primary/25 text-foreground' : 'bg-secondary/60 text-muted-foreground hover:text-foreground'}`}
+              >{lbl}{constitSort.key === k ? (constitSort.asc ? '↑' : '↓') : ''}</button>
+            ))}
+          </div>
+          <ConstituentList symbol={symbol} onOpenSymbol={onOpenSymbol} sort={constitSort} />
+        </>
+      )}
     </div>
   )
 }
 
-/** Constituents of an expanded index: H / LTP / L / Vol / chg% / +pts contribution. */
-function ConstituentList({ symbol, onOpenSymbol }: { symbol: string; onOpenSymbol: (s: string) => void }) {
+/** Constituents of an expanded index: H / LTP / L / Vol / chg% / +pts contribution
+ *  + user sorting (pts / symbol / LTP / chg% / vol). */
+function ConstituentList({ symbol, onOpenSymbol, sort }: { symbol: string; onOpenSymbol: (s: string) => void; sort: { key: ConstitSortKey; asc: boolean } }) {
   // realtime via sync:index (2s) — REST fallback when the hub has no payload yet
   const sync = useSyncData<IndexComponentsResp>(
     'sync:index',
@@ -543,7 +590,24 @@ function ConstituentList({ symbol, onOpenSymbol }: { symbol: string; onOpenSymbo
     () => (data?.constituents ?? []).map(c => ({ ...c, key: c.symbol })),
     [data],
   )
-  const sorted = useMemo(() => [...rows].sort((a, b) => b.pts - a.pts), [rows])
+  const sorted = useMemo(() => {
+    const val = (c: IndexComponentRow & { key: string }): number | string => {
+      switch (sort.key) {
+        case 'sym': return c.symbol
+        case 'ltp': return c.ltp
+        case 'chg': return c.chgPct
+        case 'vol': return c.vol ?? 0
+        default: return c.pts
+      }
+    }
+    return [...rows].sort((a, b) => {
+      const va = val(a), vb = val(b)
+      const cmp = typeof va === 'string' || typeof vb === 'string'
+        ? String(va).localeCompare(String(vb))
+        : (va as number) - (vb as number)
+      return sort.asc ? cmp : -cmp
+    })
+  }, [rows, sort])
 
   if (isLoading) return <div className="px-6 py-2 text-[9px] text-muted-foreground">loading constituents…</div>
   if (error || !data) return <div className="px-6 py-2 text-[9px] text-muted-foreground">constituents unavailable</div>
@@ -576,6 +640,7 @@ function ConstituentList({ symbol, onOpenSymbol }: { symbol: string; onOpenSymbo
               <span className="text-muted-foreground">{fmtMoney(c.low, 0)}</span>
               <span className="text-muted-foreground w-10 text-right">{fmtVolShort(c.vol)}</span>
               <span className={`w-12 text-right ${up ? 'term-up' : 'term-down'}`}>{up ? '+' : ''}{c.chgPct.toFixed(2)}%</span>
+              <DepthAddIcon symbol={c.symbol} />
             </div>
           </div>
         )

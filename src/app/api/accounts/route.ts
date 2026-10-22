@@ -5,7 +5,7 @@ import { encryptJson } from '@/lib/crypto'
 import { BROKER_META } from '@/lib/types'
 import type { BrokerType } from '@/lib/types'
 import { computeUsableCapital, getCapitalState } from '@/lib/services/capital-service'
-import { getPositions, getOpenOrders } from '@brokers/database'
+import { getPositions, getOpenOrders, setCash } from '@brokers/database'
 import { bootstrap } from '@/lib/services/bootstrap-service'
 
 export async function GET(req: NextRequest) {
@@ -19,15 +19,8 @@ export async function GET(req: NextRequest) {
   })
   const snapshots: Record<string, unknown>[] = []
   for (const a of accounts) {
-    const capital = a.capital
-    const state = capital ? {
-      mode: capital.mode as never,
-      initialCapital: capital.initialCapital,
-      realizedPnl: capital.realizedPnl,
-      chargesPaid: capital.chargesPaid,
-      deployed: capital.deployed,
-      firstTradeDone: capital.firstTradeDone,
-    } : null
+    // full capital state — resolves FIXED vs %-of-available-cash base
+    const state = await getCapitalState(a.id)
     snapshots.push({
       id: a.id,
       label: a.label,
@@ -39,14 +32,18 @@ export async function GET(req: NextRequest) {
       isOrderEnabled: a.isOrderEnabled,
       isCopyMaster: a.isCopyMaster,
       sortOrder: a.sortOrder,
-      mode: capital?.mode ?? null,
-      modeLabel: state ? capital?.mode : null,
+      mode: state?.mode ?? null,
+      modeLabel: state?.mode ?? null,
       usableCapital: state ? computeUsableCapital(state) : 0,
-      initialCapital: capital?.initialCapital ?? 0,
-      realizedPnl: capital?.realizedPnl ?? 0,
-      chargesPaid: capital?.chargesPaid ?? 0,
-      deployed: capital?.deployed ?? 0,
-      firstTradeDone: capital?.firstTradeDone ?? false,
+      initialCapital: state?.effectiveInitial ?? a.capital?.initialCapital ?? 0,
+      initialCapitalFixed: a.capital?.initialCapital ?? 0,
+      availableCash: state?.availableCash ?? null,
+      capitalBase: state?.capitalBase ?? 'FIXED',
+      capitalPct: state?.capitalPct ?? 100,
+      realizedPnl: a.capital?.realizedPnl ?? 0,
+      chargesPaid: a.capital?.chargesPaid ?? 0,
+      deployed: a.capital?.deployed ?? 0,
+      firstTradeDone: a.capital?.firstTradeDone ?? false,
       openPositions: getPositions(a.brokerType, a.id).filter(p => p.netQty !== 0).length,
       openOrders: getOpenOrders(a.brokerType, a.id).length,
       api: BROKER_META[a.brokerType as BrokerType]?.name ?? a.brokerType,
@@ -84,7 +81,12 @@ export async function POST(req: NextRequest) {
       accountId: acc.id,
       initialCapital: Number(body.initialCapital ?? 100000),
       mode: body.mode ?? 'INITIAL_PLUS_PNL',
+      capitalBase: body.capitalBase === 'AVAILABLE_CASH_PCT' ? 'AVAILABLE_CASH_PCT' : 'FIXED',
+      capitalPct: Number(body.capitalPct ?? 100),
     },
   })
+  // seed the sandbox funds ledger with a REAL balance (available cash) so
+  // the %-of-cash capital base has something meaningful to work with
+  try { setCash(acc.brokerType, acc.id, Number(body.initialCapital ?? 100000)) } catch { /* non-sandbox adapters sync later */ }
   return NextResponse.json({ ok: true, id: acc.id })
 }

@@ -28,6 +28,8 @@ const BASE = 'https://api.dhan.co/v2'
 function headers(creds: Record<string, string> | null): Record<string, string> {
   return {
     'access-token': creds?.accessToken ?? '',
+    // v2 recommends client-id alongside the token (from the OAuth consent flow)
+    ...(creds?.clientId ? { 'client-id': creds.clientId } : {}),
     'Accept': 'application/json',
     'Content-Type': 'application/json',
   }

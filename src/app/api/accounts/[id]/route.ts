@@ -7,6 +7,27 @@ import type { CapitalMode } from '@/lib/types'
 
 type Params = { params: Promise<{ id: string }> }
 
+const FEED_URL = process.env.FEED_SERVICE_URL || 'http://localhost:3004'
+const FEED_SRC_FILE = process.cwd() + '/db/feed-source.json'
+
+/** revert the terminal feed source to sim (used when an account disconnects) */
+async function revertFeedSourceToSim() {
+  try {
+    await fetch(`${FEED_URL}/feed-source`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'sim' }),
+      signal: AbortSignal.timeout(1200),
+      cache: 'no-store',
+    })
+  } catch {
+    try {
+      const { writeFile } = await import('fs/promises')
+      await writeFile(FEED_SRC_FILE, JSON.stringify({ source: 'sim', updatedAt: new Date().toISOString() }, null, 2))
+    } catch { /* feed service will resync */ }
+  }
+}
+
 export async function PATCH(req: NextRequest, { params }: Params) {
   const auth = requireAuth(req)
   if (auth) return auth
@@ -34,16 +55,33 @@ export async function PATCH(req: NextRequest, { params }: Params) {
   }
   await db.brokerAccount.update({ where: { id }, data })
 
-  if (body.initialCapital !== undefined || body.mode !== undefined || body.resetCapital) {
+  // disconnecting an account that was feeding the terminal -> fall back to sim
+  if (body.isActive === false && acc.isLiveDataSource) {
+    await db.brokerAccount.update({ where: { id }, data: { isLiveDataSource: false } })
+    await revertFeedSourceToSim()
+  }
+
+  if (body.initialCapital !== undefined || body.mode !== undefined || body.capitalBase !== undefined || body.capitalPct !== undefined || body.resetCapital) {
     if (acc.capital) {
       if (body.resetCapital) {
         await resetCapital(id, Number(body.initialCapital ?? acc.capital.initialCapital), (body.mode ?? acc.capital.mode) as CapitalMode)
+        if (body.capitalBase !== undefined || body.capitalPct !== undefined) {
+          await db.capitalConfig.update({
+            where: { accountId: id },
+            data: {
+              ...(body.capitalBase !== undefined ? { capitalBase: body.capitalBase === 'AVAILABLE_CASH_PCT' ? 'AVAILABLE_CASH_PCT' : 'FIXED' } : {}),
+              ...(body.capitalPct !== undefined ? { capitalPct: Number(body.capitalPct) || 100 } : {}),
+            },
+          })
+        }
       } else {
         await db.capitalConfig.update({
           where: { accountId: id },
           data: {
             ...(body.initialCapital !== undefined ? { initialCapital: Number(body.initialCapital) } : {}),
             ...(body.mode !== undefined ? { mode: String(body.mode) } : {}),
+            ...(body.capitalBase !== undefined ? { capitalBase: body.capitalBase === 'AVAILABLE_CASH_PCT' ? 'AVAILABLE_CASH_PCT' : 'FIXED' } : {}),
+            ...(body.capitalPct !== undefined ? { capitalPct: Number(body.capitalPct) || 100 } : {}),
           },
         })
       }

@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { api, fmtMoney, sideOffsetLabel, sideStrikeFor } from '../lib/client-api'
 import type { ChainStrikeRow, OptionQuoteCell } from '../lib/client-api'
+import { DepthAddButton } from './option-panes'
 import {
   useTerminal, defaultStrikes, pinStrikePanes,
   type StrikesCfg, type StrikeRowCfg, type WorkspaceCfg, type AllocMode,
@@ -562,7 +563,8 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
               {strikePnl >= 0 ? '+' : ''}{fmtMoney(strikePnl, 0)}
             </span>
           )}
-          <div className="flex gap-0.5 shrink-0">
+          <div className="flex gap-0.5 shrink-0 items-center">
+            {cell?.exists && <DepthAddButton ws={ws} symbol={cell.symbol} />}
             <button onClick={() => rowOrder(row, 'BUY')} title={`Market BUY ${row.strike} ${row.type} (${allocMode === 'FIXED' ? `₹${row.allocAmt ?? 0}` : `${row.allocPct}%`} per account)`} className="px-1 py-0.5 rounded bg-up text-[#00c896] hover:brightness-125 text-[9px] font-bold">B</button>
             <button onClick={() => rowOrder(row, 'SELL')} title={`Market SELL ${row.strike} ${row.type} (${allocMode === 'FIXED' ? `₹${row.allocAmt ?? 0}` : `${row.allocPct}%`} per account)`} className="px-1 py-0.5 rounded bg-down text-[#ff4d5e] hover:brightness-125 text-[9px] font-bold">S</button>
             <button onClick={() => rowExit(row)} title="Exit this strike's position" className="px-1 py-0.5 rounded bg-secondary text-muted-foreground hover:text-foreground text-[9px] font-bold">X</button>

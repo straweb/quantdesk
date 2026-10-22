@@ -151,6 +151,13 @@ export interface AccountSnapshot {
   isCopyMaster: boolean
   usableCapital: number
   initialCapital: number
+  /** capital source: FIXED rupee amount or % of the account's available cash */
+  capitalBase?: 'FIXED' | 'AVAILABLE_CASH_PCT'
+  capitalPct?: number
+  /** live available cash from the broker funds (null when unknown) */
+  availableCash?: number | null
+  /** the stored fixed rupee amount (before the % base resolves) */
+  initialCapitalFixed?: number
   realizedPnl: number
   chargesPaid: number
   deployed: number

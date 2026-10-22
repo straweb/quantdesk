@@ -47,15 +47,16 @@ export async function GET(req: NextRequest) {
       source = (await readSourceFile()) ?? 'sim'
     }
     const accounts = await db.brokerAccount.findMany({
-      where: { isActive: true },
       orderBy: { sortOrder: 'asc' },
-      select: { id: true, label: true, brokerType: true },
+      select: { id: true, label: true, brokerType: true, isActive: true },
     })
     return NextResponse.json({
       source,
       sources: [
-        { id: 'sim', label: 'Sim Feed (built-in)', brokerType: null },
-        ...accounts.map(a => ({ id: a.id, label: a.label, brokerType: a.brokerType as string })),
+        { id: 'sim', label: 'Sim Feed (built-in)', brokerType: null, isActive: true },
+        // every account is listed (disconnected ones too) so the dropdown
+        // can reconnect them — POST still refuses inactive sources
+        ...accounts.map(a => ({ id: a.id, label: a.label, brokerType: a.brokerType as string, isActive: a.isActive })),
       ],
     })
   } catch (e) {
