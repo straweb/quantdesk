@@ -9,6 +9,12 @@ import { onTicks, subscribeTicks, unsubscribeTicks } from '../lib/socket'
 import {
   CandlestickChart, LineChart, AreaChart, Sigma, Ghost, Ruler, Trash2, MousePointer2,
   Slash, AlignJustify, Shapes, TrendingUp, Type, Waves,
+  Pin, Tag, Table, MessageSquare, MessagesSquare, MessageSquareText, Pencil,
+  MoveVertical, MoveUpRight, ArrowUpRight, ArrowRight, Minus, AlignEndHorizontal,
+  Hourglass, Sun, Square, Circle, CalendarClock, Percent, Hash, ArrowDownUp,
+  MoveHorizontal, Crosshair, Clock, CalendarRange, Scissors, BarChartHorizontal,
+  BarChart3, Flag, Triangle, Diamond, Activity, TrendingDown, SquareDashed,
+  PenLine, ListOrdered,
 } from 'lucide-react'
 
 // ============================================================
@@ -129,6 +135,19 @@ function istMs(t: number, minOfDay: number): number {
 /** Shortest fib levels for the extension tool (beyond 100%). */
 const FIB_EXT = [0, 0.382, 0.618, 1, 1.272, 1.618, 2.0, 2.618]
 const PATTERN_NAMES = ['Double Top', 'Double Bottom', 'Head & Shoulders', 'Inv H&S', 'Triangle', 'Wedge', 'ABCD', 'Flag', 'Channel', 'Custom']
+/** visible LIST icons for the pattern picker (round-9: list, not dropdown) */
+const PATTERN_ICONS: Record<string, React.ReactNode> = {
+  'Double Top': <TrendingDown className="h-3 w-3" />,
+  'Double Bottom': <TrendingUp className="h-3 w-3" />,
+  'Head & Shoulders': <Activity className="h-3 w-3" />,
+  'Inv H&S': <Activity className="h-3 w-3" />,
+  'Triangle': <Triangle className="h-3 w-3" />,
+  'Wedge': <Diamond className="h-3 w-3" />,
+  'ABCD': <PenLine className="h-3 w-3" />,
+  'Flag': <Flag className="h-3 w-3" />,
+  'Channel': <SquareDashed className="h-3 w-3" />,
+  'Custom': <Waves className="h-3 w-3" />,
+}
 
 // ---------------- draw tools ----------------
 
@@ -161,6 +180,13 @@ interface Drawing {
   variant?: string // pattern name (double-top, hns, triangle…)
 }
 
+// Position-tool defaults (round-9): SL 10% · target 1.5× risk (RR 1:1.5).
+// Both levels stay draggable afterwards, and the box right edge resizes.
+const POS_SL_PCT = 0.10
+const POS_RR = 1.5
+const posDefaultSL = (pE: number, dir: 1 | -1) => pE * (1 - dir * POS_SL_PCT)
+const posDefaultTGT = (pE: number, dir: 1 | -1) => pE * (1 + dir * POS_SL_PCT * POS_RR)
+
 function distSeg(px: number, py: number, x1: number, y1: number, x2: number, y2: number): number {
   const dx = x2 - x1, dy = y2 - y1
   const l2 = dx * dx + dy * dy
@@ -192,8 +218,8 @@ const TOOL_META: { id: DrawTool | 'cursor'; label: string; hint: string; group: 
   { id: 'pricedate', label: 'Price + date range', hint: 'Δ price, %, bars & duration', group: 'Measure' },
   { id: 'forecast', label: 'Forecast', hint: 'click start & end — projected Δ box', group: 'Measure' },
   // position / data
-  { id: 'long', label: 'Long position', hint: 'click entry — auto SL/TGT box', group: 'Position' },
-  { id: 'short', label: 'Short position', hint: 'click entry — auto SL/TGT box', group: 'Position' },
+  { id: 'long', label: 'Long position', hint: 'click entry — SL 10% · TGT 1:1.5 — drag lines/edges to reshape', group: 'Position' },
+  { id: 'short', label: 'Short position', hint: 'click entry — SL 10% · TGT 1:1.5 — drag lines/edges to reshape', group: 'Position' },
   { id: 'vprofile', label: 'Volume profile', hint: 'click range start & end — POC/VAH/VAL', group: 'Position' },
   { id: 'vbs', label: 'Buy/Sell imbalance', hint: 'click range start & end — net buy vs sell', group: 'Position' },
   // annotation
@@ -204,8 +230,38 @@ const TOOL_META: { id: DrawTool | 'cursor'; label: string; hint: string; group: 
   { id: 'callout', label: 'Callout (arrow)', hint: 'click anchor, click bubble spot', group: 'Annotate' },
   { id: 'table', label: 'Table', hint: 'click to place — lines become rows', group: 'Annotate' },
   // patterns
-  { id: 'pattern', label: 'Pattern (multi-point)', hint: 'click vertices · double-click ends', group: 'Pattern' },
+  { id: 'pattern', label: 'Pattern (multi-point)', hint: 'pick from the list, click vertices, dbl-click ends', group: 'Pattern' },
 ]
+/** per-tool icon for the flyout lists (round-9: every sub-menu item has an icon) */
+const TOOL_ICONS: Record<string, React.ReactNode> = {
+  trend: <TrendingUp className="h-3.5 w-3.5" />,
+  ray: <ArrowUpRight className="h-3.5 w-3.5" />,
+  hray: <ArrowRight className="h-3.5 w-3.5" />,
+  hline: <Minus className="h-3.5 w-3.5" />,
+  vline: <MoveVertical className="h-3.5 w-3.5" />,
+  arrow: <ArrowUpRight className="h-3.5 w-3.5" />,
+  free: <Pencil className="h-3.5 w-3.5" />,
+  fib: <AlignJustify className="h-3.5 w-3.5" />,
+  fibext: <AlignEndHorizontal className="h-3.5 w-3.5" />,
+  fibtz: <Hourglass className="h-3.5 w-3.5" />,
+  fan: <Sun className="h-3.5 w-3.5" />,
+  rect: <Square className="h-3.5 w-3.5" />,
+  ellipse: <Circle className="h-3.5 w-3.5" />,
+  pricerange: <Ruler className="h-3.5 w-3.5" />,
+  pricedate: <CalendarClock className="h-3.5 w-3.5" />,
+  forecast: <MoveUpRight className="h-3.5 w-3.5" />,
+  long: <TrendingUp className="h-3.5 w-3.5" />,
+  short: <TrendingDown className="h-3.5 w-3.5" />,
+  vprofile: <BarChartHorizontal className="h-3.5 w-3.5" />,
+  vbs: <BarChart3 className="h-3.5 w-3.5" />,
+  text: <Type className="h-3.5 w-3.5" />,
+  pricenote: <Tag className="h-3.5 w-3.5" />,
+  pin: <Pin className="h-3.5 w-3.5" />,
+  comment: <MessageSquare className="h-3.5 w-3.5" />,
+  callout: <MessagesSquare className="h-3.5 w-3.5" />,
+  table: <Table className="h-3.5 w-3.5" />,
+  pattern: <Waves className="h-3.5 w-3.5" />,
+}
 const TWO_PT_TOOLS = new Set<DrawTool>(['trend', 'ray', 'hray', 'arrow', 'rect', 'ellipse', 'fib', 'fibext', 'fibtz', 'fan', 'pricerange', 'pricedate', 'forecast', 'vprofile', 'vbs'])
 const TEXT_TOOLS = new Set<DrawTool>(['text', 'pricenote', 'pin', 'comment', 'callout', 'table'])
 const TOOL_GROUP_ORDER = ['Lines', 'Fib', 'Shapes', 'Measure', 'Position', 'Annotate', 'Pattern']
@@ -333,7 +389,8 @@ function ToolMenu({ icon, label, info, active, tint, width = 'w-48', children }:
         onMouseEnter={onEnter}
         onMouseLeave={onLeave}
         title={info}
-        className={`flex items-center gap-1 px-1.5 py-[3px] rounded border shrink-0 transition-colors ${
+        aria-label={label}
+        className={`relative flex items-center justify-center h-[22px] w-[26px] rounded border shrink-0 transition-colors ${
           open
             ? 'bg-primary/25 border-primary/50 text-foreground'
             : active
@@ -342,7 +399,7 @@ function ToolMenu({ icon, label, info, active, tint, width = 'w-48', children }:
         }`}
       >
         {icon}
-        <span className="text-[9px] font-semibold leading-none whitespace-nowrap">{label}</span>
+        {active && !open && <span className="absolute -top-[3px] -right-[3px] h-[5px] w-[5px] rounded-full bg-[#e0a63f]" />}
       </button>
       {open && pos && typeof document !== 'undefined' &&
         createPortal(
@@ -741,10 +798,13 @@ export function CanvasChart({
   const selIdRef = useRef<string | null>(null)
   const [selId, setSelId] = useState<string | null>(null)
   const pendingRef = useRef<Drawing | null>(null)
-  const dragDrawRef = useRef<{ d: Drawing; mode: 'move' | 'pt'; pi?: number; startMouse: { x: number; y: number }; orig: Drawing } | null>(null)
+  // draw-drag modes: move · pt (endpoint) · ps (stop line) · tg (target line) · w (box right edge)
+  const dragDrawRef = useRef<{ d: Drawing; mode: 'move' | 'pt' | 'ps' | 'tg' | 'w'; pi?: number; startMouse: { x: number; y: number }; orig: Drawing } | null>(null)
 
   // text-entry overlay for annotation tools (text / note / comment / callout / pin / table)
   const [textEdit, setTextEdit] = useState<{ id: string; x: number; y: number; value: string; multiline: boolean } | null>(null)
+  const textEditOpenedAt = useRef(0)
+  const textInputRef = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null)
 
   const setSel = (id: string | null) => { selIdRef.current = id; setSelId(id) }
   const patternVariantRef = useRef<string>('Double Top')
@@ -2385,7 +2445,7 @@ export function CanvasChart({
   }
   const dataPt = (x: number, y: number): DrawPt => ({ t: timeAtX(x), p: priceAtY(y) })
 
-  const hitDrawing = (x: number, y: number): { d: Drawing; mode: 'move' | 'pt'; pi?: number } | null => {
+  const hitDrawing = (x: number, y: number): { d: Drawing; mode: 'move' | 'pt' | 'ps' | 'tg' | 'w'; pi?: number } | null => {
     const g = geoRef.current
     if (x > g.plotW || y > g.priceH) return null
     const X = (t: number) => ((t - g.t0) / g.tfMs) * g.cw + g.cw / 2
@@ -2396,6 +2456,8 @@ export function CanvasChart({
       const P = d.pts
       if (!P.length) continue
       for (let pi = 0; pi < P.length; pi++) {
+        // long/short: the RIGHT anchor is the resize grip (mode 'w') — skip it here
+        if ((d.type === 'long' || d.type === 'short') && pi === 1) continue
         if (Math.hypot(x - X(P[pi].t), y - Y(P[pi].p)) < 7) return { d, mode: 'pt', pi }
       }
       const X0 = X(P[0].t), Y0 = Y(P[0].p)
@@ -2473,11 +2535,15 @@ export function CanvasChart({
         case 'short': {
           const dir = d.dir ?? 1
           const pE = P[0].p
-          const pS = d.pS ?? pE * (dir > 0 ? 0.996 : 1.004)
-          const pT = d.pT ?? pE * (dir > 0 ? 1.008 : 0.992)
+          const pS = d.pS ?? posDefaultSL(pE, dir)
+          const pT = d.pT ?? posDefaultTGT(pE, dir)
           const xa = Math.min(X0, X1), xb = Math.max(X0, X1)
-          if (x < xa - 4 || x > xb + 4) break
-          hit = Math.abs(y - Y(pE)) < 5 || Math.abs(y - Y(pS)) < 5 || Math.abs(y - Y(pT)) < 5
+          if (x < xa - 5 || x > xb + 6) break
+          // priority: SL line · target line · right-edge resize · entry line
+          if (Math.abs(y - Y(pS)) < 5) return { d, mode: 'ps' }
+          if (Math.abs(y - Y(pT)) < 5) return { d, mode: 'tg' }
+          if (Math.abs(x - xb) < 6) return { d, mode: 'w' }
+          hit = Math.abs(y - Y(pE)) < 5
           break
         }
         case 'text':
@@ -2540,21 +2606,31 @@ export function CanvasChart({
     const g = geoRef.current
     const x = g.cw / 2 + ((d.pts[0].t - g.t0) / g.tfMs) * g.cw
     const y = g.priceH * ((g.pMax - d.pts[0].p) / (g.pMax - g.pMin))
+    textEditOpenedAt.current = Date.now() // blur-guard: the mount-time focus race must NOT wipe the drawing
     setTextEdit({ id: d.id, x: Math.round(x) + 4, y: Math.round(y) - 10, value: d.type === 'table' ? 'col A | col B\nrow 1 | 0' : d.text ?? '', multiline: d.type === 'table' || d.type === 'comment' || d.type === 'callout' })
   }
 
   const commitText = () => {
     if (!textEdit) return
     const te = textEdit
-    setTextEdit(null)
     const val = te.value.trim()
+    // MOUNT-TIME BLUR GUARD — the canvas mousedown that opened this editor hands
+    // focus to the canvas AFTER the input auto-focuses (browser default action);
+    // that blur is not a user commit. Swallow it and re-focus the editor so the
+    // annotation is never silently deleted (round-9: annotations "not working").
+    if (!val && Date.now() - textEditOpenedAt.current < 300) {
+      requestAnimationFrame(() => textInputRef.current?.focus())
+      return
+    }
+    setTextEdit(null)
     if (!val) {
       // empty annotation — remove the placeholder drawing
       commitDrawings(drawingsRef.current.filter(d => d.id !== te.id))
-      return
+    } else {
+      commitDrawings(drawingsRef.current.map(d => (d.id === te.id ? { ...d, text: te.value } : d)))
     }
-    commitDrawings(drawingsRef.current.map(d => (d.id === te.id ? { ...d, text: te.value } : d)))
     setToolBoth('cursor')
+    requestAnimationFrame(() => canvasRef.current?.focus({ preventScroll: true }))
   }
 
   const onWheel = (e: React.WheelEvent) => {
@@ -2606,7 +2682,10 @@ export function CanvasChart({
       }
       if (pendingRef.current && pendingRef.current.pts.length === 1) {
         const finished = finishPending(pt)
-        if (finished && (t === 'comment' || t === 'callout')) openTextFor(finished)
+        if (finished && (t === 'comment' || t === 'callout')) {
+          e.preventDefault() // keep the auto-focused editor from losing focus to the canvas
+          openTextFor(finished)
+        }
         return
       }
       if (TWO_PT_TOOLS.has(t) || t === 'comment' || t === 'callout') {
@@ -2618,7 +2697,11 @@ export function CanvasChart({
         return
       }
       if (TEXT_TOOLS.has(t)) {
-        // single-click annotation — place, then open the text overlay
+        // single-click annotation — place, then open the text overlay.
+        // preventDefault: the browser's default mousedown action would focus the
+        // canvas AFTER the editor's autoFocus ran — that blur committed an empty
+        // value and instantly deleted the annotation (annotations "not working").
+        e.preventDefault()
         const d = newDrawing({ type: t, pts: [pt] })
         openTextFor(d)
         return
@@ -2636,8 +2719,10 @@ export function CanvasChart({
       if (t === 'long' || t === 'short') {
         const dir: 1 | -1 = t === 'long' ? 1 : -1
         const pE = pt.p
-        const pS = dir > 0 ? pE * 0.996 : pE * 1.004
-        const pT = dir > 0 ? pE * 1.008 : pE * 0.992
+        // round-9 defaults: SL 10% of entry · target = 1.5× risk (RR 1:1.5) —
+        // every level + the box edges stay draggable afterwards
+        const pS = posDefaultSL(pE, dir)
+        const pT = posDefaultTGT(pE, dir)
         const g = geoRef.current
         newDrawing({
           type: t,
@@ -2732,10 +2817,21 @@ export function CanvasChart({
       const next: Drawing = { ...dd.orig, pts: dd.orig.pts.map(p => ({ ...p })) }
       if (dd.mode === 'pt' && dd.pi != null) {
         next.pts[dd.pi] = dataPt(x, y)
+      } else if (dd.mode === 'ps') {
+        // position tool: drag the STOP line vertically
+        next.pS = Number(dataPt(x, y).p.toFixed(2))
+      } else if (dd.mode === 'tg') {
+        // position tool: drag the TARGET line vertically
+        next.pT = Number(dataPt(x, y).p.toFixed(2))
+      } else if (dd.mode === 'w') {
+        // position tool: drag the right edge to resize the box duration
+        next.pts[1] = { t: dataPt(x, y).t, p: next.pts[1]?.p ?? next.pts[0].p }
       } else {
         const dt = (dx / (g.cw || 1)) * g.tfMs
         const dp = -dy * pxPerPx
         next.pts = next.pts.map(p => ({ t: p.t + dt, p: p.p + dp }))
+        if (next.pS != null) next.pS = next.pS + dp
+        if (next.pT != null) next.pT = next.pT + dp
       }
       drawingsRef.current = drawingsRef.current.map(d => (d.id === dd.d.id ? next : d))
       forceRender(n => n + 1)
@@ -2909,16 +3005,16 @@ export function CanvasChart({
            commit on click, flyout stays open until outside click/Esc). ---- */}
       {showControls && (
         <div className="absolute left-1 top-[30px] z-10 flex items-stretch gap-[3px] max-w-[calc(100%-110px)] overflow-x-auto pb-px">
-          {/* cursor / select */}
+          {/* cursor / select — icon only (round-9: main menu shows icons, hover shows the info note) */}
           <button
             onClick={() => { setToolBoth('cursor'); pendingRef.current = null }}
             title="Cursor / select — click a drawing to move or edit it · Del removes · Esc cancels"
-            className={`flex items-center gap-1 px-1.5 py-[3px] rounded border shrink-0 transition-colors ${
+            aria-label="Cursor"
+            className={`flex items-center justify-center h-[22px] w-[26px] rounded border shrink-0 transition-colors ${
               tool === 'cursor' ? 'bg-primary/25 border-primary/50 text-foreground' : 'bg-card/85 border-border text-muted-foreground hover:text-foreground hover:bg-secondary'
             }`}
           >
             <MousePointer2 className="h-3 w-3" />
-            <span className="text-[9px] font-semibold leading-none whitespace-nowrap">Cursor</span>
           </button>
           <TbSep />
 
@@ -2951,9 +3047,12 @@ export function CanvasChart({
           >
             <div className="text-[8px] uppercase tracking-wide text-muted-foreground px-2 pt-1">overlays</div>
             {([
-              ['sma20', 'MA 20'], ['sma50', 'MA 50'], ['ema', 'EMA 9/21'],
-              ['vwap', 'VWAP (session)'], ['boll', 'Bollinger 20·2'],
-            ] as [keyof IndicatorCfg, string][]).map(([k, lbl]) => (
+              ['sma20', 'MA 20', <PenLine key="i1" className="h-3 w-3 text-[#f6a04d]" />],
+              ['sma50', 'MA 50', <ListOrdered key="i2" className="h-3 w-3 text-[#4dd0e1]" />],
+              ['ema', 'EMA 9/21', <TrendingUp key="i3" className="h-3 w-3 text-[#a78bfa]" />],
+              ['vwap', 'VWAP (session)', <Crosshair key="i4" className="h-3 w-3 text-[#e0a63f]" />],
+              ['boll', 'Bollinger 20·2', <Activity key="i5" className="h-3 w-3 text-[#5fb0d8]" />],
+            ] as [keyof IndicatorCfg, string, React.ReactNode][]).map(([k, lbl, ico]) => (
               <label key={k} className="flex items-center gap-2 px-2 py-1 cursor-pointer rounded hover:bg-secondary">
                 <input
                   type="checkbox"
@@ -2961,13 +3060,17 @@ export function CanvasChart({
                   onChange={ev => patchSettings({ ind: { ...settings.ind, [k]: ev.target.checked } })}
                   className="accent-[#3b82f6] h-3 w-3"
                 />
+                {ico}
                 <span>{lbl}</span>
               </label>
             ))}
             <div className="text-[8px] uppercase tracking-wide text-muted-foreground px-2 pt-1">sub-panels</div>
             {([
-              ['rsi', 'RSI 14'], ['macd', 'MACD 12·26·9'], ['adx', 'ADX 14 (+DI/-DI)'], ['vol', 'Volume'],
-            ] as [keyof IndicatorCfg, string][]).map(([k, lbl]) => (
+              ['rsi', 'RSI 14', <Activity key="r1" className="h-3 w-3 text-[#e0a63f]" />],
+              ['macd', 'MACD 12·26·9', <BarChart3 key="r2" className="h-3 w-3 text-[#4dd0e1]" />],
+              ['adx', 'ADX 14 (+DI/-DI)', <TrendingUp key="r3" className="h-3 w-3 text-[#c084fc]" />],
+              ['vol', 'Volume', <BarChartHorizontal key="r4" className="h-3 w-3 text-[#8b949e]" />],
+            ] as [keyof IndicatorCfg, string, React.ReactNode][]).map(([k, lbl, ico]) => (
               <label key={k} className="flex items-center gap-2 px-2 py-1 cursor-pointer rounded hover:bg-secondary">
                 <input
                   type="checkbox"
@@ -2975,6 +3078,7 @@ export function CanvasChart({
                   onChange={ev => patchSettings({ ind: { ...settings.ind, [k]: ev.target.checked } })}
                   className="accent-[#3b82f6] h-3 w-3"
                 />
+                {ico}
                 <span>{lbl}</span>
               </label>
             ))}
@@ -3030,11 +3134,11 @@ export function CanvasChart({
           >
             <div className="text-[8px] uppercase tracking-wide text-muted-foreground px-2 pt-1">topmost enabled = right axis · others = left column</div>
             {([
-              ['price', 'Price'],
-              ['pct', 'Percent'],
-              ['inv', 'Inverted % (sellers)'],
-              ['pts', 'Points'],
-            ] as [keyof ScalesCfg, string][]).map(([k, lbl]) => (
+              ['price', 'Price', <Hash key="s1" className="h-3 w-3 text-[#8b949e]" />],
+              ['pct', 'Percent', <Percent key="s2" className="h-3 w-3 text-[#e0a63f]" />],
+              ['inv', 'Inverted % (sellers)', <ArrowDownUp key="s3" className="h-3 w-3 text-[#e06c9f]" />],
+              ['pts', 'Points', <MoveHorizontal key="s4" className="h-3 w-3 text-[#4dd0e1]" />],
+            ] as [keyof ScalesCfg, string, React.ReactNode][]).map(([k, lbl, ico]) => (
               <label key={k} className="flex items-center gap-2 px-2 py-1 cursor-pointer rounded hover:bg-secondary">
                 <input
                   type="checkbox"
@@ -3042,14 +3146,15 @@ export function CanvasChart({
                   onChange={ev => patchSettings({ scales: { ...(settings.scales ?? { price: true, pct: false, inv: false, pts: false }), [k]: ev.target.checked } })}
                   className="accent-[#3b82f6]"
                 />
+                {ico}
                 <span>{lbl}</span>
               </label>
             ))}
             <button
               onClick={() => window.dispatchEvent(new Event(BASE_PICK_EVENT))}
-              className="w-full mt-1 mx-0 mb-1 px-2 py-1 rounded bg-[#e0a63f]/20 border border-[#e0a63f]/40 text-[#e0a63f] font-semibold hover:bg-[#e0a63f]/30"
+              className="w-full mt-1 mx-0 mb-1 px-2 py-1 rounded bg-[#e0a63f]/20 border border-[#e0a63f]/40 text-[#e0a63f] font-semibold hover:bg-[#e0a63f]/30 flex items-center justify-center gap-1.5"
             >
-              Set baseline — then click this chart
+              <Crosshair className="h-3 w-3" /> Set baseline — then click this chart
             </button>
           </ToolMenu>
 
@@ -3063,10 +3168,10 @@ export function CanvasChart({
             info="Breaks — session 09:15 / 15:30 lines + shading · hourly dividers · prev-day range PDH/PDL with break markers (per chart)"
           >
             {([
-              ['session', 'Session breaks', '09:15 / 15:30 IST lines + band'],
-              ['hour', 'Hour breaks', 'dashed line each IST hour in-session'],
-              ['range', 'Range breaks', 'PDH/PDL lines + break markers'],
-            ] as [keyof ChartSettings['breaks'], string, string][]).map(([k, lbl, hint]) => (
+              ['session', 'Session breaks', '09:15 / 15:30 IST lines + band', <CalendarRange key="b1" className="h-3 w-3 text-[#e0a63f]" />],
+              ['hour', 'Hour breaks', 'dashed line each IST hour in-session', <Clock key="b2" className="h-3 w-3 text-[#8b949e]" />],
+              ['range', 'Range breaks', 'PDH/PDL lines + break markers', <ArrowDownUp key="b3" className="h-3 w-3 text-[#5fb0d8]" />],
+            ] as [keyof ChartSettings['breaks'], string, string, React.ReactNode][]).map(([k, lbl, hint, ico]) => (
               <label key={k} className="flex items-start gap-2 px-2 py-1 cursor-pointer rounded hover:bg-secondary">
                 <input
                   type="checkbox"
@@ -3074,6 +3179,7 @@ export function CanvasChart({
                   onChange={ev => patchSettings({ breaks: { ...(settings.breaks ?? { session: false, hour: false, range: false }), [k]: ev.target.checked } })}
                   className="accent-[#e0a63f] h-3 w-3 mt-0.5"
                 />
+                <span className="mt-[1px]">{ico}</span>
                 <span>
                   <span className="block">{lbl}</span>
                   <span className="block text-[8px] text-muted-foreground">{hint}</span>
@@ -3084,7 +3190,7 @@ export function CanvasChart({
 
           <TbSep />
 
-          {/* draw tool groups — single row, icon + group text */}
+          {/* draw tool groups — single row of ICON-ONLY buttons; every flyout item has its own icon */}
           {TOOL_GROUP_ORDER.map(group => {
             const items = TOOL_META.filter(t => t.group === group)
             const grpActive = tool !== 'cursor' && TOOL_META.find(t => t.id === tool)?.group === group
@@ -3101,23 +3207,35 @@ export function CanvasChart({
                 {items.map(t => (
                   <button
                     key={t.id}
-                    onClick={() => { setToolBoth(t.id); pendingRef.current = null }}
-                    className={`w-full flex items-center justify-between gap-2 px-2 py-0.5 rounded ${tool === t.id ? 'bg-primary/20 text-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
+                    onClick={() => { setToolBoth(t.id as DrawTool); pendingRef.current = null }}
+                    className={`w-full flex items-center gap-2 px-2 py-1 rounded ${tool === t.id ? 'bg-primary/20 text-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
                   >
-                    <span>{t.label}</span>
-                    <span className="text-[8px] text-muted-foreground/70 text-right">{t.hint}</span>
+                    <span className={tool === t.id ? 'text-[#e0a63f]' : 'text-muted-foreground/80'}>{TOOL_ICONS[t.id]}</span>
+                    <span className="flex-1 text-left">{t.label}</span>
+                    <span className="text-[8px] text-muted-foreground/70 text-right max-w-[118px] leading-tight">{t.hint}</span>
                   </button>
                 ))}
                 {group === 'Pattern' && (
-                  <div className="border-t border-border mt-1 pt-1 px-1.5 pb-1">
-                    <div className="text-[8px] uppercase tracking-wide text-muted-foreground pb-0.5">pattern label</div>
-                    <select
-                      value={patternVariantRef.current}
-                      onChange={e => { patternVariantRef.current = e.target.value; forceRender(n => n + 1) }}
-                      className="w-full h-5 rounded bg-secondary/60 px-1 text-[9px] outline-none"
-                    >
-                      {PATTERN_NAMES.map(p => <option key={p} value={p}>{p}</option>)}
-                    </select>
+                  <div className="border-t border-border mt-1 pt-1 px-1 pb-1">
+                    <div className="text-[8px] uppercase tracking-wide text-muted-foreground pb-1">pattern — pick one, then click vertices on the chart</div>
+                    <div className="grid grid-cols-2 gap-0.5">
+                      {PATTERN_NAMES.map(p => (
+                        <button
+                          key={p}
+                          onClick={() => { patternVariantRef.current = p; setToolBoth('pattern'); pendingRef.current = null }}
+                          className={`flex items-center gap-1.5 px-1.5 py-1 rounded text-[9px] text-left ${
+                            patternVariantRef.current === p && tool === 'pattern'
+                              ? 'bg-primary/25 text-foreground'
+                              : patternVariantRef.current === p
+                                ? 'bg-secondary text-foreground'
+                                : 'text-muted-foreground hover:text-foreground hover:bg-secondary'
+                          }`}
+                        >
+                          <span className={patternVariantRef.current === p ? 'text-[#e0a63f]' : 'text-muted-foreground/70'}>{PATTERN_ICONS[p] ?? <Waves className="h-3 w-3" />}</span>
+                          {p}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 )}
               </ToolMenu>
@@ -3126,17 +3244,17 @@ export function CanvasChart({
 
           <TbSep />
 
-          {/* clear all drawings */}
+          {/* clear all drawings — icon only, count badge when objects exist */}
           <button
             onClick={() => { commitDrawings([]); setSel(null) }}
             title={`Clear all drawings on this chart (${drawings.length} object(s) · Del removes just the selected one)`}
-            className={`flex items-center gap-1 px-1.5 py-[3px] rounded border shrink-0 transition-colors ${
+            aria-label="Clear drawings"
+            className={`relative flex items-center justify-center h-[22px] w-[26px] rounded border shrink-0 transition-colors ${
               drawings.length > 0 ? 'bg-card/85 border-border text-muted-foreground hover:text-[#ff4d5e] hover:bg-secondary' : 'bg-card/40 border-border/50 text-muted-foreground/50'
             }`}
           >
             <Trash2 className="h-3 w-3" />
-            <span className="text-[9px] font-semibold leading-none">Clear</span>
-            {drawings.length > 0 && <span className="text-[8px] tabular opacity-70">{drawings.length}</span>}
+            {drawings.length > 0 && <span className="absolute -top-[3px] -right-[3px] min-w-[10px] h-[10px] px-[2px] rounded-full bg-[#e0a63f] text-black text-[7px] font-bold leading-[10px] text-center tabular">{drawings.length}</span>}
           </button>
         </div>
       )}
