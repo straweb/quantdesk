@@ -11,6 +11,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from 
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { api, fmtDateTime } from '../lib/client-api'
 import type { StrategyRow } from '../lib/client-api'
+import { useSyncChannel, type SyncAdmin } from '../lib/sync'
 
 const STATUS_CLS: Record<string, string> = {
   IDLE: 'bg-secondary text-muted-foreground',
@@ -23,7 +24,10 @@ const STATUS_CLS: Record<string, string> = {
 
 export function StrategyView() {
   const qc = useQueryClient()
-  const { data } = useQuery({ queryKey: ['strategies'], queryFn: () => api.strategies(), refetchInterval: 2000 })
+  // strategies stream via the sync:admin websocket (2s push) — REST fallback
+  const adm = useSyncChannel<SyncAdmin>('sync:admin')
+  const { data: rest } = useQuery({ queryKey: ['strategies'], queryFn: () => api.strategies(), enabled: !adm, refetchInterval: 2000 })
+  const data = adm?.strategies ? { strategies: adm.strategies as unknown as StrategyRow[] } : rest
   const strategies = data?.strategies ?? []
   const [dlg, setDlg] = useState(false)
   const [pyId, setPyId] = useState<string | null>(null)

@@ -159,6 +159,8 @@ npm run start             # NODE_ENV=production bun .next/standalone/server.js
 | Login says *Invalid credentials* but admin/admin123 is correct | Fresh DB seeded a new admin on first boot — the first login attempt ran during seeding. Retry once. |
 | FEED chip DOWN on :3000 | Expected — socket.io has no proxy path on :3000; use the Caddy :81 entry. |
 | Charts frozen after restarting only the feed | The Next.js watchdog republishes the 850-symbol universe within ~10s; wait or restart the terminal. |
+| **"Failed to connect to MetaMask" / `inpage.js` in the console** | Not from the terminal — the MetaMask browser extension injects `inpage.js` into every page and cannot reach its background process inside preview iframes. The app installs a guard (`<head>` script in `src/app/layout.tsx`) that suppresses extension-origin errors; app errors are never filtered. |
+| **Platform "Download workspace" fails** ("Failed to archive workspace files") | The workspace is huge (node_modules ≈1.2 GB + `.next` + tick archives) and exceeds the platform archiver's limits. Use **Admin → Download latest source code** (streams a source-only ZIP via `GET /api/workspace/export`) or `bash scripts/export-source.sh` (writes `download/quantdesk-source-*.zip`). Tick archives are auto-pruned (newest 8 kept) so `db/ticks` never grows unbounded again. |
 
 ### Verifying the deployment
 

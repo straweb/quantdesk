@@ -1,6 +1,6 @@
 import { createServer } from 'http'
 import { Server } from 'socket.io'
-import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, readdirSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, readdirSync, unlinkSync } from 'fs'
 import path from 'path'
 import { spawn } from 'child_process'
 // bun:sqlite — embedded recorder for tick-by-tick session backups
@@ -182,6 +182,7 @@ function openTickSession(): void {
     )
     gTick.__tickSession = { db: dbh, file, startedAt: new Date(now).toISOString(), istDate: day, rows: 0 }
     console.log(`[market-feed] tick recorder ON — session ${file} (${tickCfg.symbols.join(', ')})`)
+    pruneTickSessions()
   } catch (e) {
     console.error('[market-feed] tick session open failed:', e)
   }
@@ -223,6 +224,28 @@ function tickSessionInfo() {
   return s
     ? { file: s.file, startedAt: s.startedAt, rows: s.rows }
     : null
+}
+
+/** Keep only the newest KEEP tick-session archives (across all day dirs) —
+ *  without this db/ticks grows unbounded (~20MB per day) and the platform
+ *  workspace archiver eventually fails on the workspace size. */
+function pruneTickSessions(keep = 8): void {
+  try {
+    if (!existsSync(TICK_DIR)) return
+    const all: { p: string; m: number }[] = []
+    for (const day of readdirSync(TICK_DIR)) {
+      const dayDir = path.join(TICK_DIR, day)
+      for (const f of readdirSync(dayDir)) {
+        if (!f.endsWith('.db')) continue
+        const p = path.join(dayDir, f)
+        all.push({ p, m: statSync(p).mtimeMs })
+      }
+    }
+    all.sort((a, b) => b.m - a.m)
+    for (const old of all.slice(keep)) {
+      try { unlinkSync(old.p); console.log(`arket-feed] pruned old tick session ${old.p}`) } catch { /* in use — next pass */ }
+    }
+  } catch { /* never break recording over pruning */ }
 }
 
 function listTickSessions(): { file: string; bytes: number; mtime: string }[] {
@@ -1268,14 +1291,122 @@ function buildIndexPayload(name: string): SyncCoreRow | null {
   }
 }
 
+// ============================================================
+// sync:admin (2s) — the admin/dashboard data plane over the same
+// websocket: feed engine health, per-account broker_logs tails,
+// order audit, copy-trade config, strategies (+ log tails), GTT
+// rules, auto rules, tick recorder + replay status, sync counts.
+// Mirrors the REST aggregates so the UI can drop those polls.
+// ============================================================
+function buildAdminPayload(): SyncCoreRow | null {
+  const master = openRO(MASTER_DB_PATH)
+  if (!master) return null
+
+  const acctRows: SyncCoreRow[] = []
+  const sources: SyncCoreRow[] = [{ id: 'sim', label: 'Sim Feed (built-in)', brokerType: null }]
+  const logRows: SyncCoreRow[] = []
+  try {
+    const accounts = master.prepare(`
+      SELECT id, label, brokerType, isActive, isOrderEnabled,
+             (credentialsEnc IS NOT NULL AND credentialsEnc != '') AS hasCreds
+      FROM BrokerAccount ORDER BY sortOrder ASC
+    `).all() as SyncCoreRow[]
+    master.close()
+
+    for (const a of accounts) {
+      acctRows.push({ id: a.id, label: a.label, brokerType: a.brokerType, isActive: !!a.isActive, hasCreds: !!a.hasCreds })
+      sources.push({ id: String(a.id), label: String(a.label), brokerType: a.brokerType ?? null })
+      // per-account broker_logs tail (read-only) — feeds the Logs panel +
+      // admin diagnostics without the 2s REST poll
+      const bdb = openRO(path.join(FEED_PROJECT_ROOT, 'db', 'brokers', String(a.brokerType).toLowerCase(), `${a.id}.db`))
+      if (bdb) {
+        try {
+          const logs = bdb.prepare('SELECT ts, level, message FROM broker_logs ORDER BY id DESC LIMIT 14').all() as { ts: string; level: string; message: string }[]
+          for (const l of logs) {
+            logRows.push({ ts: l.ts, level: l.level, message: l.message, accountId: a.id, accountLabel: a.label, brokerType: a.brokerType })
+          }
+        } catch { /* no logs table yet */ }
+        bdb.close()
+      }
+    }
+  } catch { try { master.close() } catch { /* already closed */ } return null }
+  logRows.sort((x, y) => (String(x.ts) < String(y.ts) ? 1 : -1))
+
+  // master-DB reads for the admin surfaces (fresh connection — the earlier
+  // one was closed after the account scan)
+  let copyTrade: SyncCoreRow | null = null
+  let strategies: SyncCoreRow[] = []
+  let audits: SyncCoreRow[] = []
+  let counts = { symbols: 0, mappings: 0 }
+  let lastSync: string | null = null
+  const m2 = openRO(MASTER_DB_PATH)
+  if (m2) {
+    try {
+      copyTrade = (m2.prepare('SELECT id, enabled, masterAccountId, capitalSharePct, slippagePct, roundToLot, skipFailedLegs, killSwitch FROM CopyTradeConfig LIMIT 1').get() as SyncCoreRow | undefined) ?? null
+      strategies = m2.prepare(`SELECT id, name, enabled, status, exchange, symbol, direction, productType, orderType, qtyMode, fixedQty, capitalAmount, entryTime, entryWindowMin, exitTime, repeatDays, stopLossPct, targetPct, trailingSlPct, lastRunDate, entryPrice, realizedPnl FROM Strategy ORDER BY name ASC`).all() as SyncCoreRow[]
+      const logTail = m2.prepare('SELECT strategyId, ts, level, message FROM StrategyLog ORDER BY ts DESC LIMIT 240').all() as { strategyId: string; ts: string; level: string; message: string }[]
+      const logsBy = new Map<string, SyncCoreRow[]>()
+      for (const l of logTail) {
+        const arr = logsBy.get(l.strategyId) ?? []
+        if (arr.length < 8) arr.push({ id: `${l.strategyId}-${l.ts}-${arr.length}`, ts: l.ts, level: l.level, message: l.message })
+        logsBy.set(l.strategyId, arr)
+      }
+      for (const s of strategies) s.logs = logsBy.get(String(s.id)) ?? []
+      audits = m2.prepare(`SELECT id, ts, source, action, masterSymbol, side, qty, status, message, legsJson FROM OrderAudit ORDER BY ts DESC LIMIT 30`).all() as SyncCoreRow[]
+      const cs = m2.prepare('SELECT COUNT(*) AS n FROM SymbolMaster').get() as { n: number }
+      const cm = m2.prepare('SELECT COUNT(*) AS n FROM SymbolMapping').get() as { n: number }
+      counts = { symbols: Number(cs?.n ?? 0), mappings: Number(cm?.n ?? 0) }
+      const ls = m2.prepare('SELECT ts FROM SyncLog ORDER BY ts DESC LIMIT 1').get() as { ts: string } | undefined
+      lastSync = ls?.ts ?? null
+    } catch { /* admin payload partials are fine */ }
+    m2.close()
+  }
+
+  // JSON-file stores
+  const readJson = (p: string): unknown => { try { return JSON.parse(readFileSync(p, 'utf8')) } catch { return null } }
+  const gttRaw = readJson(path.join(FEED_PROJECT_ROOT, 'db', 'gtt.json')) as { rules?: SyncCoreRow[] } | null
+  const autoRaw = readJson(path.join(FEED_PROJECT_ROOT, 'db', 'auto-rules.json')) as { rules?: SyncCoreRow[] } | null
+
+  // in-process engine states (mirror the /feed-status + /replay-config REST)
+  const lf = liveFeedStatus()
+  const feed = {
+    ...lf,
+    sourceIsLive: lf.source !== 'sim',
+    fresh: lf.lastTickTs != null && Date.now() - lf.lastTickTs < 15_000,
+  }
+
+  return {
+    feed,
+    feedSource: { source: feedSource, sources },
+    accountsMeta: acctRows,
+    brokerLogs: logRows.slice(0, 60),
+    audit: audits,
+    copyTrade,
+    strategies,
+    syncInfo: { lastSync, counts },
+    gtt: gttRaw?.rules ?? [],
+    autoRules: autoRaw?.rules ?? [],
+    tickRecorder: { enabled: tickCfg.enabled, symbols: tickCfg.symbols, session: tickSessionInfo(), sessions: listTickSessions().slice(0, 12) },
+    replay: replayStatus(),
+    ts: Date.now(),
+  }
+}
+
 // 1s sync loop — computes the core payload ONCE per tick and fans it out
 // with per-socket chain/index payloads (based on each socket's sync:sub)
 if (!hot.__feedTimers.sync) {
   let lastIdxAt = 0
   let lastIndexCache = new Map<string, SyncCoreRow | null>()
+  let adminTick = 0
+  let adminCache: SyncCoreRow | null = null
   hot.__feedTimers.sync = setInterval(() => {
     const sockets = [...io.sockets.sockets.values()] as unknown as { __syncSubs?: { chains: { underlying: string; expiry: string | null }[]; index: string[] }; emit: (ev: string, d: unknown) => void; id: string }[]
     if (sockets.length === 0) return
+    // sync:admin every 2s (one computation, fanned to every socket)
+    if (++adminTick % 2 === 0) {
+      adminCache = buildAdminPayload()
+      if (adminCache) for (const s of sockets) s.emit('sync:admin', adminCache)
+    }
     const core = buildCorePayload()
     const idxFresh = Date.now() - lastIdxAt > 2000
     if (idxFresh) { lastIdxAt = Date.now(); lastIndexCache = new Map() }

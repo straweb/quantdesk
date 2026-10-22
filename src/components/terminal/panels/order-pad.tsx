@@ -7,6 +7,8 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { api, fmtInr } from '../lib/client-api'
+import type { AccountRow } from '../lib/client-api'
+import { useSyncChannel, type SyncCore } from '../lib/sync'
 import { useTerminal } from '../lib/store'
 import { onTicks } from '../lib/socket'
 import { useEffect } from 'react'
@@ -44,11 +46,15 @@ export function OrderPad() {
   const lotSize = sym?.lotSize ?? 1
   const isOption = sym?.instrumentType === 'CE' || sym?.instrumentType === 'PE'
 
-  const { data: accountsData } = useQuery({
+  // accounts via the sync:core websocket — REST fallback while the socket is down
+  const core = useSyncChannel<SyncCore>('sync:core')
+  const { data: accountsRest } = useQuery({
     queryKey: ['accounts-op'],
     queryFn: () => api.accounts(),
+    enabled: !core,
     refetchInterval: 3000,
   })
+  const accountsData = core ? { accounts: core.accounts as unknown as AccountRow[] } : accountsRest
   const execAccounts = (accountsData?.accounts ?? []).filter(a => a.isOrderEnabled && a.isActive)
 
   // estimated deployment across enabled accounts (AUTO sizing)

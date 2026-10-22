@@ -14,6 +14,7 @@ import {
   type StrikesCfg, type StrikeRowCfg, type WorkspaceCfg, type AllocMode,
 } from '../lib/store'
 import { useSyncChannel, useSyncData, mergeChain, type SyncCore, type SyncChainResp } from '../lib/sync'
+import type { AccountRow } from '../lib/client-api'
 
 // ============================================================
 // F&O Strikes panel (right dock tab) — compact build.
@@ -66,8 +67,10 @@ export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
   const underlyings = undData?.underlyings ?? []
 
   // accounts: representative usable capital (first order-enabled) + PnL labels
-  const { data: accData } = useQuery({ queryKey: ['accounts'], queryFn: () => api.accounts(), refetchInterval: 4000 })
-  const accounts = accData?.accounts ?? []
+  // (via sync:core websocket — REST fallback while the socket is down)
+  const coreAcc = useSyncChannel<SyncCore>('sync:core')
+  const { data: accRest } = useQuery({ queryKey: ['accounts'], queryFn: () => api.accounts(), enabled: !coreAcc, refetchInterval: 4000 })
+  const accounts = (coreAcc?.accounts as unknown as AccountRow[] | undefined) ?? accRest?.accounts ?? []
   const repUsable = useMemo(() => {
     const on = accounts.filter(a => a.isOrderEnabled)
     return (on[0] ?? accounts[0])?.usableCapital ?? 0

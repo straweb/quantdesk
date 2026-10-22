@@ -46,6 +46,12 @@ Session flows (per broker, every attempt logged to console + `broker_logs`):
 | `GET /api/broker-orderbook` | live order book for one account |
 | `GET /api/admin/audit` | order audit trail |
 
+### Workspace
+
+| Method & path | Description |
+|---|---|
+| `GET /api/workspace/export` | streams a ZIP of the project SOURCE (src/brokers/mini-services/prisma/docs/tests/public/strategies + configs — no node_modules/.next/runtime DBs/logs, `*.png|db|log` excluded). Use when the platform workspace download fails. CLI twin: `bash scripts/export-source.sh`. |
+
 ### Orders
 
 | Method & path | Body | Description |
@@ -141,5 +147,8 @@ Session flows (per broker, every attempt logged to console + `broker_logs`):
 | `sync:core` | 1 s | accounts (incl. capital base/pct/cash), positions, orders, trades, funds, session stats |
 | `sync:chain` | 1 s | option chain meta per underlying (CE floor / PE ceil ATM, ±15 steps) |
 | `sync:index` | 1 s | index constituents + points contribution |
+| `sync:admin` | 2 s | admin/dashboard data plane: `feed` (engine health), `feedSource` (active source + sources), `accountsMeta` (per-account session presence), `brokerLogs` (per-account tails), `audit` (OrderAudit tail), `copyTrade` config, `strategies` (+ log tails), `syncInfo` (symbol/mapping counts + last sync), `gtt` rules, `autoRules`, `tickRecorder` (config + sessions), `replay` status |
 
 Client helpers live in `src/components/terminal/lib/socket.ts` (ticks) and `src/components/terminal/lib/sync.ts` (`onSync` / `useSyncChannel` / `useSyncData`, with REST fallback).
+
+`sync:admin` replaces the former REST polls across the UI — the Dashboard (master health + per-account dashboards), Admin view (logs / audit / copy-trade / sync-info / recorder / replay), Logs panel, Strategy view, Auto bot panel and the FEED chip all consume the websocket push and only fall back to REST while the socket is down.

@@ -8,6 +8,8 @@ import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { api, fmtTime, sideStrikeFor } from '../lib/client-api'
+import type { AutoRuleRow } from '../lib/client-api'
+import { useSyncChannel, type SyncAdmin } from '../lib/sync'
 import { useTerminal, type WorkspaceCfg, type StrikeRowCfg } from '../lib/store'
 
 // ============================================================
@@ -33,7 +35,10 @@ type PremiumMode = 'LTE' | 'RANGE' | 'GTE'
 
 export function AutoPanel({ ws }: { ws: WorkspaceCfg }) {
   const qc = useQueryClient()
-  const { data } = useQuery({ queryKey: ['autorules'], queryFn: () => api.autoRules(), refetchInterval: 3000 })
+  // auto rules ride the sync:admin websocket (2s push) — REST fallback
+  const adm = useSyncChannel<SyncAdmin>('sync:admin')
+  const { data: rulesRest } = useQuery({ queryKey: ['autorules'], queryFn: () => api.autoRules(), enabled: !adm, refetchInterval: 3000 })
+  const data = adm?.autoRules ? { rules: adm.autoRules as unknown as AutoRuleRow[] } : rulesRest
   const { data: undData } = useQuery({
     queryKey: ['optionUnderlyings'],
     queryFn: () => api.optionUnderlyings(),

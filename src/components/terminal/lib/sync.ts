@@ -46,7 +46,7 @@ function emitSub() {
 // re-emit the subscription after every (re)connect + bridge socket events
 // into the local channel listeners
 let subWireInstalled = false
-const SYNC_CHANNELS = ['sync:core', 'sync:chain', 'sync:index'] as const
+const SYNC_CHANNELS = ['sync:core', 'sync:chain', 'sync:index', 'sync:admin'] as const
 function ensureSubWire() {
   if (subWireInstalled) return
   subWireInstalled = true
@@ -123,6 +123,7 @@ export interface SyncCore {
     id: string; label: string; brokerType: string; status: string
     isActive: boolean; isLiveDataSource: boolean; isOrderEnabled: boolean; isCopyMaster: boolean
     clientId: string | null; usableCapital: number; initialCapital: number; realizedPnl: number
+    capitalBase: string; capitalPct: number; availableCash: number | null
     chargesPaid: number; deployed: number; mode: string; modeLabel: string
     firstTradeDone: boolean; openPositions: number; openOrders: number
   }[]
@@ -196,4 +197,70 @@ export function mergeChain(sync: ChainRespLike | null | undefined, rest: ChainRe
     atmPe: sync.atmPe ?? rest.atmPe ?? null,
     ts: sync.ts ?? 0,
   }
+}
+
+// ---- admin/dashboard plane over the sync hub (sync:admin, 2s) ----
+// Mirrors the REST admin aggregates so Admin/Dashboard/Logs can drop
+// their polling queries entirely (REST stays as the fallback).
+
+export interface SyncAdminLogRow {
+  ts: string; level: string; message: string
+  accountId: string; accountLabel: string; brokerType: string
+}
+export interface SyncAdmin {
+  feed: {
+    source: string; brokerType: string | null; connected: boolean
+    lastTickTs: number | null; lastError: string | null; errorTs: number | null
+    symbols: number; polls: number; errors: number; startedAt: number
+    log: string[]; sessionPresent: boolean; sourceIsLive: boolean; fresh: boolean
+  }
+  feedSource: { source: string; sources: { id: string; label: string; brokerType: string | null }[] }
+  accountsMeta: { id: string; label: string; brokerType: string; isActive: boolean; hasCreds: boolean }[]
+  brokerLogs: SyncAdminLogRow[]
+  audit: { id: string; ts: string; source: string; action: string; masterSymbol: string; side: string; qty: number; status: string; message: string | null }[]
+  copyTrade: {
+    id: string; enabled: boolean; masterAccountId: string | null
+    capitalSharePct: number; slippagePct: number; roundToLot: boolean
+    skipFailedLegs: boolean; killSwitch: boolean
+  } | null
+  strategies: {
+    id: string; name: string; enabled: boolean; status: string; exchange: string
+    symbol: string; direction: string; productType: string; orderType: string
+    qtyMode: string; fixedQty: number; capitalAmount?: number | null
+    entryTime: string; entryWindowMin: number; exitTime: string; repeatDays: string
+    stopLossPct?: number | null; targetPct?: number | null; trailingSlPct?: number | null
+    lastRunDate?: string | null; entryPrice?: number | null; realizedPnl: number
+    logs: { id: string; ts: string; level: string; message: string }[]
+  }[]
+  syncInfo: { lastSync: string | null; counts: { symbols: number; mappings: number } }
+  gtt: {
+    id: string; name: string; symbol: string; exchange: string
+    side: 'BUY' | 'SELL'; qty: number; trigger: 'ABOVE' | 'BELOW'
+    triggerPrice: number; orderType: 'LIMIT' | 'MARKET'; productType: string
+    repeatDaily: boolean; armed: boolean
+    lastTriggeredAt?: string; lastStatus?: string; lastMessage?: string
+    createdAt: string
+  }[]
+  autoRules: {
+    id: string; name: string; underlying: string; expiry: string | null
+    kind: 'INDEX' | 'INDEX_RANGE' | 'TIME' | 'COMPOUND'
+    level?: number; cross?: 'ABOVE' | 'BELOW'; lo?: number; hi?: number; time?: string
+    entryOp?: 'LTE' | 'GTE' | 'RANGE'; entryLo?: number; entryHi?: number
+    action: 'BUY' | 'SELL' | 'DEPLOY' | 'CANCEL'; optType: 'CE' | 'PE'; offset: number
+    strikes?: { strike: number; type: 'CE' | 'PE'; allocPct: number }[]
+    allocPct: number; entryPrice?: number; stopLoss?: number; target?: number
+    enabled: boolean; repeatDaily: boolean
+    lastFiredDate?: string; lastFiredAt?: string; lastStatus?: string; lastMessage?: string
+    fireCount: number; createdAt: string
+  }[]
+  tickRecorder: {
+    enabled: boolean; symbols: string[]
+    session: { file: string; startedAt: string; rows: number } | null
+    sessions: { file: string; bytes: number; mtime: string }[]
+  }
+  replay: {
+    active: boolean; file: string | null; speed: number; startedAt: string | null
+    total: number; played: number; symbols: string[]; progressPct: number
+  }
+  ts: number
 }

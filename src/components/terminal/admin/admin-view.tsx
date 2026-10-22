@@ -10,13 +10,15 @@ import { Switch } from '@/components/ui/switch'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { api, fmtInr, fmtDateTime } from '../lib/client-api'
-import type { BrokerTestResp } from '../lib/client-api'
+import type { BrokerTestResp, AccountRow, CopyTradeCfg } from '../lib/client-api'
+import { useSyncChannel, type SyncCore, type SyncAdmin } from '../lib/sync'
 import { BROKER_META, CAPITAL_MODES } from '@/lib/types'
 import type { BrokerType, CapitalMode } from '@/lib/types'
 
 export function AdminView() {
   return (
     <div className="h-full overflow-y-auto p-4 space-y-4 max-w-6xl mx-auto">
+      <SourceExport />
       <AccountsManager />
       <BrokerDiagnostics />
       <div className="grid lg:grid-cols-2 gap-4">
@@ -30,12 +32,55 @@ export function AdminView() {
   )
 }
 
+// ---------------- Source export ----------------
+// The platform "Download workspace" fails when the workspace is huge
+// ("Failed to archive workspace files" — node_modules + .next + tick DBs).
+// This streams a zip of the SOURCE ONLY from the app itself.
+function SourceExport() {
+  const [busy, setBusy] = useState(false)
+  const download = async () => {
+    setBusy(true)
+    try {
+      const res = await fetch('/api/workspace/export')
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const blob = await res.blob()
+      const cd = res.headers.get('Content-Disposition') ?? ''
+      const name = /filename="([^"]+)"/.exec(cd)?.[1] ?? 'quantdesk-source.zip'
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = name
+      a.click()
+      URL.revokeObjectURL(url)
+      toast.success(`Source code downloaded — ${name} (${(blob.size / 1024 / 1024).toFixed(1)} MB)`)
+    } catch (e) { toast.error(e instanceof Error ? e.message : 'Export failed') }
+    setBusy(false)
+  }
+  return (
+    <div className="rounded-lg border border-border bg-card px-4 py-3 flex flex-wrap items-center gap-3">
+      <div className="min-w-[240px] flex-1">
+        <h3 className="text-sm font-semibold flex items-center gap-1.5"><Download className="h-4 w-4 text-[#4dd0e1]" />Download latest source code</h3>
+        <p className="text-[11px] text-muted-foreground">
+          Streams a ZIP of the full project source (no node_modules / .next / runtime DBs) — use this when the
+          platform workspace download fails. CLI alternative: <code className="text-[10px] bg-secondary px-1 rounded">bash scripts/export-source.sh</code>
+        </p>
+      </div>
+      <Button size="sm" className="text-xs h-8" disabled={busy} onClick={download}>
+        <Download className={`h-3.5 w-3.5 ${busy ? 'animate-pulse' : ''}`} />
+        {busy ? 'Packing…' : 'Download source'}
+      </Button>
+    </div>
+  )
+}
+
 // ---------------- Broker diagnostics ----------------
 // The debugging surface: run a 4-step live test (credentials → mode →
 // funds → quote) against any account and watch its raw broker_logs
 // (every outbound call is tagged and mirrored there).
 function BrokerDiagnostics() {
   const qc = useQueryClient()
+  // logs stream via the sync:admin websocket (2s push) — REST fallback only
+  const adm = useSyncChannel<SyncAdmin>('sync:admin')
   const { data } = useQuery({ queryKey: ['accounts'], queryFn: () => api.accounts() })
   const accounts = (data?.accounts ?? []).filter(a => a.brokerType !== 'SIMFEED')
   const [sel, setSel] = useState<string>('')
@@ -45,9 +90,12 @@ function BrokerDiagnostics() {
   const { data: logs, refetch } = useQuery({
     queryKey: ['broker-logs', accountId],
     queryFn: () => api.brokerLogs(accountId),
-    enabled: !!accountId,
+    enabled: !!accountId && !adm,
     refetchInterval: 5000,
   })
+  const liveLogs = adm
+    ? (adm.brokerLogs ?? []).filter(l => l.accountId === accountId).map((l, i) => ({ ...l, id: i }))
+    : (logs?.logs ?? [])
 
   const runTest = async () => {
     if (!accountId) return
@@ -96,14 +144,14 @@ function BrokerDiagnostics() {
         </div>
       )}
       <div className="max-h-56 overflow-y-auto divide-y divide-border/50">
-        {(logs?.logs ?? []).map(l => (
+        {liveLogs.map(l => (
           <div key={l.id} className="px-4 py-1 flex items-start gap-2 text-[10px] tabular">
             <span className="text-muted-foreground shrink-0">{l.ts.slice(11, 19)}</span>
             <span className={`shrink-0 font-bold ${l.level === 'ERROR' ? 'text-[#ff4d5e]' : l.level === 'WARN' ? 'text-[#e0a63f]' : 'text-muted-foreground'}`}>{l.level}</span>
             <span className="min-w-0 flex-1 break-all">{l.message}</span>
           </div>
         ))}
-        {(logs?.logs ?? []).length === 0 && (
+        {liveLogs.length === 0 && (
           <div className="px-4 py-4 text-center text-[11px] text-muted-foreground">
             No broker calls logged yet for this account — create a session or run the test.
           </div>
@@ -120,8 +168,12 @@ function BrokerDiagnostics() {
 // recorded ticks, so the terminal + paper accounts trade a "live" market.
 function ReplayManager() {
   const qc = useQueryClient()
-  const { data: rec } = useQuery({ queryKey: ['tick-recorder'], queryFn: () => api.tickRecorder(), refetchInterval: 10_000 })
-  const { data: st } = useQuery({ queryKey: ['replay-status'], queryFn: () => api.replayStatus(), refetchInterval: 1500 })
+  // recorder + replay state ride the sync:admin websocket (2s) — REST fallback
+  const adm = useSyncChannel<SyncAdmin>('sync:admin')
+  const { data: recRest } = useQuery({ queryKey: ['tick-recorder'], queryFn: () => api.tickRecorder(), enabled: !adm, refetchInterval: 10_000 })
+  const { data: stRest } = useQuery({ queryKey: ['replay-status'], queryFn: () => api.replayStatus(), enabled: !adm, refetchInterval: 1500 })
+  const rec = adm?.tickRecorder ?? recRest
+  const st = adm?.replay ?? stRest
   const [file, setFile] = useState<string>('')
   const [random, setRandom] = useState(true)
   const [speed, setSpeed] = useState(1)
@@ -221,7 +273,9 @@ function ReplayManager() {
 // power the future paper-trading / replay engine.
 function TickRecorder() {
   const qc = useQueryClient()
-  const { data } = useQuery({ queryKey: ['tick-recorder'], queryFn: () => api.tickRecorder(), refetchInterval: 5000 })
+  const adm = useSyncChannel<SyncAdmin>('sync:admin')
+  const { data: rest } = useQuery({ queryKey: ['tick-recorder'], queryFn: () => api.tickRecorder(), enabled: !adm, refetchInterval: 5000 })
+  const data = adm?.tickRecorder ?? rest
   const [sym, setSym] = useState('')
   if (!data) return null
 
@@ -322,7 +376,9 @@ function TickRecorder() {
 //    GenAcsTok (sha256 checksum) → susertoken (or QuickAuth uid+pwd+PAN)
 function AccountsManager() {
   const qc = useQueryClient()
-  const { data } = useQuery({ queryKey: ['accounts'], queryFn: () => api.accounts(), refetchInterval: 5000 })
+  const core = useSyncChannel<SyncCore>('sync:core')
+  const { data: rest } = useQuery({ queryKey: ['accounts'], queryFn: () => api.accounts(), enabled: !core, refetchInterval: 5000 })
+  const data = core ? { accounts: core.accounts as unknown as AccountRow[] } : rest
   const [dlgOpen, setDlgOpen] = useState(false)
   const [form, setForm] = useState<{
     label: string; brokerType: BrokerType; clientId: string; initialCapital: string; mode: CapitalMode
@@ -756,8 +812,10 @@ function ModeSelect({ id, current }: { id: string; current: string | null }) {
 // ---------------- Copy trading ----------------
 function CopyTradeManager() {
   const qc = useQueryClient()
-  const { data: ct } = useQuery({ queryKey: ['copytrade-admin'], queryFn: () => api.copyTrade(), refetchInterval: 5000 })
+  const adm = useSyncChannel<SyncAdmin>('sync:admin')
+  const { data: ctRest } = useQuery({ queryKey: ['copytrade-admin'], queryFn: () => api.copyTrade(), enabled: !adm, refetchInterval: 5000 })
   const { data: acc } = useQuery({ queryKey: ['accounts'], queryFn: () => api.accounts() })
+  const ct = adm?.copyTrade ? { config: adm.copyTrade as unknown as CopyTradeCfg } : ctRest
   const cfg = ct?.config
   const accounts = acc?.accounts ?? []
 
@@ -811,14 +869,16 @@ function CopyTradeManager() {
 // ---------------- Master contracts ----------------
 function MasterContracts() {
   const qc = useQueryClient()
-  const { data } = useQuery({ queryKey: ['sync-info'], queryFn: () => api.syncInfo(), refetchInterval: 15000 })
+  const adm = useSyncChannel<SyncAdmin>('sync:admin')
+  const { data: rest } = useQuery({ queryKey: ['sync-info'], queryFn: () => api.syncInfo(), enabled: !adm, refetchInterval: 15000 })
+  const data = adm?.syncInfo ?? rest
   const [busy, setBusy] = useState(false)
 
   const sync = async () => {
     setBusy(true)
     try {
       const r = await api.syncSymbols()
-      toast.success(`Master contracts synced — ${r.symbolCount} symbols, ${r.mappedCount} broker mappings (${r.version})`)
+      toast.success(`Master contracts synced — ${r.symbolCount} symbols, ${r.mappedCount} broker mappings`)
       qc.invalidateQueries({ queryKey: ['sync-info'] })
       qc.invalidateQueries({ queryKey: ['symbols'] })
     } catch (e) {
@@ -861,9 +921,11 @@ function Stat({ label, value, warn }: { label: string; value: string; warn?: boo
 }
 
 // ---------------- Audit trail ----------------
+interface AuditRow { id: string; ts: string; source: string; action: string; masterSymbol: string; side: string; qty: number; status: string; message: string | null; legsJson: string | null }
 function AuditTrail() {
-  const { data } = useQuery({ queryKey: ['audit'], queryFn: () => api.audit(), refetchInterval: 4000 })
-  const rows = data?.audits ?? []
+  const adm = useSyncChannel<SyncAdmin>('sync:admin')
+  const { data: rest } = useQuery({ queryKey: ['audit'], queryFn: () => api.audit(), enabled: !adm, refetchInterval: 4000 })
+  const rows: AuditRow[] = (adm?.audit as unknown as AuditRow[] | undefined) ?? rest?.audits ?? []
   const [open, setOpen] = useState<string | null>(null)
   return (
     <div className="rounded-lg border border-border bg-card">

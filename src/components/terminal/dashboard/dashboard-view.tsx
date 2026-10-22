@@ -10,7 +10,7 @@ import { Switch } from '@/components/ui/switch'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { api, fmtInr, fmtTime } from '../lib/client-api'
 import type { PortfolioResp, GttRuleRow, MarginResp } from '../lib/client-api'
-import { useSyncChannel, type SyncCore } from '../lib/sync'
+import { useSyncChannel, type SyncCore, type SyncAdmin } from '../lib/sync'
 
 // ============================================================
 // Dashboard — portfolio, GTT, margin calculator and session
@@ -29,6 +29,7 @@ function fmtCompact(n: number | null | undefined): string {
 
 export function DashboardView() {
   const core = useSyncChannel<SyncCore>('sync:core')
+  const adm = useSyncChannel<SyncAdmin>('sync:admin')
   const { data: portfolio } = useQuery({ queryKey: ['portfolio'], queryFn: () => api.portfolio(), refetchInterval: 30_000 })
 
   const s = core?.session
@@ -55,7 +56,7 @@ export function DashboardView() {
   return (
     <div className="h-full overflow-y-auto">
       <div className="p-3 space-y-3 max-w-[1500px] mx-auto">
-        {/* KPI row */}
+        {/* KPI row — MASTER (admin) session metrics across all accounts */}
         <div className="grid grid-cols-3 md:grid-cols-6 gap-2">
           <Kpi icon={Activity} label="Net P&L" value={s ? fmtInr(s.net) : '—'} tone={(s?.net ?? 0) >= 0 ? 'up' : 'down'} sub={s ? `realized ${fmtCompact(s.realized)} · open ${fmtCompact(s.unrealized)}` : ''} />
           <Kpi icon={Trophy} label="Win rate" value={s?.winRate != null ? `${s.winRate.toFixed(0)}%` : '—'} tone={(s?.winRate ?? 0) >= 50 ? 'up' : 'neutral'} sub={s ? `${s.wins}W / ${s.closes - s.wins}L of ${s.closes} closes` : ''} />
@@ -64,6 +65,13 @@ export function DashboardView() {
           <Kpi icon={Layers} label="Charges" value={s ? fmtCompact(s.charges) : '—'} tone="neutral" sub="STT · GST · brokerage · stamp" />
           <Kpi icon={Calculator} label="Fill rate" value={fillRate != null ? `${fillRate.toFixed(0)}%` : '—'} tone="neutral" sub={`${openOrders} open of ${totalOrders} orders`} />
         </div>
+
+        {/* MASTER dashboard — live system health (feed engine, sessions, universe, safety) */}
+        <SystemHealth adm={adm} />
+
+        {/* ACCOUNT dashboards — one card per broker account, click for the
+            full per-account detail (funds, positions, orders, logs, session) */}
+        <AccountDashboards core={core} adm={adm} />
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
           {/* realized P&L curve */}
@@ -141,6 +149,211 @@ function Card({ title, children }: { title: string; children: React.ReactNode })
 }
 function Th({ children }: { children: React.ReactNode }) { return <th className="text-left font-medium px-1.5 py-1 whitespace-nowrap">{children}</th> }
 function Td({ children, className = '' }: { children: React.ReactNode; className?: string }) { return <td className={`px-1.5 py-1 whitespace-nowrap ${className}`}>{children}</td> }
+
+// ---------------- MASTER dashboard — system health strip ----------------
+// Live admin overview from the sync:admin websocket: feed engine state,
+// per-broker session presence, symbol universe, copy-trade safety switches.
+function SystemHealth({ adm }: { adm: SyncAdmin | null }) {
+  const feed = adm?.feed
+  const meta = adm?.accountsMeta ?? []
+  const tickAge = feed?.lastTickTs != null ? Math.max(0, Math.round((Date.now() - feed.lastTickTs) / 1000)) : null
+  const liveErr = feed?.sourceIsLive ? feed.lastError : null
+  return (
+    <Card title="Master — system health">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+        <HealthCell
+          label="Feed engine"
+          main={feed == null ? '—' : feed.sourceIsLive ? (feed.fresh ? 'TICKING' : 'STALLED') : 'SIM FEED'}
+          tone={feed == null ? 'neutral' : feed.sourceIsLive && !feed.fresh ? 'warn' : 'ok'}
+          sub={feed == null ? 'websocket connecting…' : feed.sourceIsLive
+            ? `${feed.symbols} symbols · last tick ${tickAge != null ? `${tickAge}s` : '—'} · ${feed.polls} polls${liveErr ? ` · ${liveErr}` : ''}`
+            : `built-in sim · ${feed.symbols ?? 0} symbols`}
+        />
+        <HealthCell
+          label="Broker sessions"
+          main={meta.length === 0 ? '—' : `${meta.filter(m => m.hasCreds).length}/${meta.length} live`}
+          tone={meta.length === 0 ? 'neutral' : meta.filter(m => m.brokerType !== 'SIMFEED' && m.isActive && !m.hasCreds).length > 0 ? 'warn' : 'ok'}
+          sub={meta.map(m => `${m.label}${m.hasCreds ? '' : ' (no session)'}`).join(' · ') || 'no live broker accounts'}
+        />
+        <HealthCell
+          label="Symbol universe"
+          main={adm ? `${adm.syncInfo.counts.symbols}` : '—'}
+          tone="neutral"
+          sub={adm ? `${adm.syncInfo.counts.mappings} broker mappings · synced ${adm.syncInfo.lastSync ? fmtTime(adm.syncInfo.lastSync) : 'never'}` : ''}
+        />
+        <HealthCell
+          label="Copy trade + recorder"
+          main={adm ? `${adm.copyTrade?.enabled ? 'COPY ON' : 'COPY OFF'}${adm.copyTrade?.killSwitch ? ' · KILL' : ''} · REC ${adm.tickRecorder?.enabled ? 'ON' : 'OFF'}` : '—'}
+          tone={adm?.copyTrade?.killSwitch ? 'warn' : 'neutral'}
+          sub={adm?.copyTrade ? `share ${adm.copyTrade.capitalSharePct}% · slippage ${adm.copyTrade.slippagePct}% · ${adm.tickRecorder?.symbols.join('/') ?? ''}` : ''}
+        />
+      </div>
+    </Card>
+  )
+}
+
+function HealthCell({ label, main, sub, tone }: { label: string; main: string; sub?: string; tone: 'ok' | 'warn' | 'neutral' }) {
+  return (
+    <div className="rounded bg-secondary/40 p-2">
+      <div className="text-[8px] uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className={`tabular font-bold text-xs mt-0.5 ${tone === 'ok' ? 'text-[#00c896]' : tone === 'warn' ? 'text-[#e0a63f]' : ''}`}>{main}</div>
+      {sub && <div className="text-[8px] text-muted-foreground leading-tight mt-0.5 break-words">{sub}</div>}
+    </div>
+  )
+}
+
+// ---------------- ACCOUNT dashboards — cards + drill-down ----------------
+// One card per broker account (realtime from sync:core + sync:admin).
+// Click a card → full per-account dashboard: funds, positions, orders,
+// trades, session stats and raw broker logs. No REST polling anywhere.
+function AccountDashboards({ core, adm }: { core: SyncCore | null; adm: SyncAdmin | null }) {
+  const [sel, setSel] = useState<string | null>(null)
+  const accounts = core?.accounts ?? []
+  if (!core || accounts.length === 0) {
+    return <Card title="Account dashboards"><div className="text-[10px] text-muted-foreground py-2 text-center">waiting for the websocket sync hub…</div></Card>
+  }
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="text-[9px] uppercase tracking-wide text-muted-foreground">Account dashboards — click a card for the full per-account view</div>
+        {sel && <button className="text-[10px] text-muted-foreground hover:text-foreground underline decoration-dotted" onClick={() => setSel(null)}>collapse</button>}
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2">
+        {accounts.map(a => (
+          <AccountCard key={a.id} acc={a} meta={adm?.accountsMeta.find(m => m.id === a.id)} open={sel === a.id} onOpen={() => setSel(sel === a.id ? null : a.id)} />
+        ))}
+      </div>
+      {sel && <AccountDetail accountId={sel} core={core} adm={adm} />}
+    </div>
+  )
+}
+
+function AccountCard({ acc, meta, open, onOpen }: { acc: SyncCore['accounts'][number]; meta?: SyncAdmin['accountsMeta'][number]; open: boolean; onOpen: () => void }) {
+  const net = acc.realizedPnl
+  return (
+    <button
+      onClick={onOpen}
+      className={`text-left rounded border p-2.5 bg-card transition-colors ${open ? 'border-primary/60 bg-primary/5' : 'border-border hover:border-primary/40'}`}
+    >
+      <div className="flex items-center gap-1.5">
+        <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${acc.isActive ? 'bg-[#00c896]' : 'bg-[#ff4d5e]'}`} title={acc.isActive ? 'connected' : 'disconnected'} />
+        <span className="font-bold text-[11px] truncate">{acc.label}</span>
+        <span className="text-[8px] uppercase tracking-wide text-muted-foreground shrink-0">{acc.brokerType}</span>
+        {meta && !meta.hasCreds && acc.brokerType !== 'SIMFEED' && (
+          <span className="ml-auto text-[7px] font-bold px-1 rounded bg-[#e0a63f]/15 text-[#e0a63f] shrink-0" title="no broker session — create it in Admin">NO SESSION</span>
+        )}
+      </div>
+      <div className="grid grid-cols-3 gap-1 mt-1.5 text-[9px] tabular">
+        <div>
+          <div className="text-[7px] uppercase text-muted-foreground">usable</div>
+          <div className="font-bold text-[#00c896]">{fmtCompact(acc.usableCapital)}{acc.capitalBase === 'AVAILABLE_CASH_PCT' && <span className="text-[#e0a63f] text-[8px]"> {acc.capitalPct}%</span>}</div>
+        </div>
+        <div>
+          <div className="text-[7px] uppercase text-muted-foreground">deployed</div>
+          <div className="font-bold">{fmtCompact(acc.deployed)}</div>
+        </div>
+        <div>
+          <div className="text-[7px] uppercase text-muted-foreground">realized</div>
+          <div className={`font-bold ${net >= 0 ? 'term-up' : 'term-down'}`}>{fmtCompact(net)}</div>
+        </div>
+      </div>
+      <div className="flex items-center gap-2 mt-1 text-[8px] text-muted-foreground tabular">
+        <span>{acc.openPositions} pos</span>
+        <span>{acc.openOrders} open ord</span>
+        <span className="ml-auto">{acc.capitalBase === 'AVAILABLE_CASH_PCT' ? '% of cash' : 'fixed ₹'}</span>
+      </div>
+    </button>
+  )
+}
+
+/** Full per-account dashboard (drill-down) — everything from the two sync
+ *  channels, zero polling: funds, positions, orders, session stats, logs. */
+function AccountDetail({ accountId, core, adm }: { accountId: string; core: SyncCore; adm: SyncAdmin | null }) {
+  const acc = core.accounts.find(a => a.id === accountId)
+  const fund = core.funds.find(f => f.accountId === accountId)
+  const positions = core.positions.filter(p => p.accountId === accountId)
+  const orders = core.orders.filter(o => o.accountId === accountId).slice(0, 8)
+  const sess = core.session.perAccount.find(p => p.accountId === accountId)
+  const logs = (adm?.brokerLogs ?? []).filter(l => l.accountId === accountId).slice(0, 10)
+  const meta = adm?.accountsMeta.find(m => m.id === accountId)
+  if (!acc) return null
+  const net = sess ? sess.realized + sess.unrealized : acc.realizedPnl
+  return (
+    <div className="rounded border border-primary/40 bg-card p-2.5 space-y-2.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-bold text-xs">{acc.label}</span>
+        <span className="text-[9px] uppercase tracking-wide text-muted-foreground">{acc.brokerType} · {acc.clientId ?? 'no client id'}</span>
+        <span className={`px-1.5 rounded text-[8px] font-bold ${acc.isActive ? 'bg-[#00c896]/15 text-[#00c896]' : 'bg-[#ff4d5e]/15 text-[#ff4d5e]'}`}>{acc.isActive ? 'CONNECTED' : 'DISCONNECTED'}</span>
+        <span className="px-1.5 rounded text-[8px] font-bold bg-secondary text-muted-foreground">{acc.isOrderEnabled ? 'ORDERS ON' : 'ORDERS OFF'}</span>
+        {acc.isCopyMaster && <span className="px-1.5 rounded text-[8px] font-bold bg-[#4dd0e1]/15 text-[#4dd0e1]">COPY MASTER</span>}
+        <div className="flex-1" />
+        <span className="text-[9px] tabular text-muted-foreground">
+          {sess ? `${sess.closes} closes · ${sess.closes ? ((sess.wins / sess.closes) * 100).toFixed(0) : '—'}% WR · ` : ''}
+          net <b className={net >= 0 ? 'term-up' : 'term-down'}>{fmtCompact(net)}</b>
+        </span>
+      </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-1.5">
+        <HealthCell label="Available cash" main={fmtCompact(fund?.cash ?? acc.availableCash)} tone="neutral" sub={acc.capitalBase === 'AVAILABLE_CASH_PCT' ? `${acc.capitalPct}% base → ${fmtCompact(acc.initialCapital)}` : `fixed initial ${fmtCompact(acc.initialCapital)}`} />
+        <HealthCell label="Deployed" main={fmtCompact(acc.deployed)} tone="neutral" sub={`${acc.openPositions} open positions`} />
+        <HealthCell label="Realized" main={fmtCompact(acc.realizedPnl)} tone={acc.realizedPnl >= 0 ? 'ok' : 'warn'} sub={`charges ${fmtCompact(acc.chargesPaid)}`} />
+        <HealthCell label="Session pts" main={sess ? `${sess.pts >= 0 ? '+' : ''}${sess.pts.toFixed(1)}` : '—'} tone={(sess?.pts ?? 0) >= 0 ? 'ok' : 'warn'} sub={`${sess?.trades ?? 0} trades`} />
+        <HealthCell label="Unrealized" main={fmtCompact(sess?.unrealized ?? 0)} tone={(sess?.unrealized ?? 0) >= 0 ? 'ok' : 'warn'} sub="open positions at LTP" />
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-2.5">
+        <div>
+          <div className="text-[8px] uppercase tracking-wide text-muted-foreground mb-1">positions</div>
+          <div className="max-h-40 overflow-y-auto">
+            <table className="w-full text-[10px] tabular">
+              <thead className="text-[8px] uppercase text-muted-foreground"><tr><Th>Symbol</Th><Th>Qty</Th><Th>Avg</Th><Th>LTP</Th><Th>P&L</Th></tr></thead>
+              <tbody>
+                {positions.map((p, i) => (
+                  <tr key={`${p.symbol}-${i}`} className="border-b border-border/30">
+                    <Td className="font-medium">{p.symbol}</Td>
+                    <Td className={p.netQty > 0 ? 'term-up' : p.netQty < 0 ? 'term-down' : ''}>{p.netQty}</Td>
+                    <Td>{p.avgPrice.toFixed(2)}</Td>
+                    <Td>{p.ltp.toFixed(2)}</Td>
+                    <Td className={p.unrealizedPnl >= 0 ? 'term-up' : 'term-down'}>{fmtCompact(p.unrealizedPnl)}</Td>
+                  </tr>
+                ))}
+                {positions.length === 0 && <tr><Td className="text-muted-foreground">flat — no open positions</Td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <div className="text-[8px] uppercase tracking-wide text-muted-foreground mb-1">recent orders</div>
+          <div className="max-h-40 overflow-y-auto space-y-0.5">
+            {orders.map(o => (
+              <div key={o.id} className="flex items-center gap-1.5 text-[10px] tabular px-1 py-0.5 rounded bg-secondary/30">
+                <span className={`font-bold ${o.side === 'BUY' ? 'text-[#00c896]' : 'text-[#ff4d5e]'}`}>{o.side}</span>
+                <span className="font-medium truncate max-w-[130px]">{o.symbol}</span>
+                <span className="text-muted-foreground">{o.qty} {o.orderType}</span>
+                <span className={`ml-auto px-1 rounded text-[8px] ${o.status === 'FILLED' ? 'bg-[#00c896]/15 text-[#00c896]' : o.status === 'OPEN' || o.status === 'PENDING' ? 'bg-[#f5a623]/15 text-[#f5a623]' : 'bg-[#ff4d5e]/15 text-[#ff4d5e]'}`}>{o.status}</span>
+              </div>
+            ))}
+            {orders.length === 0 && <div className="text-[10px] text-muted-foreground py-1">no orders yet</div>}
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div className="text-[8px] uppercase tracking-wide text-muted-foreground mb-1">broker logs (latest calls)</div>
+        <div className="max-h-28 overflow-y-auto divide-y divide-border/40">
+          {logs.map((l, i) => (
+            <div key={i} className="flex items-start gap-1.5 text-[9px] tabular py-0.5">
+              <span className="text-muted-foreground shrink-0">{l.ts.slice(11, 19)}</span>
+              <span className={`shrink-0 font-bold ${l.level === 'ERROR' ? 'text-[#ff4d5e]' : l.level === 'WARN' ? 'text-[#e0a63f]' : 'text-muted-foreground'}`}>{l.level}</span>
+              <span className="min-w-0 flex-1 break-all">{l.message}</span>
+            </div>
+          ))}
+          {logs.length === 0 && <div className="text-[9px] text-muted-foreground py-1">{meta?.hasCreds === false ? 'no broker session — create one in Admin → Session' : 'no broker calls logged yet'}</div>}
+        </div>
+      </div>
+    </div>
+  )
+}
 
 /** Tiny SVG line chart — cumulative realized P&L. */
 function PnlCurve({ pts }: { pts: { t: string; v: number }[] }) {
@@ -299,8 +512,10 @@ function MarginCalculator({ accounts }: { accounts: { id: string; label: string;
 
 function GttManager() {
   const qc = useQueryClient()
-  const { data } = useQuery({ queryKey: ['gtt'], queryFn: () => api.gttRules(), refetchInterval: 3000 })
-  const rules = data?.rules ?? []
+  // GTT rules ride the sync:admin websocket (2s push) — REST fallback
+  const adm = useSyncChannel<SyncAdmin>('sync:admin')
+  const { data: rest } = useQuery({ queryKey: ['gtt'], queryFn: () => api.gttRules(), enabled: !adm, refetchInterval: 3000 })
+  const rules = (adm?.gtt as unknown as GttRuleRow[] | undefined) ?? rest?.rules ?? []
   const [symbol, setSymbol] = useState('NIFTY')
   const [side, setSide] = useState<'BUY' | 'SELL'>('BUY')
   const [qty, setQty] = useState('1')

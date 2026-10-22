@@ -40,6 +40,9 @@
     ".next/dev/types/**/*.ts"
   ],
   "exclude": [
-    "node_modules"
+    "node_modules",
+    "scripts/check-export.ts",
+    "scripts/check-sync-admin.ts",
+    "scripts/repair-cash.ts"
   ]
 }

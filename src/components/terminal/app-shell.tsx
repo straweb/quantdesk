@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from '@tan
 import { Activity, SquareTerminal, Settings2, Bot, LogOut, CircleDot, Trophy, LayoutDashboard, Link2, Unlink, Radio, Pencil, RefreshCw, Wallet } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Slider } from '@/components/ui/slider'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
@@ -13,7 +14,7 @@ import { api } from './lib/client-api'
 import type { AccountRow } from './lib/client-api'
 import { useTerminal, type AppView } from './lib/store'
 import { onFeedStatus, ensureSocket } from './lib/socket'
-import { useSyncChannel, type SyncCore } from './lib/sync'
+import { useSyncChannel, type SyncCore, type SyncAdmin } from './lib/sync'
 import { TerminalView } from './terminal-view'
 import { AdminView } from './admin/admin-view'
 import { StrategyView } from './strategy/strategy-view'
@@ -34,6 +35,18 @@ function fmtCompact(n: number | null | undefined): string {
   if (abs >= 1e5) return `₹${(n / 1e5).toFixed(2)}L`
   if (abs >= 1000) return `₹${(n / 1000).toFixed(1)}k`
   return `₹${Math.round(n)}`
+}
+
+/** Slider max for the fixed-₹ capital editor — ~125% of the account's
+ *  available cash (or ₹10L when cash is unknown), rounded to a clean step. */
+function fixedSliderMax(cash: number | null | undefined): number {
+  const base = Math.max(100_000, Math.ceil(((cash ?? 0) * 1.25) / 50_000) * 50_000)
+  return Math.max(base, 1_000_000)
+}
+
+/** Round a rupee slider position to a clean step value. */
+function snapStep(v: number, step = 5_000): number {
+  return Math.round(v / step) * step
 }
 
 // broker icon glyph + tint — replaces the full account label on the chip
@@ -264,11 +277,11 @@ function CapitalChip({ acc }: { acc: AccountRow }) {
           <div className="text-[9px] text-muted-foreground">Capital source</div>
           <div className="grid grid-cols-2 gap-1">
             <button
-              onClick={() => setBase('FIXED')}
+              onClick={() => { setBase('FIXED'); setCapital(String((acc.initialCapitalFixed ?? acc.initialCapital) || 500000)) }}
               className={`px-2 py-1 rounded text-[10px] font-semibold border ${base === 'FIXED' ? 'bg-primary/20 border-primary/50 text-foreground' : 'bg-secondary/50 border-border text-muted-foreground hover:text-foreground'}`}
             >Fixed ₹</button>
             <button
-              onClick={() => setBase('AVAILABLE_CASH_PCT')}
+              onClick={() => { setBase('AVAILABLE_CASH_PCT'); setPct(String(acc.capitalPct ?? 100)) }}
               className={`px-2 py-1 rounded text-[10px] font-semibold border ${base === 'AVAILABLE_CASH_PCT' ? 'bg-primary/20 border-primary/50 text-foreground' : 'bg-secondary/50 border-border text-muted-foreground hover:text-foreground'}`}
             >% of cash</button>
           </div>
@@ -276,11 +289,22 @@ function CapitalChip({ acc }: { acc: AccountRow }) {
         {base === 'FIXED' ? (
           <div className="space-y-1">
             <div className="text-[9px] text-muted-foreground">Capital size (₹)</div>
-            <Input
-              value={capital}
-              onChange={e => setCapital(e.target.value.replace(/[^0-9.]/g, ''))}
-              className="h-7 text-[11px] tabular"
-            />
+            <div className="flex items-center gap-2">
+              <Slider
+                value={[Math.min(fixedSliderMax(cash), Number(capital) || 0)]}
+                min={0}
+                max={fixedSliderMax(cash)}
+                step={5_000}
+                onValueChange={v => setCapital(String(snapStep(v[0])))}
+                className="flex-1 [&_[data-slot=slider-thumb]]:h-3 [&_[data-slot=slider-thumb]]:w-3"
+              />
+              <Input
+                value={capital}
+                onChange={e => setCapital(e.target.value.replace(/[^0-9.]/g, ''))}
+                className="h-7 text-[11px] tabular w-24"
+              />
+            </div>
+            <div className="text-[8px] text-muted-foreground">slider steps ₹5k · type any amount in the box</div>
           </div>
         ) : (
           <div className="space-y-1">
@@ -288,17 +312,25 @@ function CapitalChip({ acc }: { acc: AccountRow }) {
               <span>Share of available cash</span>
               {cash != null && <span className="tabular">cash {fmtCompact(cash)}</span>}
             </div>
-            <div className="flex items-center gap-1.5">
+            <div className="flex items-center gap-2">
+              <Slider
+                value={[Math.min(100, Number(pct) || 0)]}
+                min={1}
+                max={100}
+                step={1}
+                onValueChange={v => setPct(String(v[0]))}
+                className="flex-1 [&_[data-slot=slider-thumb]]:h-3 [&_[data-slot=slider-thumb]]:w-3"
+              />
               <Input
                 value={pct}
                 onChange={e => setPct(e.target.value.replace(/[^0-9.]/g, ''))}
-                className="h-7 text-[11px] tabular w-20"
+                className="h-7 text-[11px] tabular w-16"
               />
               <span className="text-muted-foreground">%</span>
-              {pctPreview != null && (
-                <span className="ml-auto tabular font-bold text-[#00c896]">= {fmtCompact(pctPreview)}</span>
-              )}
             </div>
+            {pctPreview != null && (
+              <div className="tabular font-bold text-[#00c896] text-[10px]">= {fmtCompact(pctPreview)}</div>
+            )}
             <div className="text-[8px] text-muted-foreground leading-snug">Recomputed live from the account&apos;s available cash on every sizing call — tracks the real balance (sizing mode is bypassed; PnL is already inside the cash).</div>
           </div>
         )}
@@ -485,9 +517,13 @@ function FeedChip({ up }: { up: boolean }) {
   const [capEdit, setCapEdit] = useState<string | null>(null)
   const [capBase, setCapBase] = useState<'FIXED' | 'AVAILABLE_CASH_PCT'>('AVAILABLE_CASH_PCT')
   const [capVal, setCapVal] = useState('25')
-  const { data } = useQuery({ queryKey: ['feed-source'], queryFn: () => api.feedSource(), refetchInterval: 8000 })
+  // admin plane over the websocket (2s push) — replaces the feed-source +
+  // feed-status REST polls; REST stays as the fallback when the socket is down
+  const adm = useSyncChannel<SyncAdmin>('sync:admin')
+  const { data } = useQuery({ queryKey: ['feed-source'], queryFn: () => api.feedSource(), enabled: !adm, refetchInterval: 8000 })
   // live broker feed engine health (ticking? last error?)
-  const { data: feedSt } = useQuery({ queryKey: ['feed-status'], queryFn: () => api.feedStatus(), refetchInterval: 5000, retry: false })
+  const { data: feedSt } = useQuery({ queryKey: ['feed-status'], queryFn: () => api.feedStatus(), enabled: !adm, refetchInterval: 5000, retry: false })
+  const feedStatus = adm?.feed ?? feedSt
   // realtime PnL / capital / connection state straight from sync:core
   const sync = useSyncChannel<SyncCore>('sync:core')
   const { data: restAccs } = useQuery({
@@ -499,11 +535,11 @@ function FeedChip({ up }: { up: boolean }) {
   const accounts: AccountRow[] = sync?.accounts
     ? (sync.accounts as unknown as AccountRow[])
     : (restAccs?.accounts ?? [])
-  const source = data?.source ?? 'sim'
-  const sources = data?.sources ?? []
+  const source = adm?.feedSource.source ?? data?.source ?? 'sim'
+  const sources = adm?.feedSource.sources ?? data?.sources ?? []
   const current = sources.find(s => s.id === source)
   const accById = new Map(accounts.map(a => [a.id, a]))
-  const tickAge = feedSt?.lastTickTs ? Math.max(0, Math.round((Date.now() - feedSt.lastTickTs) / 1000)) : null
+  const tickAge = feedStatus?.lastTickTs ? Math.max(0, Math.round((Date.now() - feedStatus.lastTickTs) / 1000)) : null
 
   const refresh = async () => {
     await Promise.all([
@@ -577,8 +613,8 @@ function FeedChip({ up }: { up: boolean }) {
   }
 
   // live-feed health for the ACTIVE broker source
-  const liveHealthy = !!feedSt?.sourceIsLive && !!feedSt?.fresh
-  const liveErr = feedSt?.sourceIsLive ? feedSt?.lastError : null
+  const liveHealthy = !!feedStatus?.sourceIsLive && !!feedStatus?.fresh
+  const liveErr = feedStatus?.sourceIsLive ? feedStatus?.lastError : null
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -594,7 +630,7 @@ function FeedChip({ up }: { up: boolean }) {
           {source !== 'sim' && (
             <span
               className={`h-1.5 w-1.5 rounded-full ${liveHealthy ? 'bg-[#00c896] pulse-dot' : 'bg-[#e0a63f]'}`}
-              title={liveHealthy ? `live broker data ticking (${feedSt?.symbols} symbols · last ${tickAge}s ago)` : `live data stalled${liveErr ? ` — ${liveErr}` : ' — waiting for ticks'}`}
+              title={liveHealthy ? `live broker data ticking (${feedStatus?.symbols} symbols · last ${tickAge}s ago)` : `live data stalled${liveErr ? ` — ${liveErr}` : ' — waiting for ticks'}`}
             />
           )}
           <span className="max-w-[110px] truncate text-foreground/80">{current?.label ?? 'Sim Feed'}</span>
@@ -604,13 +640,13 @@ function FeedChip({ up }: { up: boolean }) {
         <div className="px-1 pb-1 text-[9px] text-muted-foreground leading-snug">
           Market data source — one feed active at a time. Live rows show real feed health; click <b>cap</b> to change % / fixed capital anytime, even while connected.
         </div>
-        {feedSt?.sourceIsLive && (
+        {feedStatus?.sourceIsLive && (
           <div className={`mx-1 rounded px-2 py-1.5 text-[9px] leading-snug border ${
             liveHealthy ? 'border-[#00c896]/30 bg-up/30 text-[#00c896]' : 'border-[#e0a63f]/40 bg-[#e0a63f]/10 text-[#e0a63f]'
           }`}>
             {liveHealthy
-              ? <>Live broker feed ticking — {feedSt.symbols} symbols · last tick {tickAge}s ago · {feedSt.polls} polls</>
-              : <>Live feed NOT flowing{feedSt.lastError ? ` — ${feedSt.lastError}` : ''}{!feedSt.sessionPresent ? ' · no session — create it in Admin → Session' : ''} · details in Admin → Broker Diagnostics</>}
+              ? <>Live broker feed ticking — {feedStatus.symbols} symbols · last tick {tickAge}s ago · {feedStatus.polls} polls</>
+              : <>Live feed NOT flowing{feedStatus.lastError ? ` — ${feedStatus.lastError}` : ''}{!feedStatus.sessionPresent ? ' · no session — create it in Admin → Session' : ''} · details in Admin → Broker Diagnostics</>}
           </div>
         )}
         {sources.map(s => {
@@ -714,26 +750,63 @@ function FeedChip({ up }: { up: boolean }) {
               <div className="text-[10px] font-bold">Capital — {acc.label}</div>
               <div className="grid grid-cols-2 gap-1">
                 <button
-                  onClick={() => setCapBase('AVAILABLE_CASH_PCT')}
+                  onClick={() => { setCapBase('AVAILABLE_CASH_PCT'); setCapVal(String(acc.capitalPct ?? 100)) }}
                   className={`px-2 py-1 rounded text-[10px] font-semibold border ${capBase === 'AVAILABLE_CASH_PCT' ? 'bg-primary/20 border-primary/50' : 'bg-secondary/50 border-border text-muted-foreground'}`}
                 >% of cash</button>
                 <button
-                  onClick={() => setCapBase('FIXED')}
+                  onClick={() => { setCapBase('FIXED'); setCapVal(String((acc.initialCapitalFixed ?? acc.initialCapital) || 500000)) }}
                   className={`px-2 py-1 rounded text-[10px] font-semibold border ${capBase === 'FIXED' ? 'bg-primary/20 border-primary/50' : 'bg-secondary/50 border-border text-muted-foreground'}`}
                 >Fixed ₹</button>
               </div>
-              <div className="flex items-center gap-1.5">
-                <Input
-                  value={capVal}
-                  onChange={e => setCapVal(e.target.value.replace(/[^0-9.]/g, ''))}
-                  className="h-7 text-[11px] tabular w-24"
-                  placeholder={capBase === 'AVAILABLE_CASH_PCT' ? '25' : '500000'}
-                />
-                <span className="text-muted-foreground text-[10px]">{capBase === 'AVAILABLE_CASH_PCT' ? '%' : '₹'}</span>
-                {preview != null && <span className="ml-auto tabular text-[10px] font-bold text-[#00c896]">= {fmtCompact(preview)}</span>}
-              </div>
-              {capBase === 'AVAILABLE_CASH_PCT' && cash != null && (
-                <div className="text-[8px] text-muted-foreground">broker cash {fmtCompact(cash)} — auto-refreshed from the funds API every 45s</div>
+              {capBase === 'AVAILABLE_CASH_PCT' ? (
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <Slider
+                      value={[Math.min(100, Number(capVal) || 0)]}
+                      min={1}
+                      max={100}
+                      step={1}
+                      onValueChange={v => setCapVal(String(v[0]))}
+                      className="flex-1 [&_[data-slot=slider-thumb]]:h-3 [&_[data-slot=slider-thumb]]:w-3"
+                      title={`${capVal}% of available cash`}
+                    />
+                    <Input
+                      value={capVal}
+                      onChange={e => setCapVal(e.target.value.replace(/[^0-9.]/g, ''))}
+                      className="h-7 text-[11px] tabular w-16"
+                      placeholder="25"
+                    />
+                    <span className="text-muted-foreground text-[10px]">%</span>
+                  </div>
+                  {preview != null && (
+                    <div className="tabular text-[10px] font-bold text-[#00c896]">= {fmtCompact(preview)} deployable</div>
+                  )}
+                  {cash != null && (
+                    <div className="text-[8px] text-muted-foreground">broker cash {fmtCompact(cash)} — auto-refreshed from the funds API every 45s</div>
+                  )}
+                </div>
+              ) : (
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <Slider
+                      value={[Math.min(fixedSliderMax(cash), Number(capVal) || 0)]}
+                      min={0}
+                      max={fixedSliderMax(cash)}
+                      step={5_000}
+                      onValueChange={v => setCapVal(String(snapStep(v[0])))}
+                      className="flex-1 [&_[data-slot=slider-thumb]]:h-3 [&_[data-slot=slider-thumb]]:w-3"
+                      title={`₹${Number(capVal) || 0} fixed capital`}
+                    />
+                    <Input
+                      value={capVal}
+                      onChange={e => setCapVal(e.target.value.replace(/[^0-9.]/g, ''))}
+                      className="h-7 text-[11px] tabular w-24"
+                      placeholder="500000"
+                    />
+                    <span className="text-muted-foreground text-[10px]">₹</span>
+                  </div>
+                  <div className="text-[8px] text-muted-foreground">slider steps ₹5k (max {fmtCompact(fixedSliderMax(cash))}) · type any amount in the box</div>
+                </div>
               )}
               <div className="flex items-center justify-between pt-0.5">
                 <button className="text-[10px] text-muted-foreground hover:text-foreground" onClick={() => setCapEdit(null)}>cancel</button>

@@ -30,7 +30,7 @@ Everything is persisted per **workspace**: layouts, timeframes, indicators, draw
 
 - **Terminal** — the main trading screen (watchlist + charts + strike panel + orders).
 - **Strategy** — strategy builder and Python runner (see §10).
-- **Dashboard** — KPI overview: net P&L, win rate, net points, margin used, charges, fill rate, realized-P&L curve, per-account table, portfolio (live holdings + positions), margin calculator, GTT manager.
+- **Dashboard** — Master (admin) KPI overview: net P&L, win rate, net points, margin used, charges, fill rate, realized-P&L curve, per-account table, portfolio (live holdings + positions), margin calculator, GTT manager. Plus the **Master — system health** strip (feed engine, broker sessions, symbol universe, copy-trade + recorder) and **account dashboards** — one realtime card per broker account; click a card for the full per-account drill-down (funds, positions, orders, session stats, broker logs). Everything flows over the websocket (no REST polling).
 - **Admin** — accounts, copy-trade routing, capital config, tick recorder, replay manager, broker sessions, audit log (see §11).
 
 ### 2.2 FEED chip (feed source & account control)
@@ -40,7 +40,7 @@ The `FEED LIVE <source>` chip opens a dropdown with **one row per account**:
 - radio — select which account's feed drives the whole terminal (one active feed source at a time; the built-in **Sim Feed** is the default);
 - **live-feed health** — when a broker account feeds the terminal, the chip carries a data dot (green = ticking, amber = stalled) and the dropdown shows the poll state (symbols fed, last tick age, last error — e.g. "no session — create it in Admin → Session");
 - **PnL** — live per-account P&L, coloured by sign;
-- **Cap** — current usable capital; **click it to edit capital inline** — `% of available cash` or fixed ₹, **changeable at any time (even while connected)**; the 🎒 wallet icon pulls the **REAL broker available cash** on demand (the % base also auto-refreshes from the funds API every 45 s);
+- **Cap** — current usable capital; **click it to edit capital inline** — `% of available cash` or fixed ₹, each with a **slider + input box side-by-side** (slider steps: 1 % / ₹5k; typing any value also works, both stay in sync), **changeable at any time (even while connected)**; the 🎒 wallet icon pulls the **REAL broker available cash** on demand (the % base also auto-refreshes from the funds API every 45 s); the same slider editor lives in the top-bar **capital chips** popover;
 - 🔗 / 🔗̶ **Connect / Disconnect** icon — enables or disables the account for order routing (disconnecting the currently feeding account automatically falls back to the sim feed);
 - 📡 **Feed on/off** icon — use this account as feed source or revert to sim.
 

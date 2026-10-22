@@ -2,9 +2,9 @@
 
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, fmtInr, fmtTime, fmtDateTime } from '../lib/client-api'
-import type { AggOrder, AggTrade, AggPosition, FundRow } from '../lib/client-api'
+import type { AggOrder, AggTrade, AggPosition, FundRow, AccountRow } from '../lib/client-api'
 import { useTerminal } from '../lib/store'
-import { useSyncChannel, type SyncCore } from '../lib/sync'
+import { useSyncChannel, type SyncCore, type SyncAdmin } from '../lib/sync'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -466,16 +466,22 @@ function FundsTable() {
 }
 
 function LogsPanel() {
-  const { data: acc } = useQuery({ queryKey: ['accounts-logs'], queryFn: () => api.accounts(), refetchInterval: 8000 })
-  const accounts = acc?.accounts ?? []
+  // accounts via sync:core, broker logs via sync:admin (2s websocket push) —
+  // REST only as the fallback while the socket is down
+  const core = useSyncChannel<SyncCore>('sync:core')
+  const adm = useSyncChannel<SyncAdmin>('sync:admin')
+  const { data: acc } = useQuery({ queryKey: ['accounts-logs'], queryFn: () => api.accounts(), enabled: !core, refetchInterval: 8000 })
+  const accounts: AccountRow[] = (core?.accounts as unknown as AccountRow[]) ?? acc?.accounts ?? []
   const [sel, setSel] = useState<string>('')
   const active = sel || accounts[0]?.id || ''
   const { data } = useQuery({
     queryKey: ['broker-logs', active],
     queryFn: () => api.brokerLogs(active),
     refetchInterval: 2000,
-    enabled: !!active,
+    enabled: !!active && !adm,
   })
+  const syncLogs = (adm?.brokerLogs ?? []).filter(l => l.accountId === active)
+  const logs = adm ? syncLogs : (data?.logs ?? [])
   return (
     <div className="p-2 space-y-1">
       <Select value={active} onValueChange={setSel}>
