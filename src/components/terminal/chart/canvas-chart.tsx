@@ -5,6 +5,7 @@ import { createPortal } from 'react-dom'
 import type { Candle, Tick } from '@/lib/types'
 import { TF_MS } from '@/lib/types'
 import { api } from '../lib/client-api'
+import { useTerminal } from '../lib/store'
 import { onTicks, subscribeTicks, unsubscribeTicks } from '../lib/socket'
 import {
   CandlestickChart, LineChart, AreaChart, Sigma, Ghost, Ruler, Trash2, MousePointer2,
@@ -886,18 +887,23 @@ export function CanvasChart({
       }
       setErr(null)
     } catch (e) {
-      setErr(e instanceof Error ? e.message : 'load failed')
+      // 404 = the feed engine has no data for this symbol (live source not
+      // flowing yet) — keep the chart empty instead of surfacing an error
+      setErr(null)
     } finally {
       setLoading(false)
     }
   }, [symbol, tf])
 
+  const dataEpoch = useTerminal(s => s.dataEpoch)
   useEffect(() => {
     setLoading(true)
     offsetRef.current = 0
     priceZoomRef.current = 1
     priceOffRef.current = 0
     setDirty(false)
+    setCandles([])
+    setGhost([])
     load()
     subscribeTicks([symbol])
     const iv = setInterval(load, 30_000)
@@ -905,7 +911,7 @@ export function CanvasChart({
       unsubscribeTicks([symbol])
       clearInterval(iv)
     }
-  }, [symbol, tf, load])
+  }, [symbol, tf, load, dataEpoch])
 
   // ---- ghost source data (inner candles + hover inner legend) ----
   useEffect(() => {

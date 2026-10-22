@@ -101,11 +101,21 @@ export function Watchlist() {
   const userTab = wlTabs.find(t => t.id === userTabId) ?? null
 
   const typeFilter = ''
+  // master-contract SEARCH — any tab: typing queries every synced SymbolMaster
+  // row (849+ symbols incl. the broker master contracts), so results show even
+  // when the current tab only holds 3 starred rows (the round-12 search bug)
+  const searchActive = q.trim().length > 0
+  const { data: searchData } = useQuery({
+    queryKey: ['symbols-search', q],
+    queryFn: () => api.symbols(q, typeFilter),
+    refetchInterval: 60_000,
+    enabled: searchActive,
+  })
   const { data } = useQuery({
     queryKey: ['symbols', q, typeFilter],
     queryFn: () => api.symbols(q, typeFilter),
     refetchInterval: 60_000,
-    enabled: !isUserTab && tab !== 'watch' && tab !== 'index' && tab !== 'fno',
+    enabled: !isUserTab && tab !== 'watch' && tab !== 'index' && tab !== 'fno' && !searchActive,
   })
 
   // rows for the generic master-list search (fallback tab)
@@ -211,13 +221,21 @@ export function Watchlist() {
   }, [tab, watchRows, indexRows, userRows, fnoGroups, symbols, ticks])
 
   const visible = useMemo(() => {
+    // SEARCH MODE: master-contract results replace the tab rows (deduped)
+    if (searchActive) {
+      const list = (searchData?.symbols ?? []).map(mkRow)
+      const seen = new Set<string>()
+      const uniq = list.filter(r => (seen.has(r.symbol) ? false : (seen.add(r.symbol), true)))
+      const val = (r: Row) => (sortBy === 'sym' ? 0 : sortBy === 'ltp' ? r.ltp : r.chgPct)
+      return [...uniq].sort((a, b) => sortBy === 'sym' ? (sortAsc ? a.symbol.localeCompare(b.symbol) : b.symbol.localeCompare(a.symbol)) : (sortAsc ? val(a) - val(b) : val(b) - val(a)))
+    }
     let list = baseRows
     if (q && (tab === 'watch' || tab === 'index' || isUserTab || tab === 'fno')) {
       list = list.filter(r => r.symbol.includes(q) || (r.name ?? '').toUpperCase().includes(q))
     }
     const val = (r: Row) => (sortBy === 'sym' ? 0 : sortBy === 'ltp' ? r.ltp : r.chgPct)
     return [...list].sort((a, b) => sortBy === 'sym' ? (sortAsc ? a.symbol.localeCompare(b.symbol) : b.symbol.localeCompare(a.symbol)) : (sortAsc ? val(a) - val(b) : val(b) - val(a)))
-  }, [baseRows, q, tab, isUserTab, sortBy, sortAsc])
+  }, [baseRows, q, tab, isUserTab, sortBy, sortAsc, searchActive, searchData])
 
   const visibleKey = visible.map(r => r.symbol).join(',')
   useEffect(() => {
@@ -227,6 +245,10 @@ export function Watchlist() {
   }, [visibleKey])
 
   useEffect(() => onTicks(setTicks), [])
+
+  // feed-source switch → purge all local tick state (no sim residue)
+  const dataEpoch = useTerminal(s => s.dataEpoch)
+  useEffect(() => { setTicks({}) }, [dataEpoch])
 
   const openWs = (symbol: string) => openSymbolWorkspace(symbol, fnoSet.has(symbol))
   // indices ALWAYS open the spot + ATM CE/PE workspace (charts + right strikes
@@ -390,7 +412,10 @@ export function Watchlist() {
         ))}
         {visible.length === 0 && (
           <div className="p-4 text-center text-[11px] text-muted-foreground">
-            {tab === 'watch' ? 'No starred symbols — tap the star on any row.'
+            {searchActive ? (searchData
+              ? `No master-contract matches for "${q}" — run Master Contracts sync in Admin if the broker list is stale.`
+              : 'Searching master contracts…')
+            : tab === 'watch' ? 'No starred symbols — tap the star on any row.'
             : isUserTab ? 'Empty tab — tap the star on any row to add symbols here.'
             : tab === 'fno' ? 'No F&O contracts — sync master contracts in Admin.'
             : 'No symbols. Sync master contracts in Admin.'}
@@ -733,18 +758,22 @@ function DepthPanel({ cfg, onRemove, onResize }: {
 
   useEffect(() => setHeight(cfg.height), [cfg.height])
 
+  // feed-source switch → drop the cached quote book (sim data must not linger)
+  const dataEpoch = useTerminal(s => s.dataEpoch)
+  useEffect(() => { setQuote(null); setLtp(0); setPrev(0) }, [dataEpoch])
+
   useEffect(() => {
     let dead = false
     const pull = async () => {
       try {
         const q = await api.quote(symbol)
         if (!dead) setQuote(q)
-      } catch { /* ignore */ }
+      } catch { /* live source may not feed this symbol yet — keep it blank */ }
     }
     pull()
     const iv = setInterval(pull, 4000)
     return () => { dead = true; clearInterval(iv) }
-  }, [symbol])
+  }, [symbol, dataEpoch])
 
   useEffect(() => onTicks(map => {
     const t = map[symbol]

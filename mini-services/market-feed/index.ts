@@ -117,11 +117,19 @@ const S = g.__feedState
 
 // ---------- active feed source (persisted; one at a time) ----------
 const FEED_SRC_FILE = process.env.FEED_SRC_FILE || path.resolve(process.cwd(), '../../db/feed-source.json')
+const UNIVERSE_FILE = process.env.UNIVERSE_FILE || path.resolve(process.cwd(), '../../db/universe.json')
 let feedSource = 'sim'
+let simDisabled = false
 try {
-  const raw = readFileSync(FEED_SRC_FILE, 'utf8')
-  feedSource = (JSON.parse(raw) as { source?: string }).source ?? 'sim'
+  const raw = JSON.parse(readFileSync(FEED_SRC_FILE, 'utf8')) as { source?: string; simDisabled?: boolean }
+  feedSource = raw.source ?? 'sim'
+  simDisabled = raw.simDisabled === true
 } catch { /* first boot — default 'sim' */ }
+
+/** true when the sim engine may drive prices (sim source AND live-only off) */
+function simWalkAllowed(): boolean {
+  return feedSource === 'sim' && !simDisabled
+}
 
 // ---------- tick recorder (session live-feed backup) ----------
 // Every tick of the configured symbols is written to a per-session SQLite
@@ -550,6 +558,10 @@ function aggregate(base: Candle[], tf: string): Candle[] {
 
 // ---------- tick engine ----------
 function tickOnce() {
+  // NO SIM FALLBACK: once a real broker account is the feed source (or the
+  // admin disabled the sim feed), the random walk stops for EVERY symbol —
+  // the terminal shows real data or nothing.
+  if (!simWalkAllowed()) return
   const now = Date.now()
   for (const st of S.states.values()) {
     if (replayedSymbols.has(st.symbol)) continue // replay drives this symbol
@@ -731,24 +743,52 @@ const httpServer = createServer((req, res) => {
       req.on('data', c => (body += c))
       req.on('end', () => {
         try {
-          const { source } = JSON.parse(body) as { source?: string }
-          if (!source || typeof source !== 'string') return json(400, { ok: false, error: 'source required' })
-          feedSource = source
+          const b = JSON.parse(body) as { source?: string; simDisabled?: boolean }
+          let changedSource = false
+          if (b.source !== undefined) {
+            if (!b.source || typeof b.source !== 'string') return json(400, { ok: false, error: 'source required' })
+            changedSource = b.source !== feedSource
+            feedSource = b.source
+          }
+          if (typeof b.simDisabled === 'boolean') simDisabled = b.simDisabled
           try {
             mkdirSync(path.dirname(FEED_SRC_FILE), { recursive: true })
-            writeFileSync(FEED_SRC_FILE, JSON.stringify({ source: feedSource, updatedAt: new Date().toISOString() }, null, 2))
+            // preserve sibling keys (read-modify-write) — the file carries both
+            // the source radio and the admin Live-Only switch
+            let prev: Record<string, unknown> = {}
+            try { prev = JSON.parse(readFileSync(FEED_SRC_FILE, 'utf8')) as Record<string, unknown> } catch { /* first write */ }
+            writeFileSync(FEED_SRC_FILE, JSON.stringify({ ...prev, source: feedSource, simDisabled, updatedAt: new Date().toISOString() }, null, 2))
           } catch (e) {
             console.error('[market-feed] feed-source persist failed:', e)
           }
-          console.log(`[market-feed] feed source -> ${feedSource}`)
-          json(200, { ok: true, source: feedSource })
+          if (changedSource) {
+            if (feedSource !== 'sim') {
+              // LIVE SOURCE: purge every simulated price/candle so charts,
+              // depth and watchlists can only show real broker data
+              S.states.clear()
+              S.candles.clear()
+              replayedSymbols.clear()
+              console.log(`[market-feed] feed source -> ${feedSource} — sim market data PURGED (live only)`)
+            } else {
+              // back to sim — reseed the universe (last published list first)
+              try {
+                const saved = JSON.parse(readFileSync(UNIVERSE_FILE, 'utf8')) as UniverseEntry[]
+                if (Array.isArray(saved) && saved.length) loadUniverse(saved)
+                else loadUniverse(DEFAULT_UNIVERSE)
+              } catch { loadUniverse(DEFAULT_UNIVERSE) }
+              console.log('[market-feed] feed source -> sim — universe reseeded')
+            }
+          } else {
+            console.log(`[market-feed] feed source -> ${feedSource} (simDisabled=${simDisabled})`)
+          }
+          json(200, { ok: true, source: feedSource, simDisabled })
         } catch (e) {
           json(400, { ok: false, error: String(e) })
         }
       })
       return
     }
-    return json(200, { source: feedSource })
+    return json(200, { source: feedSource, simDisabled })
   }
 
   if (url.pathname === '/universe') {
@@ -759,6 +799,11 @@ const httpServer = createServer((req, res) => {
         try {
           const { universe } = JSON.parse(body) as { universe: UniverseEntry[] }
           loadUniverse(universe)
+          // persist so a sim-source switch can reseed without the Next app
+          try {
+            mkdirSync(path.dirname(UNIVERSE_FILE), { recursive: true })
+            writeFileSync(UNIVERSE_FILE, JSON.stringify(universe))
+          } catch { /* best effort */ }
           json(200, { ok: true, symbols: S.states.size })
         } catch (e) {
           json(400, { ok: false, error: String(e) })
@@ -1377,7 +1422,7 @@ function buildAdminPayload(): SyncCoreRow | null {
 
   return {
     feed,
-    feedSource: { source: feedSource, sources },
+    feedSource: { source: feedSource, simDisabled, sources },
     accountsMeta: acctRows,
     brokerLogs: logRows.slice(0, 60),
     audit: audits,

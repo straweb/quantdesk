@@ -157,25 +157,25 @@ export function authStart(brokerType: string, accountId: string, creds: Record<s
       }
     }
     case 'DHAN': {
-      const hasPartner = required(creds, ['appId', 'appSecret']) !== null
+      const hasApp = required(creds, ['appId', 'appSecret']) !== null
       const hasClient = required(creds, ['clientId']) !== null
       return {
         loginUrl: null, // filled after generate-consent (async) — see dhanGenerateConsent()
-        instructions: hasPartner
+        instructions: hasApp
           ? [
-              'Press "Generate consent" — the terminal calls auth.dhan.co/partner/generate-consent with your partner_id/partner_secret headers.',
-              'Open the returned consent-login URL, log in with Dhan credentials + TOTP, and copy the tokenId from the redirect (?tokenId=...).',
-              'Paste the tokenId here — partner/consume-consent returns the accessToken + dhanClientId.',
+              'Press "Generate consent" — the terminal calls auth.dhan.co/app/generate-consent?client_id=<Dhan Client ID> with app_id/app_secret headers (DhanHQ app consent — OpenAlgo parity).',
+              'Open the returned consentApp-login URL, log in with Dhan credentials + TOTP, and copy the tokenId from the redirect (?tokenId=...).',
+              'Paste the tokenId here — app/consumeApp-consent returns the accessToken + dhanClientId.',
               'Shortcut without a browser: paste "PIN:TOTP" (e.g. 123456:987654) below — the terminal calls app/generateAccessToken directly.',
               'Or paste a direct JWT access token (from web.dhan.co → Access DhanHQ APIs).',
             ]
           : [
               'Three ways to create the session:',
               '1 · DIRECT: paste "PIN:TOTP" (e.g. 123456:987654) — needs the Dhan Client ID saved + TOTP enabled.',
-              '2 · PARTNER: save Partner ID + Partner Secret on the account, press Generate consent, log in at the consent URL, paste the redirect tokenId.',
+              '2 · APP CONSENT: save the DhanHQ App ID + App Secret (web.dhan.co → profile → DhanHQ Trading APIs → create app) plus your Dhan Client ID, press Generate consent, log in at the consent URL, paste the redirect tokenId.',
               '3 · Paste a direct JWT access token from web.dhan.co (valid 24h).',
             ],
-        fieldsNeeded: hasClient ? ['PIN:TOTP, or tokenId (partner), or a JWT'] : ['clientId'],
+        fieldsNeeded: hasClient ? ['PIN:TOTP, or tokenId (consent), or a JWT'] : ['clientId'],
       }
     }
     case 'SHOONYA': {
@@ -198,33 +198,52 @@ export function authStart(brokerType: string, accountId: string, creds: Record<s
   }
 }
 
-/** Dhan step 1 — partner generate-consent, keep the consentId in memory. */
+/** Dhan step 1 — app consent (DhanHQ app_id/app_secret, OpenAlgo parity).
+ *  Partner-consent endpoint kept as a fallback for partner deployments. */
 export async function dhanGenerateConsent(accountId: string, creds: Record<string, string> | null): Promise<{ ok: boolean; loginUrl?: string; message: string }> {
   if (!creds?.appId?.trim() || !creds?.appSecret?.trim()) {
-    return { ok: false, message: 'Partner consent needs Partner ID + Partner Secret saved on the account. No partner app? Paste "PIN:TOTP" (e.g. 123456:987654) or a direct JWT in the session dialog instead.' }
+    return { ok: false, message: 'Consent needs the DhanHQ App ID + App Secret saved on the account (web.dhan.co → profile → DhanHQ Trading APIs → create app). No DhanHQ app? Paste "PIN:TOTP" (e.g. 123456:987654) or a direct JWT in the session dialog instead.' }
   }
-  logBroker('DHAN', accountId, `partner generate-consent started (partner_id ${mask(creds.appId.trim())})`)
+  const appId = creds.appId.trim()
+  const appSecret = creds.appSecret.trim()
+  const clientId = creds.clientId?.trim() ?? ''
+  logBroker('DHAN', accountId, `app generate-consent started (app_id ${mask(appId)}${clientId ? `, client ${mask(clientId)}` : ''})`)
 
-  const res = await attempt<{ consentId?: string; consentStatus?: string; errorType?: string; errorMessage?: string }>(
+  // PRIMARY: /app/generate-consent?client_id=<dhanClientId> (requires the client id)
+  if (clientId) {
+    const res = await attempt<{ status?: string; consentAppId?: string; errorType?: string; errorMessage?: string }>(
+      'DHAN', accountId, 'app:generate-consent',
+      `${DHAN_AUTH}/app/generate-consent?client_id=${encodeURIComponent(clientId)}`,
+      { method: 'POST', headers: { app_id: appId, app_secret: appSecret }, timeoutMs: 8000 },
+    )
+    const consentAppId = res.data?.consentAppId ?? null
+    if (res.data?.status === 'success' && consentAppId) {
+      consentStore.set(accountId, consentAppId)
+      const loginUrl = `${DHAN_AUTH}/login/consentApp-login?consentAppId=${encodeURIComponent(consentAppId)}`
+      logBroker('DHAN', accountId, `consent generated ${mask(consentAppId)} — consentApp-login URL ready`)
+      return { ok: true, loginUrl, message: 'Consent generated — open the login URL, log in, then paste the redirect tokenId' }
+    }
+    logBroker('DHAN', accountId, `app generate-consent FAILED — ${res.data?.errorMessage ?? res.data?.errorType ?? JSON.stringify(res.data ?? {}).slice(0, 140) ?? res.error ?? res.status}`, 'WARN')
+  } else {
+    logBroker('DHAN', accountId, 'app generate-consent skipped — no Dhan Client ID saved on the account', 'WARN')
+  }
+
+  // FALLBACK: legacy partner consent (partner deployments)
+  const res2 = await attempt<{ consentId?: string; consentStatus?: string; errorType?: string; errorMessage?: string }>(
     'DHAN', accountId, 'partner:generate-consent',
     `${DHAN_AUTH}/partner/generate-consent`,
-    {
-      method: 'POST',
-      headers: { partner_id: creds.appId.trim(), partner_secret: creds.appSecret.trim() },
-      timeoutMs: 8000,
-    },
+    { method: 'POST', headers: { partner_id: appId, partner_secret: appSecret }, timeoutMs: 8000 },
   )
-
-  const consentId = res.data?.consentId ?? null
+  const consentId = res2.data?.consentId ?? null
   if (consentId) {
     consentStore.set(accountId, consentId)
     const loginUrl = `${DHAN_AUTH}/consent-login?consentId=${encodeURIComponent(consentId)}`
-    logBroker('DHAN', accountId, `consent generated ${mask(consentId)} (${res.data?.consentStatus ?? 'GENERATED'}) — login URL ready`)
-    return { ok: true, loginUrl, message: 'Consent generated — open the login URL, log in, then paste the redirect tokenId' }
+    logBroker('DHAN', accountId, `partner consent generated ${mask(consentId)} — consent-login URL ready`)
+    return { ok: true, loginUrl, message: 'Partner consent generated — open the login URL, log in, then paste the redirect tokenId' }
   }
-  const reason = res.data?.errorMessage ?? res.data?.errorType ?? (res.data ? JSON.stringify(res.data).slice(0, 160) : res.error ?? String(res.status))
-  logBroker('DHAN', accountId, `generate-consent FAILED — ${reason}`, 'ERROR')
-  return { ok: false, message: `Failed to get consent — ${reason}. Check Admin → Broker Diagnostics for the exact request log.` }
+  const reason = res2.data?.errorMessage ?? res2.data?.errorType ?? (res2.data ? JSON.stringify(res2.data).slice(0, 160) : res2.error ?? String(res2.status))
+  logBroker('DHAN', accountId, `generate-consent FAILED (app + partner) — ${reason}`, 'ERROR')
+  return { ok: false, message: `Failed to get consent — ${reason}. Check the App ID/App Secret (DhanHQ app) + Dhan Client ID are saved, or use PIN:TOTP / a direct JWT. See Admin → Broker Diagnostics for the exact request log.` }
 }
 
 /** Exchange the redirect code/session for session tokens (per broker). */
@@ -307,33 +326,35 @@ export async function authComplete(brokerType: string, accountId: string, creds:
           logBroker('DHAN', accountId, `generateAccessToken FAILED — ${reason}`, 'ERROR')
           return { ok: false, message: `Direct token generation failed — ${reason}. Check TOTP is enabled + the PIN is correct, or paste a JWT.` }
         }
-        // PARTNER consume-consent (tokenId from the consent-login redirect)
-        if (!creds?.appId || !creds?.appSecret) return { ok: false, message: 'Partner tokenId exchange needs Partner ID + Partner Secret on the account — or paste "PIN:TOTP" / a direct JWT instead' }
+        // CONSENT consume (tokenId from the consentApp-login redirect).
+        // app/consumeApp-consent first (DhanHQ app consent), then partner.
+        if (!creds?.appId || !creds?.appSecret) return { ok: false, message: 'tokenId exchange needs the DhanHQ App ID + App Secret on the account — or paste "PIN:TOTP" / a direct JWT instead' }
         const consentId = consentStore.get(accountId)
-        if (!consentId) return { ok: false, message: 'Generate consent first (step 1) — the terminal must remember the consentId for the exchange' }
-        logBroker('DHAN', accountId, `partner consume-consent started (consentId ${mask(consentId)}, tokenId ${mask(c)})`)
-        const res = await attempt<{ accessToken?: string; dhanClientId?: string; dhanClientName?: string; dhanClientUcc?: string; expiryTime?: string; errorType?: string; errorMessage?: string }>(
-          'DHAN', accountId, 'partner:consume-consent',
-          `${DHAN_AUTH}/partner/consume-consent?tokenId=${encodeURIComponent(c)}`,
-          {
-            method: 'POST',
-            headers: { partner_id: creds.appId.trim(), partner_secret: creds.appSecret.trim() },
-            timeoutMs: 8000,
-          },
-        )
-        if (res.data?.accessToken) {
-          const clientId = res.data.dhanClientId ?? creds.clientId ?? ''
-          logBroker('DHAN', accountId, `OAuth session created for ${clientId}${res.data.expiryTime ? ` (expires ${res.data.expiryTime})` : ''}`)
-          return {
-            ok: true,
-            message: `Dhan session active — ${clientId || 'client'}${res.data.expiryTime ? ` (expires ${res.data.expiryTime})` : ''}`,
-            userId: clientId,
-            credentials: { ...(creds ?? {}), accessToken: res.data.accessToken, clientId },
+        logBroker('DHAN', accountId, `consent exchange started (${consentId ? `consentId ${mask(consentId)}, ` : ''}tokenId ${mask(c)})`)
+        const appHeaders = { app_id: creds.appId.trim(), app_secret: creds.appSecret.trim(), 'Content-Type': 'application/json' }
+        const partnerHeaders = { partner_id: creds.appId.trim(), partner_secret: creds.appSecret.trim() }
+        const exchanges: [string, string, Record<string, string>][] = [
+          ['app:consumeApp-consent', `${DHAN_AUTH}/app/consumeApp-consent?tokenId=${encodeURIComponent(c)}`, appHeaders],
+          ['partner:consume-consent', `${DHAN_AUTH}/partner/consume-consent?tokenId=${encodeURIComponent(c)}`, partnerHeaders],
+        ]
+        for (const [label, url, hdrs] of exchanges) {
+          const res = await attempt<{ accessToken?: string; dhanClientId?: string; dhanClientName?: string; dhanClientUcc?: string; expiryTime?: string; errorType?: string; errorMessage?: string }>(
+            'DHAN', accountId, label, url,
+            { method: 'POST', headers: hdrs, timeoutMs: 8000 },
+          )
+          if (res.data?.accessToken) {
+            const clientId = res.data.dhanClientId ?? creds.clientId ?? ''
+            logBroker('DHAN', accountId, `OAuth session created for ${clientId}${res.data.expiryTime ? ` (expires ${res.data.expiryTime})` : ''}`)
+            return {
+              ok: true,
+              message: `Dhan session active — ${clientId || 'client'}${res.data.expiryTime ? ` (expires ${res.data.expiryTime})` : ''}`,
+              userId: clientId,
+              credentials: { ...(creds ?? {}), accessToken: res.data.accessToken, clientId },
+            }
           }
+          logBroker('DHAN', accountId, `${label} FAILED — ${res.data?.errorMessage ?? res.data?.errorType ?? JSON.stringify(res.data ?? {}).slice(0, 140) ?? res.error ?? res.status}`, 'WARN')
         }
-        const reason = res.data?.errorMessage ?? res.data?.errorType ?? (res.data ? JSON.stringify(res.data).slice(0, 160) : res.error ?? String(res.status))
-        logBroker('DHAN', accountId, `consume-consent FAILED — ${reason}`, 'ERROR')
-        return { ok: false, message: `consume-consent failed — ${reason}. Generate a fresh consent and retry.` }
+        return { ok: false, message: 'tokenId exchange failed — generate a FRESH consent (tokenId is single-use) and retry, or paste "PIN:TOTP" / a direct JWT. Exact request logs are in Admin → Broker Diagnostics.' }
       }
       case 'SHOONYA': {
         if (!creds?.apiKey || !creds?.apiSecret) return { ok: false, message: 'Save the account with Shoonya api_key (client_id) + api_secret first' }
@@ -378,23 +399,17 @@ export async function authComplete(brokerType: string, accountId: string, creds:
         }
 
         // ---- OAuth GenAcsTok when a redirect code is given ----
+        // hedging auth_api.py parity: checksum = sha256(client_id + api_secret + code)
+        // on NorenWClientAPI/GenAcsTok jData={code, checksum} -> {stat:'Ok', access_token}
         if (!uid) return { ok: false, message: 'Save the Shoonya User ID (login id) on the account — GenAcsTok needs uid + appkey' }
         const appKey = createHash('sha256').update(`${uid}|${secret}`).digest('hex')
-        // verifier candidates — whichever sha256 the deployment expects; every
-        // attempt is logged so the accepted one is visible in diagnostics
-        const verifiers: [string, string][] = [
-          ['sha256(code+secret)', createHash('sha256').update(`${c}${secret}`).digest('hex')],
-          ['sha256(secret+code)', createHash('sha256').update(`${secret}${c}`).digest('hex')],
-          ['sha256(secret+uid+code)', createHash('sha256').update(`${secret}${uid}${c}`).digest('hex')],
-          ['sha256(code)', createHash('sha256').update(c).digest('hex')],
-        ]
         // ---- family A: NorenWClientAPI/GenAcsTok {code, checksum} ----
-        // (the API host validates these exact keys — "code or checksum is Missing"
-        //  otherwise; INVALID_VERIFIER from it means the checksum VALUE was wrong)
+        // DOCUMENTED variant FIRST, then fallbacks — and NEVER break early:
+        // INVALID_VERIFIER just means that one checksum was wrong.
         const checksums: [string, string][] = [
+          ['sha256(client_id+secret+code)', createHash('sha256').update(`${clientId}${secret}${c}`).digest('hex')],
           ['sha256(code+secret)', createHash('sha256').update(`${c}${secret}`).digest('hex')],
           ['sha256(secret+code)', createHash('sha256').update(`${secret}${c}`).digest('hex')],
-          ['sha256(client_id+secret+code)', createHash('sha256').update(`${clientId}${secret}${c}`).digest('hex')],
         ]
         for (const [label, checksum] of checksums) {
           const res = await attempt<{ stat?: string; access_token?: string; susertoken?: string; emsg?: string }>(
@@ -408,9 +423,15 @@ export async function authComplete(brokerType: string, accountId: string, creds:
             logBroker('SHOONYA', accountId, `OAuth (GenAcsTok) session created — checksum ${label} accepted`)
             return { ok: true, message: 'Shoonya session active (GenAcsTok)', userId: uid, credentials: { ...creds, sessionId: token } }
           }
-          if (/invalid verifier/i.test(res.data?.emsg ?? '')) break // wrong checksum family — try next family
+          if (/invalid\s*code|expired|no data/i.test(res.data?.emsg ?? '')) break // code itself is bad — checksums won't help
         }
-        // ---- family B: NorenWClientTP/GenAcsTok full jData (docs OAuth shape) ----
+        // ---- family B: NorenWClientTP/GenAcsTok full jData (legacy docs shape) ----
+        const verifiers: [string, string][] = [
+          ['sha256(code+secret)', createHash('sha256').update(`${c}${secret}`).digest('hex')],
+          ['sha256(secret+code)', createHash('sha256').update(`${secret}${c}`).digest('hex')],
+          ['sha256(secret+uid+code)', createHash('sha256').update(`${secret}${uid}${c}`).digest('hex')],
+          ['sha256(code)', createHash('sha256').update(c).digest('hex')],
+        ]
         for (const [label, verifier] of verifiers) {
           const payload = {
             apkversion: '1.0.0', uid, pwd: verifier, factor2: '',
@@ -427,10 +448,10 @@ export async function authComplete(brokerType: string, accountId: string, creds:
             logBroker('SHOONYA', accountId, `OAuth (GenAcsTok) session created — verifier ${label} accepted`)
             return { ok: true, message: 'Shoonya session active (GenAcsTok)', userId: uid, credentials: { ...creds, sessionId: token } }
           }
-          if (/invalid\s*code|expired/i.test(res.data?.emsg ?? '')) break
+          if (/invalid\s*code|expired|no data/i.test(res.data?.emsg ?? '')) break
         }
         logBroker('SHOONYA', accountId, `GenAcsTok FAILED — ${tried.join(' | ')}`, 'ERROR')
-        return { ok: false, message: `GenAcsTok failed — ${tried.join(' | ')}. Or use QuickAuth: paste pwd:factor2 (e.g. mypass:ABCD1234E).` }
+        return { ok: false, message: `GenAcsTok failed — ${tried.join(' | ')}. The redirect code is single-use and short-lived: open the OAuth URL again and paste a FRESH code. Or use QuickAuth: paste pwd:factor2 (e.g. mypass:ABCD1234E).` }
       }
       default:
         return { ok: false, message: `Broker ${brokerType} has no live session flow (sim feed needs none)` }

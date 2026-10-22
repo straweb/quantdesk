@@ -176,7 +176,7 @@ While you hold a position, its chart shows an **entry marker** (L/S tag with liv
 - **Index** — indices with **expandable constituents** (weight, live LTP, change %, **contribution in points**, sortable); includes a **Commodities · MCX** section; SENSEX/BANKEX included;
 - **FNO** — all exchanges grouped with sticky headers: **NSE F&O / BFO / MCX / CDS** — latest expiry, contract count, lot size, live spot + change %;
 - **N user tabs** — add your own tabs (double-click to rename, × to delete), star symbols into the active tab;
-- per-tab **sort** (symbol / LTP / chg% ↑↓) and a **search box** that filters every tab;
+- per-tab **sort** (symbol / LTP / chg% ↑↓) and a **search box** — typing queries the FULL synced master-contract list (all 849+ symbols incl. broker contracts) regardless of tab; results replace the tab rows until you clear the box;
 - every row has a **depth-add icon** (pushes that symbol into the depth stack) and clicking a row opens its per-symbol workspace (F&O symbols land with the spot+CE/PE layout ready).
 
 ### 5.2 Depth panels (order-book stack)
@@ -266,12 +266,13 @@ Quick global actions live in the header of the dock: **B / S** quick tickets, **
 
 ## 11. Admin view
 
+- **Trading mode (Live-Only switch)** — the *Disable Sim Feed & Sandbox* checkbox at the top of Admin. ON: the sim random-walk stops for every symbol (charts show real broker data or nothing) and broker adapters **refuse** sandbox fills — orders without a live broker session are REJECTED, never simulated. OFF: sim feed + sandbox available as usual. The FEED chip shows an amber **LIVE-ONLY** badge while it is on.
 - **Accounts** — add/remove broker accounts. Live brokers use per-broker **OAuth-style credential fields** (ICICI: api key + secret; Dhan: client id + optional partner id/secret; Shoonya: user id + api key + secret). Every input shows a **sample value / format hint** (e.g. Dhan client id `1100123456`, Shoonya user id `FA12345`). For live brokers, leave **Initial Capital blank** and the account starts with **100 % of the REAL broker available cash** (pulled from the funds API; changeable anytime).
 - **Edit accounts** — the ✏️ button on a live account row opens the Edit dialog: user id / client id / api key / secret can be **modified at any time** (stored values show masked; leave a field empty to keep it — secrets never need retyping).
 - **Broker sessions** — per live account, a **Session** dialog walks the consent flow: open/copy the generated login URL → paste the returned code/token → create session. Active sessions show a masked session chip and a green state. Flows per broker:
   - **ICICI Breeze** — paste the redirect `apisession`; the exchange uses the exact Breeze-SDK call (GET with body `{SessionToken, AppKey}`).
-  - **Dhan** — paste **`PIN:TOTP`** (e.g. `123456:987654`) for direct token generation, or use the partner consent flow (Generate consent → consent-login URL → paste the redirect `tokenId`), or paste a direct JWT from web.dhan.co.
-  - **Shoonya** — official OAuth URL (`api.shoonya.com/OAuthlogin/authorize/oauth?client_id=…`) → paste the redirect `code`; checksum variants are tried automatically. QuickAuth alternative: paste **`pwd:factor2`** (optionally `:totp`), e.g. `mypass:ABCD1` or `mypass:ABCD1:987654`.
+  - **Dhan** — three flows: ① paste **`PIN:TOTP`** (e.g. `123456:987654`) for direct token generation; ② **app consent** (OpenAlgo parity): save the DhanHQ **App ID + App Secret** (web.dhan.co → profile → DhanHQ Trading APIs → create app) and your Dhan Client ID, press *Generate consent* → `auth.dhan.co/app/generate-consent?client_id=…` → log in at the consentApp-login URL → paste the redirect `tokenId` (exchanged at `app/consumeApp-consent`); ③ paste a direct JWT from web.dhan.co.
+  - **Shoonya** — official OAuth URL (`api.shoonya.com/OAuthlogin/authorize/oauth?client_id=…`) → paste the redirect `code` (single-use + short-lived: always open a FRESH one). The exchange sends `GenAcsTok` with `checksum = sha256(app_client_id + api_secret + code)` (documented variant first, fallbacks tried automatically). QuickAuth alternative: paste **`pwd:factor2`** (optionally `:totp`), e.g. `mypass:ABCD1` or `mypass:ABCD1:987654`.
 - **Broker Diagnostics** — the debugging panel: pick an account → **Test connection** runs a timed 4-step report (credentials → adapter mode → funds ₹ → quote LTP) and the raw **broker log stream** below shows every outbound call (`[BROKER][tag] METHOD url → status (ms)`), so a failing integration is visible line by line.
 - **Copy-trade routing** — the master/executes matrix: which account receives fan-out orders (order-routing toggle mirrors the capital chips).
 - **Capital config** — per account: initial capital, source (fixed ₹ / % of available cash), sizing mode, reset.

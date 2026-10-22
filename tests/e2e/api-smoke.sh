@@ -42,7 +42,6 @@ chk "feed :3004 /health ok"        "$H" '.ok' 'true'
 chk "feed universe >= 400 symbols" "$H" '(.symbols >= 400)' 'true'
 M="$(curl -s --max-time 8 "$BASE/api/auth/me")"
 chk "Next :3000 /api/auth/me alive (user=null, feed key present)" "$M" 'has("user") and has("feed")' 'true'
-
 say "2. Auth"
 R="$(curl -s -c "$JAR" -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin123"}')"
 chk "login admin/admin123"        "$R" '.ok' 'true'
@@ -52,6 +51,17 @@ X="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/accounts")"
 chk "unauthenticated /api/accounts → 401" "$([ "$X" = "401" ] && echo 0 || echo 1)" '0' '0'
 
 say "3. Accounts & capital"
+# the sim order tests need the SIM feed active — the round-12 no-sim-fallback
+# rule stops all simulated prices while a real broker account is the source
+curl -s -b "$JAR" -X POST "$BASE/api/feed" -H 'Content-Type: application/json' -d '{"source":"sim"}' >/dev/null
+A="$(curl -s -b "$JAR" "$BASE/api/accounts")"
+# reset the SIM Master capital baseline (previous sessions may have left it
+# in % of cash mode — the 75-lot smoke leg needs a predictable usable amount)
+SIMID="$(echo "$A" | jq -r '[.accounts[] | select(.brokerType=="SIMFEED")][0].id' 2>/dev/null)"
+if [ -n "$SIMID" ] && [ "$SIMID" != "null" ]; then
+  curl -s -b "$JAR" -X PATCH "$BASE/api/accounts/$SIMID" -H 'Content-Type: application/json' \
+    -d '{"capitalBase":"FIXED","initialCapital":600000}' >/dev/null
+fi
 A="$(curl -s -b "$JAR" "$BASE/api/accounts")"
 chk "demo accounts seeded (>= 6)" "$A" '(.accounts | length >= 6)' 'true'
 chk "every account exposes usable capital (usableCapital)" "$A" '([.accounts[] | has("usableCapital")] | all)' 'true'
@@ -75,7 +85,7 @@ if [ -z "$ATMCE_SYM" ] || [ "$ATMCE_SYM" = "null" ]; then
   bad "ATM CE symbol missing — cannot run order lifecycle"
 else
   O="$(curl -s -b "$JAR" -X POST "$BASE/api/orders" -H 'Content-Type: application/json' \
-    -d "{\"symbol\":\"$ATMCE_SYM\",\"exchange\":\"NFO\",\"side\":\"BUY\",\"orderType\":\"MARKET\",\"productType\":\"NRML\",\"qty\":75,\"source\":\"MANUAL\"}")"
+    -d "{\"symbol\":\"$ATMCE_SYM\",\"exchange\":\"NFO\",\"side\":\"BUY\",\"orderType\":\"MARKET\",\"productType\":\"NRML\",\"qty\":25,\"source\":\"MANUAL\"}")"
   chk "master order accepted (not FAILED)" "$O" '(.status != "FAILED")' 'true'
   FILLS="$(printf '%s' "$O" | jq '[.legs[]? | select(.status == "FILLED")] | length')"
   ok  "filled legs reported: $FILLS"

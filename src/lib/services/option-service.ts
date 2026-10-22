@@ -3,7 +3,7 @@ import { adapters } from '../../../brokers/index'
 import { BROKER_TYPES } from '../types'
 import type { BrokerType } from '../types'
 import { fetchQuotes } from '../../../brokers/feed-client'
-import { optionPremium, strikeStepFor, publishUniverseToFeed } from './symbol-service'
+import { optionPremium, strikeStepFor, publishUniverseToFeed, istToday } from './symbol-service'
 
 // ============================================================
 // Option chain service — F&O indices + stocks.
@@ -79,7 +79,14 @@ export async function getChainMeta(underlying: string, expiry?: string | null): 
   if (optRows.length === 0) return null
 
   const expiries = [...new Set(optRows.map(r => r.expiry).filter((e): e is string => !!e))].sort()
-  const activeExpiry = expiry && expiries.includes(expiry) ? expiry : expiries[0]
+  // default expiry = the FIRST expiry that has not passed yet — old master
+  // rows accumulate across daily syncs, and expiries[0] can be a stale
+  // (already expired) weekly whose symbols no longer exist in the feed.
+  // "today" is IST (the exchange calendar the expiries belong to).
+  const today = istToday()
+  const activeExpiry = expiry && expiries.includes(expiry)
+    ? expiry
+    : (expiries.find(e => e >= today) ?? expiries[expiries.length - 1])
   const inExpiry = optRows.filter(r => r.expiry === activeExpiry)
   const strikes = [...new Set(inExpiry.map(r => r.strike).filter((s): s is number => s != null))].sort((a, b) => a - b)
   if (strikes.length === 0) return null
@@ -219,7 +226,14 @@ export async function ensureOptionContracts(underlying: string, strike: number, 
 
   const refPrice = base?.basePrice ?? anyOpt?.basePrice ?? 1000
   const lotSize = anyOpt?.lotSize ?? base?.lotSize ?? 1
-  const activeExpiry = expiry ?? anyOpt?.expiry
+  // default to the earliest LIVE expiry (stale weekly rows accumulate in the
+  // master table — never create contracts for an expired series)
+  const today = istToday()
+  const firstLive = await db.symbolMaster.findFirst({
+    where: { underlying, instrumentType: { in: ['CE', 'PE'] }, expiry: { gte: today } },
+    orderBy: { expiry: 'asc' },
+  })
+  const activeExpiry = expiry ?? firstLive?.expiry ?? anyOpt?.expiry
   if (!activeExpiry) return { created: 0, symbols: [] }
 
   const days = Math.max(0, Math.round((new Date(activeExpiry).getTime() - Date.now()) / 86400000))

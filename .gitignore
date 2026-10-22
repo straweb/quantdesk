@@ -56,3 +56,5 @@ server.log
 tool-results/
 scripts/*.png
 .zscripts/
+.hedging-ref/
+node_modules/

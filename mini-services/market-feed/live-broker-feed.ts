@@ -3,6 +3,7 @@ import path from 'path'
 import { createDecipheriv, createHash } from 'node:crypto'
 // @ts-ignore bun runtime builtin
 import { Database } from 'bun:sqlite'
+import { breezeRequest, breezeInstrumentParams, parseBreezeQuoteRow, firstSuccess, type BreezeCreds } from '../../brokers/icici_breeze/breeze'
 
 // ============================================================
 // LIVE BROKER FEED — real market data for live broker accounts.
@@ -12,19 +13,22 @@ import { Database } from 'bun:sqlite'
 // the SAME tick pipeline as the sim engine (SymbolState + 1m candles
 // + the 250ms socket stream), so charts/watchlists/panels all go
 // live without any client change. Symbols fed by a live broker are
-// skipped by the random-walk engine (liveFedSymbols).
+// skipped by the random-walk engine (liveFedSymbols) — and when a
+// real broker is the source the random walk is OFF entirely (no sim
+// fallback), the same rule the admin Live-Only switch enforces.
 //
 //   DHAN   POST api.dhan.co/v2/marketfeed/quote  (batched per segment)
 //   SHOONYA  POST NorenWClientTP/GetQuote (jKey session, per symbol)
-//   ICICI   GET  breezeapi/api/v1/quotes?stock_code=... (per symbol)
+//   ICICI   GET breezeapi/api/v1/quotes (SDK checksum headers, body params)
 //
 // Everything is logged: [BROKER][feed] lines to the console, rolling
 // diagnostics kept per account, and a /feed-status REST endpoint
 // exposes { source, connected, lastTickTs, lastError, symbols } so
 // the FEED chip can show exactly why data is (not) flowing.
-// Symbol mapping comes from the master DB (SymbolMapping) and is
-// re-read every 2 min; credentials are decrypted with TERMINAL_SECRET
-// and re-read every 60 s (a fresh admin session is picked up live).
+// Symbol mapping comes from the master DB (SymbolMapping — real
+// scrip-master tokens after a sync) and is re-read every 2 min;
+// credentials are decrypted with TERMINAL_SECRET and re-read every
+// 60 s (a fresh admin session is picked up live).
 // ============================================================
 
 export interface LiveFeedCtx {
@@ -67,6 +71,7 @@ const g = globalThis as unknown as {
     accountId: string
     lastVol: Map<string, number>
     inflight: boolean
+    simDisabled: boolean
   }
 }
 
@@ -84,6 +89,7 @@ function st(): NonNullable<typeof g.__liveFeed> {
       accountId: '',
       lastVol: new Map(),
       inflight: false,
+      simDisabled: false,
     }
   }
   return g.__liveFeed
@@ -244,7 +250,15 @@ async function fetchDhan(accountId: string, creds: Record<string, string>, targe
   const s = st()
   const segments: Record<string, string[]> = {}
   for (const t of targets) {
-    const seg = t.exchange === 'NFO' ? 'NSE_FNO' : t.exchange === 'BSE' ? 'BSE_EQ' : t.exchange === 'MCX' ? 'MCX_COMM' : t.exchange === 'CDS' ? 'NSE_CURRENCY' : 'NSE_EQ'
+    // Dhan segments (scrip-master parity): indices IDX_I, NSE eq NSE_EQ,
+    // derivatives NSE_FNO/BSE_FNO, MCX MCX_COMM, currency NSE_CURRENCY
+    const seg = t.instrumentType === 'INDEX' ? 'IDX_I'
+      : t.exchange === 'NFO' ? 'NSE_FNO'
+      : t.exchange === 'BFO' ? 'BSE_FNO'
+      : t.exchange === 'BSE' ? 'BSE_EQ'
+      : t.exchange === 'MCX' ? 'MCX_COMM'
+      : t.exchange === 'CDS' ? 'NSE_CURRENCY'
+      : 'NSE_EQ'
     const token = t.brokerToken || t.brokerSymbol
     if (!token) continue
     ;(segments[seg] ??= []).push(token)
@@ -300,18 +314,27 @@ async function fetchShoonya(accountId: string, creds: Record<string, string>, ta
   const s = st()
   const uid = creds.userId ?? ''
   const body = { uid, actid: uid, jKey: creds.sessionId ?? '' }
+  const jdata = (b: Record<string, unknown>): string => 'jData=' + JSON.stringify(b).replace(/&/g, '\\u0026')
   let n = 0
   let lastErr: string | null = null
+  let i = 0
   for (const t of targets) {
-    const [exch, tsym] = (t.brokerSymbol || '').includes('|')
-      ? (t.brokerSymbol || '').split('|')
-      : [t.exchange === 'NFO' ? 'NFO' : t.exchange === 'BSE' ? 'BSE' : t.exchange === 'MCX' ? 'MCX' : t.exchange === 'CDS' ? 'CDS' : 'NSE', t.brokerSymbol]
+    // scrip-master sync stores brokerToken = "NSE|<tsym>"; older synthetic
+    // rows keep the bare tsym in brokerSymbol
+    const [exch, tsym] = (t.brokerToken || '').includes('|')
+      ? (t.brokerToken || '').split('|')
+      : (t.brokerSymbol || '').includes('|')
+        ? (t.brokerSymbol || '').split('|')
+        : [t.exchange === 'NFO' ? 'NFO' : t.exchange === 'BSE' ? 'BSE' : t.exchange === 'BFO' ? 'BFO' : t.exchange === 'MCX' ? 'MCX' : t.exchange === 'CDS' ? 'CDS' : 'NSE', t.brokerSymbol]
     if (!tsym) continue
+    // Noren throttles per-second bursts — tiny sleep, round-robin subsets
+    if (i > 0 && i % 6 === 0) await new Promise(r => setTimeout(r, 250))
+    i++
     try {
       const res = await fetch('https://api.shoonya.com/NorenWClientTP/GetQuote', {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain' },
-        body: `jData=${JSON.stringify({ ...body, exch, tsym })}`,
+        body: jdata({ ...body, exch, tsym }),
         signal: withTimeout(3000),
         cache: 'no-store',
       })
@@ -344,49 +367,45 @@ async function fetchShoonya(accountId: string, creds: Record<string, string>, ta
 
 async function fetchIcici(accountId: string, creds: Record<string, string>, targets: MappingRow[]): Promise<void> {
   const s = st()
-  const mons = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-  const num = (v: unknown): number | undefined => (Number.isFinite(Number(v)) ? Number(v) : undefined)
   let n = 0
   let lastErr: string | null = null
-  for (const t of targets) {
-    // brokerToken format from the breeze adapter: "SYM|expiry|strike|right"
-    const [stock, expiryIso, strike, right] = (t.brokerToken || '').split('|')
-    const p = new URLSearchParams({ exchange_code: t.exchange === 'NFO' ? 'NFO' : 'NSE', stock_code: stock ?? t.brokerSymbol })
-    if (expiryIso) {
-      const [y, m, d] = expiryIso.split('-')
-      if (y && m && d) p.set('expiry_date', `${d}-${mons[parseInt(m) - 1]}-${y}`)
-    }
-    if (t.instrumentType === 'CE' || t.instrumentType === 'PE') {
-      if (right) p.set('right', right)
-      if (strike) p.set('strike_price', String(Math.round(Number(strike))))
-      p.set('product', 'options')
-    } else if (t.instrumentType === 'FUT') {
-      p.set('product', 'futures')
-    } else {
-      p.set('product', 'cash')
-    }
+  // Breeze rate limit ~3.5 req/s — round-robin batches of 3 symbols/cycle
+  // (the full set covers over a few seconds), oldest-first rotation
+  const BATCH = 3
+  const rr = iciciRr % Math.max(1, targets.length)
+  iciciRr = (iciciRr + 1) % Math.max(1, targets.length)
+  const batch = targets.length <= BATCH ? targets : targets.slice(rr, rr + BATCH).concat(rr + BATCH > targets.length ? targets.slice(0, (rr + BATCH) % targets.length) : [])
+  const bc: BreezeCreds = { apiKey: creds.apiKey, apiSecret: creds.apiSecret, sessionToken: creds.sessionToken, userId: creds.userId }
+  const log = (line: string, level: 'INFO' | 'WARN' = 'INFO') => {
+    if (level === 'WARN') pushLog(`breeze ${line}`, 'WARN')
+  }
+  for (const t of batch) {
+    // brokerToken = "SYM|YYYY-MM-DD|strike|CE/PE" (breeze adapter mapSymbol)
+    const [stock, expiry, strike, right] = (t.brokerToken || '').split('|')
     try {
-      const res = await fetch(`https://api.icicidirect.com/breezeapi/api/v1/quotes?${p}`, {
-        headers: {
-          'Authorization': `Bearer ${creds.sessionToken ?? ''}`,
-          'X-SessionToken': creds.sessionToken ?? '',
-          'api-key': creds.apiKey ?? '',
-          'Content-Type': 'application/json',
-        },
-        signal: withTimeout(3000),
-        cache: 'no-store',
-      })
-      const j = await res.json().catch(() => null) as { Result?: Record<string, unknown>[]; Error?: string } | null
-      if (!res.ok || !j?.Result?.length) {
-        lastErr = `quotes ${res.status} ${j?.Error ?? ''}`.trim()
+      const res = await breezeRequest<Record<string, unknown>>(
+        bc, 'GET', 'quotes',
+        breezeInstrumentParams({
+          symbol: stock || t.brokerSymbol,
+          exchange: t.exchange,
+          instrumentType: t.instrumentType,
+          expiry: expiry || null,
+          strike: strike || null,
+          optionType: right || t.instrumentType,
+        }),
+        { timeoutMs: 5000, log },
+      )
+      const row = firstSuccess(res)
+      if (res.status !== 200 || !row) {
+        lastErr = `quotes ${res.httpStatus || res.status} ${res.error ?? ''}`.trim()
         s.status.errors++
         continue
       }
-      const row = j.Result[0]
+      const q = parseBreezeQuoteRow(row)
       if (applyQuote(t.masterSymbol, {
-        ltp: num(row.ltp) ?? num(row.last_price) ?? num(row.last),
-        open: num(row.open), high: num(row.high), low: num(row.low), prevClose: num(row.close),
-        volume: num(row.volume_qty) ?? num(row.volume),
+        ltp: q.ltp, bid: q.bid, ask: q.ask,
+        open: q.open, high: q.high, low: q.low, prevClose: q.prevClose,
+        volume: q.volume,
       })) n++
     } catch (e) {
       lastErr = e instanceof Error ? e.message : String(e)
@@ -402,6 +421,8 @@ async function fetchIcici(accountId: string, creds: Record<string, string>, targ
   }
 }
 
+let iciciRr = 0
+
 // ---------- main cycle ----------
 async function cycle(): Promise<void> {
   const s = st()
@@ -409,15 +430,20 @@ async function cycle(): Promise<void> {
   if (!ctx || s.inflight) return
   s.inflight = true
   try {
-    // active source (file is the shared source of truth, written by REST)
+    // active source + global sim switch (file is the shared source of truth)
     let source = 'sim'
+    let simDisabled = false
     try {
       const raw = readFileSync(path.join(dbRoot(), 'feed-source.json'), 'utf8')
-      source = (JSON.parse(raw) as { source?: string }).source ?? 'sim'
+      const j = JSON.parse(raw) as { source?: string; simDisabled?: boolean }
+      source = j.source ?? 'sim'
+      simDisabled = j.simDisabled === true
     } catch { /* default sim */ }
+    s.simDisabled = simDisabled
 
     if (source !== s.status.source) {
-      // source changed — reset everything live
+      // source changed — reset everything live AND purge the sim market data
+      // so charts/depth never show simulated numbers under a real broker
       s.status.source = source
       s.status.brokerType = null
       s.status.connected = false
@@ -435,10 +461,25 @@ async function cycle(): Promise<void> {
       s.credsTs = 0
       s.brokerType = ''
       s.accountId = ''
+      if (ctx && source !== 'sim') {
+        // purge sim market data when a LIVE broker becomes the source.
+        // (reverting to 'sim' must NOT purge — the /feed-source handler
+        // reseeds the universe right after this file write)
+        ctx.S.states.clear()
+        ctx.S.candles.clear()
+      }
       if (source === 'sim') pushLog('feed source → sim (live polling idle)')
+      else pushLog(`feed source → ${source} — market data PURGED (real broker data only, no sim fallback)`, 'WARN')
     }
 
-    if (source === 'sim') { s.status.connected = false; return }
+    if (source === 'sim') {
+      s.status.connected = false
+      if (simDisabled) {
+        s.status.lastError = 'SIM FEED DISABLED (Live-Only mode) — select a connected broker account as the feed source'
+        s.status.errorTs = Date.now()
+      }
+      return
+    }
 
     if (!s.accountId) {
       // resolve the account (type + label) once

@@ -200,11 +200,13 @@ export const api = {
   me: () => fetchJson<{ user: string | null; feed: string }>('/api/auth/me'),
 
   feedSource: () =>
-    fetchJson<{ source: string; sources: { id: string; label: string; brokerType: string | null }[] }>('/api/feed'),
+    fetchJson<{ source: string; simDisabled?: boolean; sources: { id: string; label: string; brokerType: string | null }[] }>('/api/feed'),
   feedStatus: () =>
     fetchJson<FeedStatusResp>('/api/feed/status'),
   setFeedSource: (source: string) =>
     fetch('/api/feed', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source }) }).then(r => j<{ ok: boolean; source: string }>(r)),
+  setSimDisabled: (simDisabled: boolean) =>
+    fetch('/api/feed', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ simDisabled }) }).then(r => j<{ ok: boolean; simDisabled: boolean }>(r)),
 
   accounts: () => fetch('/api/accounts').then(r => j<{ accounts: AccountRow[] }>(r)),
   createAccount: (body: Record<string, unknown>) =>

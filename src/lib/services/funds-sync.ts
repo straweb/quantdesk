@@ -49,6 +49,11 @@ export async function syncAccountFunds(accountId: string): Promise<{ ok: boolean
   if (!hasSession) return { ok: false, message: 'broker session missing — create it in Admin → Session first' }
   try {
     const funds = await adapter.getFunds(ctxFor(acc.id, acc.label, acc.brokerType, creds))
+    if (funds?.error) {
+      // broker answered with an error (bad endpoint / expired session / empty book)
+      logBroker(acc.brokerType, acc.id, `funds sync FAILED — ${funds.error}`, 'WARN')
+      return { ok: false, message: funds.error }
+    }
     if (!funds || !Number.isFinite(funds.cash)) {
       return { ok: false, message: 'funds call returned no cash (check Broker Diagnostics)' }
     }

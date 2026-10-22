@@ -127,13 +127,13 @@ function nextExpiries(count: number, weekday = 4): string[] {
   return out
 }
 
-function nextMonthEnds(count: number): string[] {
-  // last Thursday of this month and next month (for monthly futures)
+function nextMonthEnds(count: number, weekday = 4): string[] {
+  // last `weekday` of the next `count` months (for monthly futures/options)
   const out: string[] = []
   const now = new Date()
   for (let i = 0; i < count; i++) {
     const d = new Date(now.getFullYear(), now.getMonth() + i + 1, 0) // last day of month
-    while (d.getDay() !== 4) d.setDate(d.getDate() - 1)
+    while (d.getDay() !== weekday) d.setDate(d.getDate() - 1)
     out.push(d.toISOString().slice(0, 10))
   }
   return out
@@ -155,6 +155,11 @@ export function strikeStepFor(price: number): number {
   return 100
 }
 
+/** calendar date in IST — the exchange timezone the expiry dates belong to */
+export function istToday(): string {
+  return new Date(Date.now() + 5.5 * 3600_000).toISOString().slice(0, 10)
+}
+
 export interface SyncResult {
   symbolCount: number
   mappedCount: number
@@ -163,8 +168,13 @@ export interface SyncResult {
 
 export async function syncMasterContracts(source: 'SEED' | 'DAILY_SYNC' | 'MANUAL' = 'MANUAL'): Promise<SyncResult> {
   const version = new Date().toISOString().slice(0, 10)
-  const weekly = nextExpiries(2) // weekly options expiries
-  const monthly = nextMonthEnds(2)
+  // Exchange calendars (verified against the live Dhan/Noren scrip masters,
+  // 2026): NSE F&O weeklies/monthlies expire on TUESDAY, BSE (SENSEX/BANKEX)
+  // on THURSDAY. Keeping these aligned makes the scrip-master token
+  // enrichment (Dhan securityId / Noren tsym) match 1:1.
+  const weekly = nextExpiries(2, 2) // NFO weekly option expiries (Tue)
+  const weeklyBse = nextExpiries(2, 4) // BFO weekly expiries (Thu)
+  const monthly = nextMonthEnds(2, 2) // NFO monthly (Tue)
   const daysTo = (exp: string) => Math.max(0, Math.round((new Date(exp).getTime() - Date.now()) / 86400000))
 
   interface Row {
@@ -252,7 +262,7 @@ export async function syncMasterContracts(source: 'SEED' | 'DAILY_SYNC' | 'MANUA
     const base = 58000
     const lot = 15
     rows.push({ symbol: 'BANKEX', name: 'BSE Bankex Index', exchange: 'BSE', instrumentType: 'INDEX', lotSize: 1, tickSize: 0.05, basePrice: base })
-    for (const exp of weekly) {
+    for (const exp of weeklyBse) {
       rows.push({ symbol: `BANKEX${exp.replaceAll('-', '')}FUT`, name: `BANKEX ${exp} Fut`, exchange: 'BFO', instrumentType: 'FUT', expiry: exp, lotSize: lot, tickSize: 0.05, underlying: 'BANKEX', basePrice: base })
       const atm = Math.round(base / 100) * 100
       for (let k = -6; k <= 6; k++) {
@@ -355,10 +365,32 @@ export async function syncMasterContracts(source: 'SEED' | 'DAILY_SYNC' | 'MANUA
   }
 
   // --- publish universe to feed service ---
+  // Publish every LIVE master row (no expiry, or expiry >= IST today) —
+  // not just today's version — so the chain/ATM series selected by
+  // getChainMeta always has feed prices (stale-expired rows stay out).
+  try {
+    const liveRows = await db.symbolMaster.findMany({
+      where: { OR: [{ expiry: null }, { expiry: { gte: istToday() } }] },
+      orderBy: { id: 'asc' },
+    })
+    await publishUniverseToFeed(liveRows)
+  } catch { /* fall back to the version rows below */ }
   await publishUniverseToFeed(masterRows)
 
+  // --- enrich DHAN/SHOONYA mappings with REAL scrip-master tokens ---
+  // (Dhan securityIds + Noren tsyms from the public master files —
+  //  synthetic tokens cannot query real broker quotes/orders)
+  let enrichNote = ''
+  try {
+    const { enrichBrokerMappings } = await import('./scrip-master')
+    const er = await enrichBrokerMappings()
+    enrichNote = er.notes.length ? ` · ${er.notes.join(' · ')}` : ''
+  } catch (e) {
+    enrichNote = ` · scrip-master enrichment skipped: ${e instanceof Error ? e.message : String(e)}`
+  }
+
   await db.syncLog.create({
-    data: { source, exchange: 'ALL', symbolCount, mappedCount, status: 'SUCCESS', message: `Synced ${symbolCount} symbols, ${mappedCount} broker mappings`, version },
+    data: { source, exchange: 'ALL', symbolCount, mappedCount, status: 'SUCCESS', message: `Synced ${symbolCount} symbols, ${mappedCount} broker mappings${enrichNote}`, version },
   })
   await db.systemSetting.upsert({
     where: { key: 'lastMasterSync' },

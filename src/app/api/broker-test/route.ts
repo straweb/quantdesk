@@ -66,8 +66,15 @@ export async function POST(req: NextRequest) {
     t0 = Date.now()
     try {
       const f = await adapter.getFunds(ctx)
-      fundsOk = Number.isFinite(f?.cash)
-      fundsDetail = fundsOk ? `available cash ₹${Math.round(f.cash).toLocaleString('en-IN')}` : 'funds call returned no cash value'
+      if (f?.error) {
+        fundsOk = false
+        fundsDetail = f.error
+      } else {
+        fundsOk = Number.isFinite(f?.cash) && (f!.cash > 0 || f!.cash === 0)
+        fundsDetail = fundsOk
+          ? `available cash ₹${Math.round(f.cash).toLocaleString('en-IN')}`
+          : 'funds call returned no cash value'
+      }
     } catch (e) {
       fundsDetail = e instanceof Error ? e.message : String(e)
     }
@@ -76,15 +83,25 @@ export async function POST(req: NextRequest) {
     t('funds', false, 0, fundsDetail)
   }
 
-  // 4 — quote on the first mapped symbol
+  // 4 — quote on a REPRESENTATIVE mapped symbol (spot index first, then a
+  // future, then an equity — the oldest mapping may be an exotic option)
   let quoteOk = false
   let quoteDetail = 'skipped (sandbox account)'
   if (adapter?.getQuote && creds && hasSession) {
-    const mapping = await db.symbolMapping.findFirst({
+    const mappings = await db.symbolMapping.findMany({
       where: { brokerType: acc.brokerType },
       include: { master: true },
       orderBy: { id: 'asc' },
+      take: 500,
     })
+    const rank = (m: (typeof mappings)[number]): number => {
+      const it = m.master.instrumentType
+      if (it === 'INDEX') return 0
+      if (it === 'FUT') return 1
+      if (it === 'EQ') return 2
+      return 3
+    }
+    const mapping = [...mappings].sort((a, b) => rank(a) - rank(b))[0]
     if (mapping) {
       ctx.symbolMap = {
         masterSymbol: mapping.master.symbol,
@@ -100,7 +117,7 @@ export async function POST(req: NextRequest) {
         quoteOk = !!q?.ltp
         quoteDetail = quoteOk
           ? `${mapping.master.symbol} LTP ${q.ltp}${q.bid ? ` · bid ${q.bid}` : ''}${q.ask ? ` · ask ${q.ask}` : ''}`
-          : `no LTP in the response for ${mapping.master.symbol} (${ctx.symbolMap.brokerToken}) — check mapping / market hours`
+          : `no LTP for ${mapping.master.symbol} (${mapping.master.instrumentType}, token ${ctx.symbolMap.brokerToken}) — ${(q as unknown as Record<string, unknown>)?.error ? String((q as unknown as Record<string, unknown>).error) : 'check mapping / market hours / session validity'}`
       } catch (e) {
         quoteDetail = e instanceof Error ? e.message : String(e)
       }

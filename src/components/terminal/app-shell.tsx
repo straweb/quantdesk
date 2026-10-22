@@ -536,7 +536,9 @@ function FeedChip({ up }: { up: boolean }) {
     ? (sync.accounts as unknown as AccountRow[])
     : (restAccs?.accounts ?? [])
   const source = adm?.feedSource.source ?? data?.source ?? 'sim'
+  const simDisabled = adm?.feedSource.simDisabled ?? data?.simDisabled ?? false
   const sources = adm?.feedSource.sources ?? data?.sources ?? []
+  const bumpDataEpoch = useTerminal(s => s.bumpDataEpoch)
   const current = sources.find(s => s.id === source)
   const accById = new Map(accounts.map(a => [a.id, a]))
   const tickAge = feedStatus?.lastTickTs ? Math.max(0, Math.round((Date.now() - feedStatus.lastTickTs) / 1000)) : null
@@ -555,8 +557,11 @@ function FeedChip({ up }: { up: boolean }) {
     try {
       await api.setFeedSource(id)
       await refresh()
+      // purge every client-side market-data holder (candles, ghost, ticks,
+      // depth books) — sim data must never linger under a real-broker source
+      bumpDataEpoch()
       const label = sources.find(s => s.id === id)?.label ?? id
-      toast.success(`Market data source → ${label}`)
+      toast.success(`Market data source → ${label}${id === 'sim' ? '' : ' (sim data cleared)'}`)
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Switch failed')
     } finally { setBusy(false) }
@@ -634,6 +639,7 @@ function FeedChip({ up }: { up: boolean }) {
             />
           )}
           <span className="max-w-[110px] truncate text-foreground/80">{current?.label ?? 'Sim Feed'}</span>
+          {simDisabled && <span className="px-1 rounded bg-[#e0a63f]/20 text-[#e0a63f] text-[8px] font-bold" title="Live-Only mode (admin) — sim feed disabled">LIVE-ONLY</span>}
         </button>
       </PopoverTrigger>
       <PopoverContent align="end" className="w-[360px] p-2 text-[11px] space-y-1">

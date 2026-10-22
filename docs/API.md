@@ -87,7 +87,7 @@ Session flows (per broker, every attempt logged to console + `broker_logs`):
 | Method & path | Description |
 |---|---|
 | `GET /api/symbols` | browse master symbols (`?symbols=a,b` for explicit list, `?q=` search, exchange/type filters) |
-| `POST /api/symbols/sync` | master-contracts sync (indices/eq/futs/weekly-monthly options/BFO/MCX/CDS) → republishes feed universe |
+| `POST /api/symbols/sync` | master-contracts sync (indices/eq/futs/weekly-monthly options/BFO/MCX/CDS) → republishes the LIVE universe (non-expired rows) → enriches Dhan/Shoonya mappings with REAL scrip-master tokens (Dhan `api-scrip-master.csv` securityIds + Noren `*_symbols.txt.zip` tsyms, cached 12 h in `db/masters/`) |
 | `GET /api/symbols/resolve` | broker-specific token mapping for a symbol |
 
 ### Automation
@@ -100,7 +100,7 @@ Session flows (per broker, every attempt logged to console + `broker_logs`):
 | `GET/POST /api/tickrecorder` | tick recorder config + recorded sessions (POST: toggle / symbols) |
 | `GET/POST /api/replay` | paper-trading replay (POST: `{action:'start'\|'stop', file?, random?, fromTs?, toTs?, speed 0.5–20}`) |
 | `GET /api/stats/session` | session win rate, realized/unrealized/net ₹, pts, charges, per-account breakdown |
-| `GET /api/feed` · `POST /api/feed` | active feed source list (includes disconnected accounts) / set source |
+| `GET /api/feed` · `POST /api/feed` | active feed source list + `simDisabled` flag / set `{source}` (radio) or `{simDisabled}` (Live-Only switch — stops the sim random-walk AND refuses sandbox fills) |
 
 ### Strategies
 
@@ -119,7 +119,7 @@ Session flows (per broker, every attempt logged to console + `broker_logs`):
 | `/health` | GET | `{ok, symbols, ts}` — watchdog target |
 | `/candles` | GET | `?symbol&tf&bars` OHLCV (deterministic 3-session 1m backfill + aggregated TFs) |
 | `/ltp` · `/quote` · `/depth` | GET | batch market data |
-| `/feed-source` | GET/POST | active feed account (persisted to `db/feed-source.json`) |
+| `/feed-source` | GET/POST | active feed account + `simDisabled` (persisted to `db/feed-source.json`; switching to a live source PURGES all sim candles/states, switching back to sim reseeds from `db/universe.json`) |
 | `/feed-status` | GET | live broker feed engine: source, connected, last tick age, last error, log ring |
 | `/universe` | POST | publish symbol universe (from master sync) |
 

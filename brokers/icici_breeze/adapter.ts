@@ -1,50 +1,90 @@
 import type {
   BrokerAdapter, LegContext, OrderLegResult,
-  BrokerBookRow, BrokerTradeRow, BrokerPositionRow, BrokerFundsRow, BrokerQuoteRow, ModifyPatch,
+  BrokerBookRow, BrokerTradeRow, BrokerPositionRow, BrokerFundsRow, ModifyPatch,
 } from '../registry'
 import { registerAdapter } from '../registry'
 import { applyFill, rejectOrder } from '../execution'
 import { logBroker } from '../database'
-import { liveFetch, num, normalizeStatus } from '../live-api'
+import { num, normalizeStatus } from '../live-api'
+import { isSimDisabled } from '../sim-mode'
+import {
+  breezeRequest, breezeInstrumentParams, parseBreezeQuoteRow, firstSuccess, successList,
+  type BreezeCreds, type BreezeRes,
+} from './breeze'
 
 // ============================================================
 // ICICI Direct Breeze broker plugin — Breeze REST API v1.
-// Full live surface:
-//   POST   /orders                 place
-//   PUT    /orders                 modify (action: 'modify')
-//   PATCH  /orders                 cancel (action: 'cancel')
-//   GET    /orders                 order book (?id= for detail)
-//   GET    /trades                 trade book
-//   GET    /portfolio/positions    position book
-//   GET    /customer/margins       funds / margin
-//   GET    /quotes                 L1 quote (stock_code + right/strike/expiry)
-// Auth: Authorization: Bearer <session token> + api-key header.
-// Expiry format "28-Oct-2025", strike as int, right = CE/PE.
-// Sandbox mode: sandbox engine fallback (sim LTP), flagged.
+//
+// EVERY call goes through breezeRequest (checksum headers + params
+// as request body + `{Status, Success, Error}` envelope), matching
+// breeze_connect 1.0.69 / the straweb-hedging port exactly:
+//   GET  funds                → funds snapshot
+//   GET  quotes               → L1 quote
+//   POST order                → place (Success.order_id)
+//   PUT  order                → modify
+//   DELETE order              → cancel
+//   GET  order                → order book (exchange + date window)
+//   GET  trades               → trade book
+//   GET  portfoliopositions   → positions
+//   GET  portfolioholdings    → demat
+//   GET  customer/margins     → margin estimate (action params)
+// Sandbox mode only when no session (or Live-Only mode disables it).
 // ============================================================
 
-const BASE = 'https://api.icicidirect.com/breezeapi/api/v1'
-
-const mons = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-
-function breezeExpiry(expiry?: string | null): string | undefined {
-  if (!expiry) return undefined
-  const [y, m, d] = expiry.split('-')
-  return `${d}-${mons[parseInt(m) - 1]}-${y}`
-}
-
-function breezeHeaders(creds: Record<string, string> | null): Record<string, string> {
+function creds2breeze(c: Record<string, string> | null | undefined): BreezeCreds {
   return {
-    'Authorization': `Bearer ${creds?.sessionToken ?? ''}`,
-    'X-SessionToken': creds?.sessionToken ?? '',
-    'api-key': creds?.apiKey ?? '',
-    'Content-Type': 'application/json',
+    apiKey: c?.apiKey,
+    apiSecret: c?.apiSecret,
+    sessionToken: c?.sessionToken,
+    userId: c?.userId,
+    apiSession: c?.apiSession,
   }
 }
 
-/** tagged live fetch — every outbound Breeze call logs [ICICI_BREEZE][tag] */
-function lf<T>(ctx: LegContext, tag: string, url: string, init: RequestInit & { timeoutMs?: number } = {}) {
-  return liveFetch<T>(url, { ...init, callTag: { broker: 'ICICI_BREEZE', accountId: ctx.accountId, tag } })
+/** tagged logging so Admin → Broker Diagnostics shows every Breeze call */
+function loggerFor(ctx: LegContext, tag: string) {
+  return (line: string, level: 'INFO' | 'WARN' = 'INFO') => {
+    logBroker('ICICI_BREEZE', ctx.accountId, `${tag}: ${line}`, level)
+  }
+}
+
+const EXCH_UP: Record<string, string> = { NSE: 'NSE', BSE: 'BSE', NFO: 'NFO', BFO: 'BFO', MCX: 'MCX', CDS: 'CDS' }
+
+function exchangeUpper(ex: string): string {
+  return EXCH_UP[(ex ?? '').toUpperCase()] ?? (ex || 'NSE').toUpperCase()
+}
+
+/** order payload exactly like hedging transform_data (empty values dropped by buildBreezeBody) */
+function liveOrderPayload(ctx: LegContext): Record<string, unknown> {
+  const m = (ctx.symbolMap.brokerToken ?? '').split('|')
+  const units = ctx.order.qty * ctx.symbolMap.lotSize
+  const exch = exchangeUpper(ctx.symbolMap.exchange)
+  const isDeriv = exch === 'NFO' || exch === 'BFO' || exch === 'MCX'
+  const isOpt = ctx.symbolMap.instrumentType === 'CE' || ctx.symbolMap.instrumentType === 'PE'
+  const orderType = ctx.order.orderType === 'MARKET' ? 'market' : ctx.order.orderType === 'LIMIT' ? 'limit' : 'stoploss'
+  const body: Record<string, unknown> = {
+    stock_code: m[0] || ctx.symbolMap.masterSymbol,
+    exchange_code: exch,
+    product: isDeriv ? (isOpt ? 'options' : 'futures') : ctx.order.productType === 'CNC' ? 'cash' : 'margin',
+    action: ctx.order.side.toLowerCase(),
+    order_type: orderType,
+    quantity: String(units),
+    price: ctx.order.limitPrice ? ctx.order.limitPrice.toFixed(2) : '0',
+    validity: 'day',
+    user_remark: (ctx.order.source + (ctx.order.strategyId ? ':' + ctx.order.strategyId : '')).slice(0, 20),
+  }
+  if ((ctx.order.orderType === 'SL' || ctx.order.orderType === 'SL-M') && ctx.order.triggerPrice) {
+    body.stoploss = ctx.order.triggerPrice.toFixed(2)
+  }
+  if (isDeriv) {
+    const exp = m[1]
+    if (exp) body.expiry_date = exp.startsWith('T') ? exp : `${exp}T06:00:00.000Z`
+    if (isOpt) {
+      body.right = ctx.symbolMap.instrumentType === 'CE' ? 'call' : 'put'
+      if (m[2]) body.strike_price = String(Math.round(Number(m[2])))
+    }
+  }
+  return body
 }
 
 function toBookRow(o: Record<string, unknown>): BrokerBookRow {
@@ -54,7 +94,7 @@ function toBookRow(o: Record<string, unknown>): BrokerBookRow {
     symbol: String(o.stock_code ?? ''),
     side: String(o.action ?? '').toUpperCase() === 'BUY' ? 'BUY' : 'SELL',
     qty: num(o.quantity) ?? 0,
-    filledQty: normalizeStatus(raw) === 'FILLED' ? num(o.quantity) ?? 0 : undefined,
+    filledQty: normalizeStatus(raw) === 'FILLED' ? num(o.quantity) ?? 0 : num(o.filled_quantity) ?? undefined,
     status: normalizeStatus(raw),
     rawStatus: raw,
     avgPrice: num(o.average_price) ?? num(o.price) ?? undefined,
@@ -68,8 +108,9 @@ const breezeAdapter: BrokerAdapter = {
   isLiveCapable: () => true,
 
   mapSymbol(master) {
-    // Breeze payloads take separate fields; brokerSymbol is a readable composite
-    const exp = breezeExpiry(master.expiry)
+    // brokerToken = stock|expiry(YYYY-MM-DD)|strike|CE/PE — breezeInstrumentParams
+    // expands it per call (ISO expiry, call/put, strike rounding).
+    const exp = (master.expiry ?? '').slice(0, 10)
     let brokerSymbol = master.symbol
     if (master.instrumentType === 'FUT') brokerSymbol = `${master.symbol}-FUT`
     else if (master.instrumentType === 'CE' || master.instrumentType === 'PE')
@@ -86,38 +127,29 @@ const breezeAdapter: BrokerAdapter = {
   async placeOrder(ctx: LegContext): Promise<OrderLegResult> {
     const units = ctx.order.qty * ctx.symbolMap.lotSize
     if (ctx.credentials?.sessionToken && ctx.credentials?.apiKey) {
-      const m = ctx.symbolMap.brokerToken?.split('|') ?? []
-      const body: Record<string, unknown> = {
-        product: ctx.order.productType === 'CNC' ? 'delivery' : 'margin',
-        action: ctx.order.side.toLowerCase(),
-        price: ctx.order.limitPrice ? ctx.order.limitPrice.toFixed(2) : '0',
-        validity: 'day',
-        disclosure_quantity: '0',
-        exchange_code: ctx.symbolMap.exchange === 'NFO' ? 'NFO' : 'NSE',
-        quantity: String(units),
-        order_type: ctx.order.orderType === 'LIMIT' ? 'limit' : ctx.order.orderType === 'SL' ? 'stoploss' : 'market',
-        stock_code: m[0],
-        remarks: (ctx.order.source + (ctx.order.strategyId ? ':' + ctx.order.strategyId : '')).slice(0, 20),
-      }
-      if (ctx.order.triggerPrice) body.trigger_price = ctx.order.triggerPrice.toFixed(2)
-      if (ctx.symbolMap.instrumentType === 'FUT') body.expiry_date = breezeExpiry(ctx.symbolMap.brokerToken?.split('|')[1])
-      if (ctx.symbolMap.instrumentType === 'CE' || ctx.symbolMap.instrumentType === 'PE') {
-        body.right = ctx.symbolMap.instrumentType
-        body.strike_price = String(Math.round(Number(m[2])))
-        body.expiry_date = breezeExpiry(m[1])
-        body.product = 'options'
-      }
-      const res = await lf<{ Status?: number; Result?: { OrderID?: string }; Error?: string }>(ctx, 'place-order', `${BASE}/orders`, {
-        method: 'POST', headers: breezeHeaders(ctx.credentials), body: JSON.stringify(body),
-      })
-      if (res.data?.Status === 1 && res.data.Result?.OrderID) {
-        logBroker('ICICI_BREEZE', ctx.accountId, `LIVE order ${res.data.Result.OrderID} ${ctx.order.side} ${units} ${ctx.symbolMap.brokerSymbol}`)
+      const res = await breezeRequest<{ Status?: number; Success?: { order_id?: string }; Error?: string }>(
+        creds2breeze(ctx.credentials), 'POST', 'order', liveOrderPayload(ctx),
+        { timeoutMs: 10_000, log: loggerFor(ctx, 'place-order') },
+      )
+      const orderId = res.data?.Success?.order_id
+      if (res.status === 200 && orderId) {
+        logBroker('ICICI_BREEZE', ctx.accountId, `LIVE order ${orderId} ${ctx.order.side} ${units} ${ctx.symbolMap.brokerSymbol}`)
         return {
           accountId: ctx.accountId, accountLabel: ctx.accountLabel, brokerType: 'ICICI_BREEZE',
-          brokerOrderId: res.data.Result.OrderID, status: 'OPEN', qty: ctx.order.qty, message: 'Live order accepted by Breeze',
+          brokerOrderId: orderId, status: 'OPEN', qty: ctx.order.qty, message: 'Live order accepted by Breeze',
         }
       }
-      logBroker('ICICI_BREEZE', ctx.accountId, `API error: ${res.data?.Error ?? res.error ?? res.status}`, 'WARN')
+      logBroker('ICICI_BREEZE', ctx.accountId, `place order failed: ${res.error ?? res.raw?.slice(0, 120) ?? res.status}`, 'WARN')
+    }
+    if (isSimDisabled()) {
+      // Live-Only mode (admin) — never fall back to simulated fills
+      rejectOrder(ctx, 'REJECTED (Live-Only mode — sandbox fills disabled)')
+      logBroker('ICICI_BREEZE', ctx.accountId, 'order REJECTED — Live-Only mode disables sandbox fills (create the broker session)', 'ERROR')
+      return {
+        accountId: ctx.accountId, accountLabel: ctx.accountLabel, brokerType: 'ICICI_BREEZE',
+        brokerOrderId: '', status: 'REJECTED', qty: ctx.order.qty,
+        message: 'Live-Only mode: broker session/API required — sandbox fills disabled',
+      }
     }
     if (!ctx.credentials?.sessionToken) {
       rejectOrder(ctx, 'Sandbox fill (no live credentials)')
@@ -134,53 +166,83 @@ const breezeAdapter: BrokerAdapter = {
 
   async modifyOrder(ctx, brokerOrderId, patch: ModifyPatch) {
     if (!ctx.credentials?.sessionToken) return { ok: false, message: 'no live credentials' }
-    const body: Record<string, unknown> = { order_id: brokerOrderId, action: 'modify' }
-    if (patch.qty != null) body.quantity = String(patch.qty * ctx.symbolMap.lotSize)
-    if (patch.limitPrice != null) body.price = patch.limitPrice.toFixed(2)
-    if (patch.triggerPrice != null) body.trigger_price = patch.triggerPrice.toFixed(2)
-    if (patch.orderType) body.order_type = patch.orderType === 'LIMIT' ? 'limit' : patch.orderType === 'SL' ? 'stoploss' : patch.orderType === 'SL-M' ? 'stoploss-market' : 'market'
-    const res = await lf<{ Status?: number; Error?: string }>(ctx, 'modify-order', `${BASE}/orders`, {
-      method: 'PUT', headers: breezeHeaders(ctx.credentials), body: JSON.stringify(body),
-    })
-    const ok = res.data?.Status === 1 || res.ok
-    logBroker('ICICI_BREEZE', ctx.accountId, `LIVE modify ${brokerOrderId}: ${ok ? 'ok' : res.data?.Error ?? res.error}`, ok ? 'INFO' : 'WARN')
-    return { ok, message: ok ? 'Live order modified' : res.data?.Error ?? res.error }
+    const m = (ctx.symbolMap.brokerToken ?? '').split('|')
+    const body: Record<string, unknown> = {
+      order_id: brokerOrderId,
+      exchange_code: exchangeUpper(ctx.symbolMap.exchange),
+      stock_code: m[0] || ctx.symbolMap.masterSymbol,
+      action: ctx.order.side.toLowerCase(),
+      product: ctx.symbolMap.instrumentType === 'CE' || ctx.symbolMap.instrumentType === 'PE' ? 'options' : ctx.symbolMap.instrumentType === 'FUT' ? 'futures' : ctx.order.productType === 'CNC' ? 'cash' : 'margin',
+      order_type: patch.orderType ? (patch.orderType === 'MARKET' ? 'market' : patch.orderType === 'LIMIT' ? 'limit' : 'stoploss') : (ctx.order.orderType === 'MARKET' ? 'market' : ctx.order.orderType === 'LIMIT' ? 'limit' : 'stoploss'),
+      quantity: String((patch.qty ?? ctx.order.qty) * ctx.symbolMap.lotSize),
+      price: patch.limitPrice != null ? patch.limitPrice.toFixed(2) : ctx.order.limitPrice ? ctx.order.limitPrice.toFixed(2) : '0',
+      validity: 'day',
+    }
+    if (patch.triggerPrice != null) body.stoploss = patch.triggerPrice.toFixed(2)
+    const res = await breezeRequest<{ Status?: number; Error?: string }>(
+      creds2breeze(ctx.credentials), 'PUT', 'order', body,
+      { timeoutMs: 8000, log: loggerFor(ctx, 'modify-order') },
+    )
+    const ok = res.status === 200
+    logBroker('ICICI_BREEZE', ctx.accountId, `LIVE modify ${brokerOrderId}: ${ok ? 'ok' : res.error ?? 'failed'}`, ok ? 'INFO' : 'WARN')
+    return { ok, message: ok ? 'Live order modified' : res.error ?? 'modify failed' }
   },
 
   async cancelOrder(ctx, brokerOrderId) {
     if (ctx.credentials?.sessionToken) {
-      const res = await lf<{ Status?: number; Error?: string }>(ctx, 'cancel-order', `${BASE}/orders`, {
-        method: 'PATCH',
-        headers: breezeHeaders(ctx.credentials),
-        body: JSON.stringify({ order_id: brokerOrderId, action: 'cancel' }),
-        timeoutMs: 3000,
-      })
-      if (res.ok || res.data?.Status === 1) return { ok: true, message: 'Live order cancelled' }
-      return { ok: false, message: res.data?.Error ?? 'cancel failed' }
+      const res = await breezeRequest<{ Status?: number; Error?: string }>(
+        creds2breeze(ctx.credentials), 'DELETE', 'order',
+        { order_id: brokerOrderId, exchange_code: exchangeUpper(ctx.symbolMap.exchange) },
+        { timeoutMs: 6000, log: loggerFor(ctx, 'cancel-order') },
+      )
+      if (res.status === 200) return { ok: true, message: 'Live order cancelled' }
+      return { ok: false, message: res.error ?? 'cancel failed' }
     }
+    if (isSimDisabled()) return { ok: false, message: 'Live-Only mode: no live order to cancel' }
     return { ok: true, message: 'Sandbox cancel attempted' }
   },
 
   async getOrderBook(ctx) {
     if (!ctx.credentials?.sessionToken) return []
-    const res = await lf<{ Status?: number; Result?: Record<string, unknown>[] }>(ctx, 'order-book', `${BASE}/orders`, { headers: breezeHeaders(ctx.credentials) })
-    const rows = res.data?.Result
-    return Array.isArray(rows) ? rows.map(toBookRow) : []
+    // Breeze books are paginated per exchange + date window
+    const today = new Date()
+    const iso = (d: Date) => `${d.toISOString().slice(0, 10)}T06:00:00.000Z`
+    const rows: Record<string, unknown>[] = []
+    for (const exch of ['nse', 'nfo']) {
+      const res = await breezeRequest<Record<string, unknown>>(
+        creds2breeze(ctx.credentials), 'GET', 'order',
+        { exchange_code: exch, from_date: iso(today), to_date: iso(today) },
+        { timeoutMs: 8000, log: loggerFor(ctx, 'order-book') },
+      )
+      rows.push(...successList(res))
+    }
+    return rows.map(toBookRow)
   },
 
   async getOrderStatus(ctx, brokerOrderId) {
     if (!ctx.credentials?.sessionToken) return null
-    const res = await lf<{ Status?: number; Result?: Record<string, unknown> }>(ctx, 'order-status',
-      `${BASE}/orders?id=${encodeURIComponent(brokerOrderId)}`, { headers: breezeHeaders(ctx.credentials) },
+    const res = await breezeRequest<Record<string, unknown>>(
+      creds2breeze(ctx.credentials), 'GET', 'order',
+      { order_id: brokerOrderId, exchange_code: exchangeUpper(ctx.symbolMap.exchange) },
+      { timeoutMs: 6000, log: loggerFor(ctx, 'order-status') },
     )
-    return res.data?.Result ? toBookRow(res.data.Result) : null
+    const row = firstSuccess(res)
+    return row ? toBookRow(row) : null
   },
 
   async getTradeBook(ctx) {
     if (!ctx.credentials?.sessionToken) return []
-    const res = await lf<{ Status?: number; Result?: Record<string, unknown>[] }>(ctx, 'trade-book', `${BASE}/trades`, { headers: breezeHeaders(ctx.credentials) })
-    const rows = res.data?.Result
-    if (!Array.isArray(rows)) return []
+    const today = new Date()
+    const iso = (d: Date) => `${d.toISOString().slice(0, 10)}T06:00:00.000Z`
+    const rows: Record<string, unknown>[] = []
+    for (const exch of ['nse', 'nfo']) {
+      const res = await breezeRequest<Record<string, unknown>>(
+        creds2breeze(ctx.credentials), 'GET', 'trades',
+        { exchange_code: exch, from_date: iso(today), to_date: iso(today) },
+        { timeoutMs: 8000, log: loggerFor(ctx, 'trade-book') },
+      )
+      rows.push(...successList(res))
+    }
     return rows.map(t => ({
       tradeId: String(t.trade_id ?? t.exchange_trade_id ?? ''),
       orderId: String(t.order_id ?? ''),
@@ -194,11 +256,11 @@ const breezeAdapter: BrokerAdapter = {
 
   async getPositionsLive(ctx) {
     if (!ctx.credentials?.sessionToken) return []
-    const res = await lf<{ Status?: number; Result?: Record<string, unknown>[] }>(ctx, 'positions',
-      `${BASE}/portfolio/positions?exchange_code=NFO`, { headers: breezeHeaders(ctx.credentials) },
+    const res = await breezeRequest<Record<string, unknown>>(
+      creds2breeze(ctx.credentials), 'GET', 'portfoliopositions', {},
+      { timeoutMs: 8000, log: loggerFor(ctx, 'positions') },
     )
-    const rows = res.data?.Result
-    if (!Array.isArray(rows)) return []
+    const rows = successList(res)
     return rows
       .filter(p => num(p.quantity) !== 0)
       .map(p => ({
@@ -211,20 +273,38 @@ const breezeAdapter: BrokerAdapter = {
       }))
   },
 
-  async getFunds(ctx) {
+  async getFunds(ctx): Promise<BrokerFundsRow> {
     if (!ctx.credentials?.sessionToken) return { cash: 0 }
-    const res = await lf<{ Status?: number; Result?: Record<string, unknown> }>(ctx, 'funds', `${BASE}/customer/margins`, { headers: breezeHeaders(ctx.credentials) })
-    const r = res.data?.Result ?? {}
-    // Breeze margin payload keys vary — probe the common ones
-    const cash = num(r.margin_available) ?? num(r.net_available_cash) ?? num(r.available_cash) ?? num(r.marginavailable) ?? 0
-    return { cash, utilized: num(r.margin_utilized) ?? num(r.utilized_amount) ?? 0 }
+    // GET funds — Success: {total_bank_balance, allocated_equity, allocated_commodity,
+    // allocated_fno, block_by_trade_balance, unallocated_balance} (hedging funds.py parity)
+    const res = await breezeRequest<Record<string, unknown>>(
+      creds2breeze(ctx.credentials), 'GET', 'funds', {},
+      { timeoutMs: 10_000, log: loggerFor(ctx, 'funds') },
+    )
+    const s = firstSuccess(res)
+    if (!s) return { cash: 0, error: res.error ?? `funds API returned no data (HTTP ${res.httpStatus})` }
+    const f = (k: string): number => {
+      const v = Number(String(s[k] ?? '').replace(/,/g, ''))
+      return Number.isFinite(v) ? v : 0
+    }
+    const allocatedEquity = f('allocated_equity')
+    const unallocated = f('unallocated_balance')
+    const bank = f('total_bank_balance')
+    const blocked = f('block_by_trade_balance')
+    const cash = Math.max(0, allocatedEquity + unallocated + bank - blocked)
+    const utilized = f('allocated_fno') + f('allocated_commodity') + blocked
+    if (res.status !== 200) return { cash: 0, error: res.error ?? `funds API status ${res.status}` }
+    return { cash, utilized }
   },
 
   async getHoldings(ctx) {
     if (!ctx.credentials?.sessionToken) return []
-    const res = await lf<{ Status?: number; Result?: Record<string, unknown>[] }>(ctx, 'holdings', `${BASE}/portfolio/holdings`, { headers: breezeHeaders(ctx.credentials), timeoutMs: 6000 })
-    const arr = Array.isArray(res.data?.Result) ? res.data!.Result : []
-    return arr.map(h => ({
+    const res = await breezeRequest<Record<string, unknown>>(
+      creds2breeze(ctx.credentials), 'GET', 'portfolioholdings', { exchange_code: 'nse' },
+      { timeoutMs: 10_000, log: loggerFor(ctx, 'holdings') },
+    )
+    const rows = successList(res)
+    return rows.map(h => ({
       symbol: String(h.stock_code ?? ''),
       isin: h.isin ? String(h.isin) : undefined,
       qty: num(h.quantity) ?? num(h.holding_quantity) ?? 0,
@@ -237,16 +317,21 @@ const breezeAdapter: BrokerAdapter = {
 
   async marginCalc(ctx, params) {
     if (!ctx.credentials?.sessionToken) return null
-    const q = new URLSearchParams({
-      action: params.side.toLowerCase(),
-      exchange_code: ctx.symbolMap.exchange === 'NFO' ? 'NFO' : 'NSE',
-      product: params.productType === 'CNC' ? 'cash' : ctx.symbolMap.instrumentType === 'FUT' ? 'futures' : 'options',
-      quantity: String(params.qty),
-      price: String(params.price),
-    })
-    const res = await lf<{ Status?: number; Result?: Record<string, unknown> }>(ctx, 'margin-calc', `${BASE}/customer/margins?${q}`, { headers: breezeHeaders(ctx.credentials), timeoutMs: 5000 })
-    const r = res.data?.Result ?? {}
-    if (!res.ok || !r || Array.isArray(r)) return { required: 0, detail: 'margin API unreachable' }
+    const m = (ctx.symbolMap.brokerToken ?? '').split('|')
+    const res = await breezeRequest<Record<string, unknown>>(
+      creds2breeze(ctx.credentials), 'GET', 'customer/margins',
+      {
+        action: params.side.toLowerCase(),
+        exchange_code: exchangeUpper(ctx.symbolMap.exchange),
+        product: ctx.symbolMap.instrumentType === 'CE' || ctx.symbolMap.instrumentType === 'PE' ? 'options' : ctx.symbolMap.instrumentType === 'FUT' ? 'futures' : params.productType === 'CNC' ? 'cash' : 'margin',
+        quantity: String(params.qty * ctx.symbolMap.lotSize),
+        price: String(params.price),
+        stock_code: m[0] || ctx.symbolMap.masterSymbol,
+      },
+      { timeoutMs: 8000, log: loggerFor(ctx, 'margin-calc') },
+    )
+    const r = firstSuccess(res)
+    if (!res.status || res.status !== 200 || !r) return { required: 0, detail: res.error ?? 'margin API unavailable' }
     return {
       required: num(r.margin_required) ?? num(r.total_margin) ?? 0,
       available: num(r.margin_available) ?? num(r.net_available_cash) ?? undefined,
@@ -259,27 +344,23 @@ const breezeAdapter: BrokerAdapter = {
 
   async getQuote(ctx, token) {
     if (!ctx.credentials?.sessionToken) return { symbol: token, ltp: 0 }
-    // token = stock_code|expiry|strike|right (see mapSymbol)
+    // token = stock|expiry(YYYY-MM-DD)|strike|CE-PE (see mapSymbol)
     const [stock, expiry, strike, right] = token.split('|')
-    const isOpt = !!strike && !!right
-    const params = new URLSearchParams({
-      stock_code: stock,
-      exchange_code: ctx.symbolMap.exchange === 'NFO' ? 'NFO' : 'NSE',
-      product: ctx.symbolMap.instrumentType === 'FUT' ? 'futures' : isOpt ? 'options' : 'cash',
-    })
-    if (expiry) params.set('expiry_date', expiry)
-    if (isOpt) { params.set('right', right); params.set('strike_price', String(Math.round(Number(strike)))) }
-    const res = await lf<{ Status?: number; Result?: Record<string, unknown>[] }>(ctx, 'quote', `${BASE}/quotes?${params}`, { headers: breezeHeaders(ctx.credentials), timeoutMs: 3000 })
-    const row = Array.isArray(res.data?.Result) ? res.data.Result[0] : null
+    const row = firstSuccess(await breezeRequest<Record<string, unknown>>(
+      creds2breeze(ctx.credentials!), 'GET', 'quotes',
+      breezeInstrumentParams({
+        symbol: stock || ctx.symbolMap.masterSymbol,
+        exchange: ctx.symbolMap.exchange,
+        instrumentType: ctx.symbolMap.instrumentType,
+        expiry: expiry || null,
+        strike: strike || null,
+        optionType: right || ctx.symbolMap.instrumentType,
+      }),
+      { timeoutMs: 6000, log: loggerFor(ctx, 'quote') },
+    ) as BreezeRes<Record<string, unknown>>)
     if (!row) return { symbol: token, ltp: 0 }
-    return {
-      symbol: token,
-      ltp: num(row.ltp) ?? 0,
-      bid: num(row.buy_price ?? row.bp1),
-      ask: num(row.sell_price ?? row.sp1),
-      open: num(row.open), high: num(row.high), low: num(row.low), prevClose: num(row.close),
-      volume: num(row.volume),
-    }
+    const q = parseBreezeQuoteRow(row)
+    return { symbol: token, ...q }
   },
 }
 

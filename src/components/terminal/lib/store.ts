@@ -137,6 +137,10 @@ interface TerminalState {
   workspaces: WorkspaceCfg[]
   activeWs: string
   selectedSymbol: string
+  // bumped whenever the feed SOURCE changes — every market-data holder
+  // (chart candles/ghost, watchlist ticks, depth books) clears on change
+  // so sim data never lingers under a real-broker source
+  dataEpoch: number
   // starred watchlist (Watch tab in the left panel)
   watchSymbols: string[]
   // user-defined watchlist tabs (N tabs; each holds explicit symbols)
@@ -182,6 +186,7 @@ interface TerminalState {
   // draggable chart levels
   setChartLevel: (symbol: string, kind: 'sl' | 'target', price: number | null) => void
   setActiveStrike: (v: { strike: number; type: 'CE' | 'PE'; wsId: string } | null) => void
+  bumpDataEpoch: () => void
   /** Open (or re-activate) a per-symbol workspace; FNO ones get the
    *  spot+ATM layout and the strikes panel auto-bound to the symbol. */
   openSymbolWorkspace: (s: string, fno?: boolean) => void
@@ -209,6 +214,7 @@ export const useTerminal = create<TerminalState>()(
       workspaces: [mkWs('ws1', 'Workspace 1', 'NIFTY'), mkWs('ws2', 'Hedge Desk', 'BANKNIFTY')],
       activeWs: 'ws1',
       selectedSymbol: 'NIFTY',
+      dataEpoch: 0,
       watchSymbols: ['NIFTY', 'SENSEX', 'BANKNIFTY'],
       wlTabs: [],
       chartLevels: {},
@@ -280,6 +286,7 @@ export const useTerminal = create<TerminalState>()(
         set({ chartLevels: { ...cur, [symbol]: next } })
       },
       setActiveStrike: v => set({ activeStrike: v }),
+      bumpDataEpoch: () => set({ dataEpoch: get().dataEpoch + 1 }),
       openSymbolWorkspace: (s, fno = false) => {
         const existing = get().workspaces.find(w => w.symbol === s)
         if (existing) {

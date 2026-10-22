@@ -6,6 +6,7 @@ import { registerAdapter } from '../registry'
 import { applyFill, rejectOrder } from '../execution'
 import { logBroker } from '../database'
 import { liveFetch, num, normalizeStatus } from '../live-api'
+import { isSimDisabled } from '../sim-mode'
 
 // ============================================================
 // Shoonya (Finvasia) broker plugin — Noren REST API. Full surface:
@@ -13,12 +14,22 @@ import { liveFetch, num, normalizeStatus } from '../live-api'
 //   /OrderBook  /TradeBook  /PositionBook
 //   /Limits     /GetQuote   /SingleOrdHist
 // Auth: every request body carries jKey = session token (Noren
-// convention) + uid/actid. Symbol format: NSE|RELIANCE-EQ,
-// NFO|NIFTY28OCT25C24500.
-// Sandbox mode: sandbox engine fallback (sim LTP), flagged.
+// convention) + uid/actid. Symbol format (from the scrip-master
+// sync): NSE|RELIANCE-EQ, NFO|NIFTY29OCT2625000CE.
+// Limits additionally supports the NorenWClientAPI host with an
+// Authorization: Bearer header (hedging parity) — tried first.
+// Sandbox mode: sandbox engine fallback (sim LTP), flagged — and
+// HARD-DISABLED when the admin Live-Only mode is on.
 // ============================================================
 
 const BASE = 'https://api.shoonya.com/NorenWClientTP'
+const BASE_API = 'https://api.shoonya.com/NorenWClientAPI'
+
+/** Shoonya splits the body on "&" — a literal & inside JSON breaks parsing.
+ *  Escape it as the JSON unicode escape (hedging _encode_jdata parity). */
+function jdata(body: Record<string, unknown>): string {
+  return 'jData=' + JSON.stringify(body).replace(/&/g, '\\u0026')
+}
 
 /** Noren request wrapper — jKey session token + uid/actid on every call. */
 function norenBody(ctx: LegContext, extra: Record<string, unknown> = {}) {
@@ -35,10 +46,24 @@ function norenBody(ctx: LegContext, extra: Record<string, unknown> = {}) {
 async function norenPost<T>(ctx: LegContext | null, endpoint: string, body: Record<string, unknown>, timeoutMs = 4000) {
   return liveFetch<T>(`${BASE}/${endpoint}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'text/plain' },
+    body: jdata(body),
     timeoutMs,
     callTag: { broker: 'SHOONYA', accountId: ctx?.accountId, tag: endpoint.toLowerCase() },
+  })
+}
+
+/** Limits on the NorenWClientAPI host with a Bearer header (hedging parity). */
+async function norenApiLimits<T>(ctx: LegContext, timeoutMs = 5000) {
+  return liveFetch<T>(`${BASE_API}/Limits`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'text/plain',
+      'Authorization': `Bearer ${ctx.credentials?.sessionId ?? ''}`,
+    },
+    body: jdata({ uid: ctx.credentials?.userId ?? '', actid: ctx.credentials?.userId ?? '' }),
+    timeoutMs,
+    callTag: { broker: 'SHOONYA', accountId: ctx.accountId, tag: 'limits-api' },
   })
 }
 
@@ -119,6 +144,15 @@ const shoonyaAdapter: BrokerAdapter = {
       }
       logBroker('SHOONYA', ctx.accountId, `API error: ${res.data?.emsg ?? res.error ?? res.status}`, 'WARN')
     }
+    if (isSimDisabled()) {
+      rejectOrder(ctx, 'REJECTED (Live-Only mode — sandbox fills disabled)')
+      logBroker('SHOONYA', ctx.accountId, 'order REJECTED — Live-Only mode disables sandbox fills (create the broker session)', 'ERROR')
+      return {
+        accountId: ctx.accountId, accountLabel: ctx.accountLabel, brokerType: 'SHOONYA',
+        brokerOrderId: '', status: 'REJECTED', qty: ctx.order.qty,
+        message: 'Live-Only mode: broker session/API required — sandbox fills disabled',
+      }
+    }
     if (!ctx.credentials?.sessionId) {
       rejectOrder(ctx, 'Sandbox fill (no live credentials)')
     }
@@ -191,12 +225,24 @@ const shoonyaAdapter: BrokerAdapter = {
       }))
   },
 
-  async getFunds(ctx) {
+  async getFunds(ctx): Promise<BrokerFundsRow> {
     if (!ctx.credentials?.sessionId) return { cash: 0 }
-    const res = await norenPost<Record<string, unknown> | { emsg?: string }>(ctx, 'Limits', norenBody(ctx))
-    const d = (res.data && !Array.isArray(res.data) ? res.data : {}) as Record<string, unknown>
-    const cash = num(d.cash) ?? 0
-    return { cash, available: num(d.marginavailable) ?? cash, utilized: num(d.marginused) ?? 0 }
+    // hedging parity: NorenWClientAPI/Limits with a Bearer header first,
+    // then the classic TP body-jKey variant. available = cash + payin − marginused.
+    const api = await norenApiLimits<Record<string, unknown> | { emsg?: string; stat?: string }>(ctx)
+    let d: Record<string, unknown> = {}
+    if (api.data && !Array.isArray(api.data) && !(api.data as { emsg?: string }).emsg) {
+      const j = api.data as Record<string, unknown>
+      if (j.cash != null || j.payin != null || j.marginavailable != null) d = j
+    }
+    if (!(d.cash != null || d.payin != null)) {
+      const tp = await norenPost<Record<string, unknown> | { emsg?: string }>(ctx, 'Limits', norenBody(ctx), 5000)
+      d = (tp.data && !Array.isArray(tp.data) ? tp.data : {}) as Record<string, unknown>
+    }
+    if (d.cash == null && d.payin == null) return { cash: 0, error: String((d as { emsg?: string }).emsg ?? 'Limits returned no cash fields (session?)') }
+    const n = (v: unknown): number => (Number.isFinite(Number(v)) ? Number(v) : 0)
+    const cash = Math.max(0, n(d.cash) + n(d.payin) - n(d.marginused))
+    return { cash, available: num(d.marginavailable) ?? cash, utilized: n(d.marginused) }
   },
 
   async getHoldings(ctx) {
@@ -238,16 +284,21 @@ const shoonyaAdapter: BrokerAdapter = {
 
   async getQuote(ctx, token) {
     if (!ctx.credentials?.sessionId) return { symbol: token, ltp: 0 }
-    const [exch, tsym] = token.includes('|') ? token.split('|') : [ctx.symbolMap.exchange, token]
-    const res = await norenPost<Record<string, unknown>>(ctx, 'GetQuote', norenBody(ctx, { exch, tsym }), 3000)
-    if (!res.data) return { symbol: token, ltp: 0 }
+    // scrip-master sync stores brokerToken = "NSE|<tsym>"; fall back to
+    // brokerSymbol for pre-sync rows
+    const [exch, tsym] = token.includes('|')
+      ? token.split('|')
+      : [ctx.symbolMap.exchange, ctx.symbolMap.brokerSymbol || token]
+    const res = await norenPost<Record<string, unknown> | { emsg?: string }>(ctx, 'GetQuote', norenBody(ctx, { exch, tsym }), 3000)
+    if (!res.data || (res.data as { emsg?: string }).emsg) return { symbol: tsym, ltp: 0 }
+    const d = res.data as Record<string, unknown>
     return {
       symbol: tsym,
-      ltp: num(res.data.lp) ?? 0,
-      bid: num(res.data.bp1),
-      ask: num(res.data.sp1),
-      open: num(res.data.o), high: num(res.data.h), low: num(res.data.l), prevClose: num(res.data.c),
-      volume: num(res.data.volume),
+      ltp: num(d.lp) ?? 0,
+      bid: num(d.bp1),
+      ask: num(d.sp1),
+      open: num(d.o), high: num(d.h), low: num(d.l), prevClose: num(d.c),
+      volume: num(d.v) ?? num(d.volume),
     }
   },
 }

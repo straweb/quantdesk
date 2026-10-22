@@ -6,6 +6,7 @@ import { registerAdapter } from '../registry'
 import { applyFill, rejectOrder } from '../execution'
 import { logBroker } from '../database'
 import { liveFetch, num, normalizeStatus } from '../live-api'
+import { isSimDisabled } from '../sim-mode'
 
 // ============================================================
 // Dhan broker plugin — Dhan API v2 (REST). Full live surface:
@@ -38,7 +39,19 @@ function headers(creds: Record<string, string> | null): Record<string, string> {
 function mapTransactionType(side: 'BUY' | 'SELL') { return side } // Dhan uses BUY/SELL
 function mapProduct(p: 'MIS' | 'CNC' | 'NRML') { return p === 'CNC' ? 'CNC' : p === 'MIS' ? 'INTRADAY' : 'MARGIN' }
 function mapOrderType(t: string) { return t === 'MARKET' ? 'MARKET' : t === 'LIMIT' ? 'LIMIT' : t === 'SL' ? 'STOP_LOSS' : 'STOP_LOSS_MARKET' }
-function mapSegment(exchange: string) { return exchange === 'NFO' ? 'NSE_FNO' : exchange === 'BSE' ? 'BSE_EQ' : 'NSE_EQ' }
+function mapSegment(exchange: string, instrumentType?: string): string {
+  // Dhan exchange segments (scrip master SEM_SEGMENT mapping — hedging parity):
+  // indices live in IDX_I, NSE eq in NSE_EQ, derivatives in NSE_FNO/BSE_FNO
+  if (instrumentType === 'INDEX') return 'IDX_I'
+  switch (exchange) {
+    case 'NFO': return 'NSE_FNO'
+    case 'BFO': return 'BSE_FNO'
+    case 'BSE': return 'BSE_EQ'
+    case 'MCX': return 'MCX_COMM'
+    case 'CDS': return 'NSE_CURRENCY'
+    default: return 'NSE_EQ'
+  }
+}
 
 /** tagged live fetch — every outbound Dhan call logs [DHAN][tag] with status + latency */
 function lf<T>(ctx: LegContext, tag: string, url: string, init: RequestInit & { timeoutMs?: number } = {}) {
@@ -50,7 +63,7 @@ function livePayload(ctx: LegContext) {
   return {
     dhanClientId: ctx.credentials?.clientId ?? '',
     transactionType: mapTransactionType(ctx.order.side),
-    exchangeSegment: mapSegment(ctx.symbolMap.exchange),
+    exchangeSegment: mapSegment(ctx.symbolMap.exchange, ctx.symbolMap.instrumentType),
     productType: mapProduct(ctx.order.productType),
     orderType: mapOrderType(ctx.order.orderType),
     validity: 'DAY',
@@ -125,7 +138,16 @@ const dhanAdapter: BrokerAdapter = {
         logBroker('DHAN', ctx.accountId, 'API unreachable — sandbox fallback', 'WARN')
       }
     }
-    // sandbox execution
+    // sandbox execution — HARD-DISABLED in Live-Only mode (admin checkbox)
+    if (isSimDisabled()) {
+      rejectOrder(ctx, 'REJECTED (Live-Only mode — sandbox fills disabled)')
+      logBroker('DHAN', ctx.accountId, 'order REJECTED — Live-Only mode disables sandbox fills (create the broker session)', 'ERROR')
+      return {
+        accountId: ctx.accountId, accountLabel: ctx.accountLabel, brokerType: 'DHAN',
+        brokerOrderId: '', status: 'REJECTED', qty: ctx.order.qty,
+        message: 'Live-Only mode: broker session/API required — sandbox fills disabled',
+      }
+    }
     if (!ctx.credentials?.accessToken) {
       rejectOrder(ctx, 'Sandbox fill (no live credentials)') // audit trail only
     }
@@ -239,7 +261,7 @@ const dhanAdapter: BrokerAdapter = {
       method: 'POST', headers: headers(ctx.credentials), timeoutMs: 5000,
       body: JSON.stringify({
         dhanClientId: ctx.credentials.clientId ?? '',
-        exchangeSegment: mapSegment(ctx.symbolMap.exchange),
+        exchangeSegment: mapSegment(ctx.symbolMap.exchange, ctx.symbolMap.instrumentType),
         transactionType: params.side,
         quantity: params.qty,
         productType: params.productType === 'MIS' ? 'INTRADAY' : 'CNC',
@@ -259,7 +281,7 @@ const dhanAdapter: BrokerAdapter = {
 
   async getQuote(ctx, token) {
     if (!ctx.credentials?.accessToken) return { symbol: token, ltp: 0 }
-    const segment = mapSegment(ctx.symbolMap.exchange)
+    const segment = mapSegment(ctx.symbolMap.exchange, ctx.symbolMap.instrumentType)
     const res = await lf<{ data?: Record<string, Record<string, unknown>> }>(ctx, 'quote', `${BASE}/marketfeed/quote`, {
       method: 'POST', headers: headers(ctx.credentials), timeoutMs: 3000,
       body: JSON.stringify({ [segment]: [token] }),

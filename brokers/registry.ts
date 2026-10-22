@@ -77,6 +77,8 @@ export interface BrokerFundsRow {
   cash: number
   available?: number
   utilized?: number
+  /** set when the broker funds call failed (surface in diagnostics) */
+  error?: string
 }
 
 export interface BrokerQuoteRow {

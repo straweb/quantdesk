@@ -19,6 +19,7 @@ export function AdminView() {
   return (
     <div className="h-full overflow-y-auto p-4 space-y-4 max-w-6xl mx-auto">
       <SourceExport />
+      <TradingMode />
       <AccountsManager />
       <BrokerDiagnostics />
       <div className="grid lg:grid-cols-2 gap-4">
@@ -28,6 +29,51 @@ export function AdminView() {
       <TickRecorder />
       <ReplayManager />
       <AuditTrail />
+    </div>
+  )
+}
+
+// ---------------- Trading mode (Live-Only switch) ----------------
+// Round-12: a global checkbox that DISABLES the sim feed + sandbox fills.
+// ON  → the feed engine stops the random walk (charts/watchlists show real
+//        broker data only, empty until ticks arrive) and broker adapters
+//        REJECT orders without a live session instead of simulating them.
+// OFF → sim feed + sandbox execution available as before.
+function TradingMode() {
+  const qc = useQueryClient()
+  const adm = useSyncChannel<SyncAdmin>('sync:admin')
+  const { data } = useQuery({ queryKey: ['feed-source'], queryFn: () => api.feedSource() })
+  const simDisabled = adm?.feedSource?.simDisabled ?? data?.simDisabled ?? false
+  const [busy, setBusy] = useState(false)
+  const toggle = async (next: boolean) => {
+    setBusy(true)
+    try {
+      await api.setSimDisabled(next)
+      await qc.invalidateQueries({ queryKey: ['feed-source'] })
+      toast.success(next
+        ? 'LIVE-ONLY mode — sim feed + sandbox fills disabled'
+        : 'Sim feed + sandbox re-enabled')
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Switch failed')
+    } finally { setBusy(false) }
+  }
+  return (
+    <div className={`rounded-lg border bg-card px-4 py-3 flex flex-wrap items-center gap-3 ${simDisabled ? 'border-[#e0a63f]/50' : 'border-border'}`}>
+      <div className="min-w-[260px] flex-1">
+        <h3 className="text-sm font-semibold flex items-center gap-1.5">
+          {simDisabled ? <ShieldAlert className="h-4 w-4 text-[#e0a63f]" /> : <ShieldCheck className="h-4 w-4 text-[#4dd0e1]" />}
+          Trading mode — {simDisabled ? 'LIVE ONLY' : 'Sim + Sandbox allowed'}
+        </h3>
+        <p className="text-[11px] text-muted-foreground">
+          {simDisabled
+            ? 'Sim feed is OFF for every symbol and sandbox fills are refused — orders need a live broker session, charts show real data or nothing.'
+            : 'Sim feed drives prices when no broker source is active and orders can fall back to sandbox fills. Switch ON when trading a real broker account.'}
+        </p>
+      </div>
+      <label className="flex items-center gap-2 text-xs cursor-pointer select-none">
+        <Switch checked={simDisabled} disabled={busy} onCheckedChange={toggle} />
+        <span className={simDisabled ? 'text-[#e0a63f] font-semibold' : 'text-muted-foreground'}>Disable Sim Feed &amp; Sandbox</span>
+      </label>
     </div>
   )
 }
