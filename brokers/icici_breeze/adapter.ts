@@ -42,6 +42,11 @@ function breezeHeaders(creds: Record<string, string> | null): Record<string, str
   }
 }
 
+/** tagged live fetch — every outbound Breeze call logs [ICICI_BREEZE][tag] */
+function lf<T>(ctx: LegContext, tag: string, url: string, init: RequestInit & { timeoutMs?: number } = {}) {
+  return liveFetch<T>(url, { ...init, callTag: { broker: 'ICICI_BREEZE', accountId: ctx.accountId, tag } })
+}
+
 function toBookRow(o: Record<string, unknown>): BrokerBookRow {
   const raw = String(o.status ?? '')
   return {
@@ -102,7 +107,7 @@ const breezeAdapter: BrokerAdapter = {
         body.expiry_date = breezeExpiry(m[1])
         body.product = 'options'
       }
-      const res = await liveFetch<{ Status?: number; Result?: { OrderID?: string }; Error?: string }>(`${BASE}/orders`, {
+      const res = await lf<{ Status?: number; Result?: { OrderID?: string }; Error?: string }>(ctx, 'place-order', `${BASE}/orders`, {
         method: 'POST', headers: breezeHeaders(ctx.credentials), body: JSON.stringify(body),
       })
       if (res.data?.Status === 1 && res.data.Result?.OrderID) {
@@ -134,7 +139,7 @@ const breezeAdapter: BrokerAdapter = {
     if (patch.limitPrice != null) body.price = patch.limitPrice.toFixed(2)
     if (patch.triggerPrice != null) body.trigger_price = patch.triggerPrice.toFixed(2)
     if (patch.orderType) body.order_type = patch.orderType === 'LIMIT' ? 'limit' : patch.orderType === 'SL' ? 'stoploss' : patch.orderType === 'SL-M' ? 'stoploss-market' : 'market'
-    const res = await liveFetch<{ Status?: number; Error?: string }>(`${BASE}/orders`, {
+    const res = await lf<{ Status?: number; Error?: string }>(ctx, 'modify-order', `${BASE}/orders`, {
       method: 'PUT', headers: breezeHeaders(ctx.credentials), body: JSON.stringify(body),
     })
     const ok = res.data?.Status === 1 || res.ok
@@ -144,7 +149,7 @@ const breezeAdapter: BrokerAdapter = {
 
   async cancelOrder(ctx, brokerOrderId) {
     if (ctx.credentials?.sessionToken) {
-      const res = await liveFetch<{ Status?: number; Error?: string }>(`${BASE}/orders`, {
+      const res = await lf<{ Status?: number; Error?: string }>(ctx, 'cancel-order', `${BASE}/orders`, {
         method: 'PATCH',
         headers: breezeHeaders(ctx.credentials),
         body: JSON.stringify({ order_id: brokerOrderId, action: 'cancel' }),
@@ -158,14 +163,14 @@ const breezeAdapter: BrokerAdapter = {
 
   async getOrderBook(ctx) {
     if (!ctx.credentials?.sessionToken) return []
-    const res = await liveFetch<{ Status?: number; Result?: Record<string, unknown>[] }>(`${BASE}/orders`, { headers: breezeHeaders(ctx.credentials) })
+    const res = await lf<{ Status?: number; Result?: Record<string, unknown>[] }>(ctx, 'order-book', `${BASE}/orders`, { headers: breezeHeaders(ctx.credentials) })
     const rows = res.data?.Result
     return Array.isArray(rows) ? rows.map(toBookRow) : []
   },
 
   async getOrderStatus(ctx, brokerOrderId) {
     if (!ctx.credentials?.sessionToken) return null
-    const res = await liveFetch<{ Status?: number; Result?: Record<string, unknown> }>(
+    const res = await lf<{ Status?: number; Result?: Record<string, unknown> }>(ctx, 'order-status',
       `${BASE}/orders?id=${encodeURIComponent(brokerOrderId)}`, { headers: breezeHeaders(ctx.credentials) },
     )
     return res.data?.Result ? toBookRow(res.data.Result) : null
@@ -173,7 +178,7 @@ const breezeAdapter: BrokerAdapter = {
 
   async getTradeBook(ctx) {
     if (!ctx.credentials?.sessionToken) return []
-    const res = await liveFetch<{ Status?: number; Result?: Record<string, unknown>[] }>(`${BASE}/trades`, { headers: breezeHeaders(ctx.credentials) })
+    const res = await lf<{ Status?: number; Result?: Record<string, unknown>[] }>(ctx, 'trade-book', `${BASE}/trades`, { headers: breezeHeaders(ctx.credentials) })
     const rows = res.data?.Result
     if (!Array.isArray(rows)) return []
     return rows.map(t => ({
@@ -189,7 +194,7 @@ const breezeAdapter: BrokerAdapter = {
 
   async getPositionsLive(ctx) {
     if (!ctx.credentials?.sessionToken) return []
-    const res = await liveFetch<{ Status?: number; Result?: Record<string, unknown>[] }>(
+    const res = await lf<{ Status?: number; Result?: Record<string, unknown>[] }>(ctx, 'positions',
       `${BASE}/portfolio/positions?exchange_code=NFO`, { headers: breezeHeaders(ctx.credentials) },
     )
     const rows = res.data?.Result
@@ -208,7 +213,7 @@ const breezeAdapter: BrokerAdapter = {
 
   async getFunds(ctx) {
     if (!ctx.credentials?.sessionToken) return { cash: 0 }
-    const res = await liveFetch<{ Status?: number; Result?: Record<string, unknown> }>(`${BASE}/customer/margins`, { headers: breezeHeaders(ctx.credentials) })
+    const res = await lf<{ Status?: number; Result?: Record<string, unknown> }>(ctx, 'funds', `${BASE}/customer/margins`, { headers: breezeHeaders(ctx.credentials) })
     const r = res.data?.Result ?? {}
     // Breeze margin payload keys vary — probe the common ones
     const cash = num(r.margin_available) ?? num(r.net_available_cash) ?? num(r.available_cash) ?? num(r.marginavailable) ?? 0
@@ -217,7 +222,7 @@ const breezeAdapter: BrokerAdapter = {
 
   async getHoldings(ctx) {
     if (!ctx.credentials?.sessionToken) return []
-    const res = await liveFetch<{ Status?: number; Result?: Record<string, unknown>[] }>(`${BASE}/portfolio/holdings`, { headers: breezeHeaders(ctx.credentials), timeoutMs: 6000 })
+    const res = await lf<{ Status?: number; Result?: Record<string, unknown>[] }>(ctx, 'holdings', `${BASE}/portfolio/holdings`, { headers: breezeHeaders(ctx.credentials), timeoutMs: 6000 })
     const arr = Array.isArray(res.data?.Result) ? res.data!.Result : []
     return arr.map(h => ({
       symbol: String(h.stock_code ?? ''),
@@ -239,7 +244,7 @@ const breezeAdapter: BrokerAdapter = {
       quantity: String(params.qty),
       price: String(params.price),
     })
-    const res = await liveFetch<{ Status?: number; Result?: Record<string, unknown> }>(`${BASE}/customer/margins?${q}`, { headers: breezeHeaders(ctx.credentials), timeoutMs: 5000 })
+    const res = await lf<{ Status?: number; Result?: Record<string, unknown> }>(ctx, 'margin-calc', `${BASE}/customer/margins?${q}`, { headers: breezeHeaders(ctx.credentials), timeoutMs: 5000 })
     const r = res.data?.Result ?? {}
     if (!res.ok || !r || Array.isArray(r)) return { required: 0, detail: 'margin API unreachable' }
     return {
@@ -264,7 +269,7 @@ const breezeAdapter: BrokerAdapter = {
     })
     if (expiry) params.set('expiry_date', expiry)
     if (isOpt) { params.set('right', right); params.set('strike_price', String(Math.round(Number(strike)))) }
-    const res = await liveFetch<{ Status?: number; Result?: Record<string, unknown>[] }>(`${BASE}/quotes?${params}`, { headers: breezeHeaders(ctx.credentials), timeoutMs: 3000 })
+    const res = await lf<{ Status?: number; Result?: Record<string, unknown>[] }>(ctx, 'quote', `${BASE}/quotes?${params}`, { headers: breezeHeaders(ctx.credentials), timeoutMs: 3000 })
     const row = Array.isArray(res.data?.Result) ? res.data.Result[0] : null
     if (!row) return { symbol: token, ltp: 0 }
     return {

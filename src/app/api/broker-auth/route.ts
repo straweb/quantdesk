@@ -19,6 +19,33 @@ function mask(v?: string): string | null {
   return v.length <= 8 ? '••••' : `${v.slice(0, 4)}••••${v.slice(-4)}`
 }
 
+/** masked per-broker credential fields for the Edit-Account dialog
+ *  (values never leave the server unmasked; blank input = unchanged) */
+function credFieldsFor(brokerType: string, creds: Record<string, string> | null) {
+  const m = (k: string) => mask(creds?.[k] ?? undefined)
+  switch (brokerType) {
+    case 'ICICI_BREEZE':
+      return [
+        { key: 'apiKey', label: 'API key (Breeze AppKey)', masked: m('apiKey'), sample: 'e.g. Naa1B2c3D4e5F6g7H8i9J0k1L2m3N4o5' },
+        { key: 'apiSecret', label: 'API secret (checksum input)', masked: m('apiSecret'), sample: 'e.g. p9Q8r7S6t5U4v3W2x1Y0z9A8b7C6d5E4' },
+      ]
+    case 'DHAN':
+      return [
+        { key: 'clientId', label: 'Dhan Client ID', masked: m('clientId'), sample: 'e.g. 1100123456' },
+        { key: 'appId', label: 'Partner ID (optional)', masked: m('appId'), sample: 'partner apps only — enables the consent flow' },
+        { key: 'appSecret', label: 'Partner Secret (optional)', masked: m('appSecret'), sample: 'partner apps only — pairs with Partner ID' },
+      ]
+    case 'SHOONYA':
+      return [
+        { key: 'userId', label: 'User ID (login id)', masked: m('userId'), sample: 'e.g. FA12345' },
+        { key: 'apiKey', label: 'API key (app client_id)', masked: m('apiKey'), sample: 'e.g. 68f3a1b9c2d4e5f6a7b8c9d0e1f2a3b4' },
+        { key: 'apiSecret', label: 'API secret', masked: m('apiSecret'), sample: 'e.g. 9d8c7b6a5f4e3d2c1b0a998877665544' },
+      ]
+    default:
+      return []
+  }
+}
+
 export async function GET(req: NextRequest) {
   const auth = requireAuth(req)
   if (auth) return auth
@@ -39,6 +66,7 @@ export async function GET(req: NextRequest) {
     userId: creds?.userId ?? acc.clientId ?? null,
     liveCapable: adapter?.isLiveCapable() ?? false,
     mode: adapter?.modeLabel(creds) ?? 'sandbox',
+    credFields: credFieldsFor(acc.brokerType, creds),
     ...flow,
   })
 }
@@ -68,6 +96,15 @@ export async function POST(req: NextRequest) {
         where: { id: acc.id },
         data: { credentialsEnc: encryptJson(r.credentials) },
       })
+      // session just went live — pull the REAL broker funds immediately so
+      // capital sizing (% of available cash) has the actual balance
+      if (acc.brokerType !== 'SIMFEED') {
+        try {
+          const { syncAccountFunds } = await import('@/lib/services/funds-sync')
+          const f = await syncAccountFunds(acc.id)
+          if (f.ok) r.message += ` · funds ₹${f.cash?.toLocaleString('en-IN')}`
+        } catch { /* funds pull is best-effort */ }
+      }
     }
     return NextResponse.json(r)
   }

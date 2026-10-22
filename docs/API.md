@@ -22,19 +22,27 @@ Two surfaces:
 | Method & path | Description |
 |---|---|
 | `GET /api/accounts` | all accounts + capital state (mode, base/pct, available cash, usable) |
-| `POST /api/accounts` | create account (per-broker credential fields, encrypted at rest) |
-| `GET/PATCH/DELETE /api/accounts/[id]` | read / update (label, `isActive` routing, credentials, `capitalBase`, `capitalPct`, capital+mode) / delete |
+| `POST /api/accounts` | create account (per-broker credential fields, encrypted at rest; live brokers: blank initial capital = 100 % of broker available cash) |
+| `GET/PATCH/DELETE /api/accounts/[id]` | read / update (label, `isActive` routing, `credentials` (replace) or `credentialsMerge` (partial — blank keys kept), `capitalBase`, `capitalPct`, capital+mode) / delete |
 | `GET /api/funds` | aggregated per-account funds ledgers |
+| `POST /api/funds` | `{accountId?}` — pull REAL broker funds now (one account or every active live account; also runs automatically every 45 s) |
 | `GET /api/portfolio` | live holdings + live marks + open positions |
 | `GET /api/margin` | per-account broker margin vs usable (sandbox estimate fallback) |
 
 ### Broker sessions & diagnostics
 
+Session flows (per broker, every attempt logged to console + `broker_logs`):
+- **ICICI Breeze** — open the apiuser login URL → redirect `?apisession=` → paste it; the terminal exchanges it at `customerdetails` exactly like the Breeze SDK (GET with a JSON body `{SessionToken, AppKey}` — raw `node:https`, since Node fetch cannot send a GET body).
+- **Dhan** — three flows: ① paste `PIN:TOTP` → `auth.dhan.co/app/generateAccessToken?dhanClientId=&pin=&totp=` returns the accessToken directly; ② partner consent (`partner/generate-consent` → `consent-login?consentId=` → paste the redirect `tokenId` → `partner/consume-consent`); ③ paste a direct JWT from web.dhan.co.
+- **Shoonya** — official OAuth `https://api.shoonya.com/OAuthlogin/authorize/oauth?client_id={client_id}` → redirect `?code=` → paste; GenAcsTok checksum families are tried in order (`{code, checksum}` on NorenWClientAPI, full jData verifiers on NorenWClientTP) and every attempt is logged. QuickAuth alternative: paste `pwd:factor2(:totp)`.
+
 | Method & path | Description |
 |---|---|
-| `GET /api/broker-auth` | per live account: auth status + flow descriptor + generated login URL |
-| `POST /api/broker-auth` | `{accountId, step:'consent'\|'complete', …}` — OAuth-style consent / session creation |
-| `GET /api/broker-logs` | per-account adapter logs |
+| `GET /api/broker-auth` | auth status + flow descriptor + login URL + masked `credFields` (samples + stored values) for the Edit dialog |
+| `POST /api/broker-auth` | `{accountId, action:'consent'\|'complete', code?}` — consent / session creation (flows above) |
+| `POST /api/broker-test` | `{accountId}` — 4-step connectivity test: credentials → adapter mode → funds ₹ → quote LTP (timed, each underlying call logged) |
+| `GET /api/broker-logs` | per-account raw call logs (every outbound broker call is tagged `[BROKER][tag]` and mirrored here) |
+| `GET /api/feed/status` | live broker feed engine status: active source, ticking state, last tick age, last error, recent log lines |
 | `GET /api/broker-orderbook` | live order book for one account |
 | `GET /api/admin/audit` | order audit trail |
 
@@ -106,7 +114,10 @@ Two surfaces:
 | `/candles` | GET | `?symbol&tf&bars` OHLCV (deterministic 3-session 1m backfill + aggregated TFs) |
 | `/ltp` · `/quote` · `/depth` | GET | batch market data |
 | `/feed-source` | GET/POST | active feed account (persisted to `db/feed-source.json`) |
+| `/feed-status` | GET | live broker feed engine: source, connected, last tick age, last error, log ring |
 | `/universe` | POST | publish symbol universe (from master sync) |
+
+**Live broker feed engine** — when the active source is a live account, the feed service polls that broker's quote APIs every second (Dhan `marketfeed/quote` batched per segment, Shoonya `GetQuote`, Breeze `/quotes`), maps master symbols via `SymbolMapping`, decrypts the account session (re-read every 60 s), and pushes ticks into the same pipeline as the sim engine (fed symbols skip the random walk). Symbol mappings re-read every 2 min; status surfaces on `/feed-status`.
 | `/tick-config` | GET/POST | tick recorder on/off + symbol list (`db/ticks/tick-recorder.json`) |
 | `/tick-sessions` | GET | recorded session DBs |
 | `/tick-sample` | GET | sample rows from a session (replay preview) |

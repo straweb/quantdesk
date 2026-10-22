@@ -38,8 +38,9 @@ Everything is persisted per **workspace**: layouts, timeframes, indicators, draw
 The `FEED LIVE <source>` chip opens a dropdown with **one row per account**:
 
 - radio — select which account's feed drives the whole terminal (one active feed source at a time; the built-in **Sim Feed** is the default);
+- **live-feed health** — when a broker account feeds the terminal, the chip carries a data dot (green = ticking, amber = stalled) and the dropdown shows the poll state (symbols fed, last tick age, last error — e.g. "no session — create it in Admin → Session");
 - **PnL** — live per-account P&L, coloured by sign;
-- **Cap** — current usable capital;
+- **Cap** — current usable capital; **click it to edit capital inline** — `% of available cash` or fixed ₹, **changeable at any time (even while connected)**; the 🎒 wallet icon pulls the **REAL broker available cash** on demand (the % base also auto-refreshes from the funds API every 45 s);
 - 🔗 / 🔗̶ **Connect / Disconnect** icon — enables or disables the account for order routing (disconnecting the currently feeding account automatically falls back to the sim feed);
 - 📡 **Feed on/off** icon — use this account as feed source or revert to sim.
 
@@ -265,8 +266,13 @@ Quick global actions live in the header of the dock: **B / S** quick tickets, **
 
 ## 11. Admin view
 
-- **Accounts** — add/remove broker accounts. Live brokers use per-broker **OAuth-style credential fields** (ICICI: api key + secret; Dhan: app id + secret + client id; Shoonya: user id + api key + secret). Sandbox (sim) accounts are created instantly.
-- **Broker sessions** — per live account, a **Session** dialog walks the consent flow: open/copy the generated login URL → paste the returned code/token → create session. Active sessions show a masked session chip and a green state. Sessions can be refreshed any time without restarting the terminal.
+- **Accounts** — add/remove broker accounts. Live brokers use per-broker **OAuth-style credential fields** (ICICI: api key + secret; Dhan: client id + optional partner id/secret; Shoonya: user id + api key + secret). Every input shows a **sample value / format hint** (e.g. Dhan client id `1100123456`, Shoonya user id `FA12345`). For live brokers, leave **Initial Capital blank** and the account starts with **100 % of the REAL broker available cash** (pulled from the funds API; changeable anytime).
+- **Edit accounts** — the ✏️ button on a live account row opens the Edit dialog: user id / client id / api key / secret can be **modified at any time** (stored values show masked; leave a field empty to keep it — secrets never need retyping).
+- **Broker sessions** — per live account, a **Session** dialog walks the consent flow: open/copy the generated login URL → paste the returned code/token → create session. Active sessions show a masked session chip and a green state. Flows per broker:
+  - **ICICI Breeze** — paste the redirect `apisession`; the exchange uses the exact Breeze-SDK call (GET with body `{SessionToken, AppKey}`).
+  - **Dhan** — paste **`PIN:TOTP`** (e.g. `123456:987654`) for direct token generation, or use the partner consent flow (Generate consent → consent-login URL → paste the redirect `tokenId`), or paste a direct JWT from web.dhan.co.
+  - **Shoonya** — official OAuth URL (`api.shoonya.com/OAuthlogin/authorize/oauth?client_id=…`) → paste the redirect `code`; checksum variants are tried automatically. QuickAuth alternative: paste **`pwd:factor2`** (optionally `:totp`), e.g. `mypass:ABCD1` or `mypass:ABCD1:987654`.
+- **Broker Diagnostics** — the debugging panel: pick an account → **Test connection** runs a timed 4-step report (credentials → adapter mode → funds ₹ → quote LTP) and the raw **broker log stream** below shows every outbound call (`[BROKER][tag] METHOD url → status (ms)`), so a failing integration is visible line by line.
 - **Copy-trade routing** — the master/executes matrix: which account receives fan-out orders (order-routing toggle mirrors the capital chips).
 - **Capital config** — per account: initial capital, source (fixed ₹ / % of available cash), sizing mode, reset.
 - **Tick Data Recorder** — RECORDING switch, symbol chips (default NIFTY + SENSEX), current session rows and the list of recorded session DBs (replay data source).

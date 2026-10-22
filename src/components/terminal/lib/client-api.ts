@@ -201,6 +201,8 @@ export const api = {
 
   feedSource: () =>
     fetchJson<{ source: string; sources: { id: string; label: string; brokerType: string | null }[] }>('/api/feed'),
+  feedStatus: () =>
+    fetchJson<FeedStatusResp>('/api/feed/status'),
   setFeedSource: (source: string) =>
     fetch('/api/feed', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source }) }).then(r => j<{ ok: boolean; source: string }>(r)),
 
@@ -232,6 +234,10 @@ export const api = {
   positions: () => fetch('/api/positions').then(r => j<{ positions: AggPosition[]; bySymbol: { symbol: string; netQty: number; avgPrice: number; ltp: number; unrealizedPnl: number; accounts: number }[]; totals: { unrealizedPnl: number; realizedPnl: number; openPositions: number } }>(r)),
   trades: () => fetch('/api/trades').then(r => j<{ trades: AggTrade[]; totals: { charges: number; realized: number } }>(r)),
   funds: () => fetch('/api/funds').then(r => j<{ funds: FundRow[] }>(r)),
+  syncFunds: (accountId?: string) =>
+    fetch('/api/funds', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(accountId ? { accountId } : {}) }).then(r => j<{ ok: boolean; cash?: number; message?: string; results?: { accountId: string; label: string; ok: boolean; cash?: number; message: string }[] }>(r)),
+  brokerTest: (accountId: string) =>
+    fetch('/api/broker-test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accountId }) }).then(r => j<BrokerTestResp>(r)),
   brokerLogs: (accountId: string) => fetch(`/api/broker-logs?accountId=${accountId}`).then(r => j<{ logs: { id: number; ts: string; level: string; message: string }[] }>(r)),
   audit: () => fetch('/api/admin/audit').then(r => j<{ audits: { id: string; ts: string; source: string; action: string; masterSymbol: string; side: string; qty: number; status: string; message: string | null; legsJson: string | null }[] }>(r)),
 
@@ -353,6 +359,33 @@ export interface BrokerAuthStatus {
   loginUrl: string | null
   instructions: string[]
   fieldsNeeded: string[]
+  credFields: { key: string; label: string; masked: string | null; sample: string }[]
+}
+
+export interface BrokerTestResp {
+  ok: boolean
+  accountId: string
+  label: string
+  brokerType: string
+  steps: { step: string; ok: boolean; ms: number; detail: string }[]
+  hint: string
+}
+
+export interface FeedStatusResp {
+  source: string
+  brokerType: string | null
+  connected: boolean
+  lastTickTs: number | null
+  lastError: string | null
+  errorTs: number | null
+  symbols: number
+  polls: number
+  errors: number
+  startedAt: number
+  log: string[]
+  sessionPresent: boolean
+  sourceIsLive: boolean
+  fresh: boolean
 }
 
 export interface GttRuleRow {

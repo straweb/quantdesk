@@ -3,13 +3,14 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { KeyRound, RefreshCw, Trash2, Download, Radio, ShieldAlert, ShieldCheck, X } from 'lucide-react'
+import { KeyRound, RefreshCw, Trash2, Download, Radio, ShieldAlert, ShieldCheck, X, Pencil, Stethoscope } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { api, fmtInr, fmtDateTime } from '../lib/client-api'
+import type { BrokerTestResp } from '../lib/client-api'
 import { BROKER_META, CAPITAL_MODES } from '@/lib/types'
 import type { BrokerType, CapitalMode } from '@/lib/types'
 
@@ -17,6 +18,7 @@ export function AdminView() {
   return (
     <div className="h-full overflow-y-auto p-4 space-y-4 max-w-6xl mx-auto">
       <AccountsManager />
+      <BrokerDiagnostics />
       <div className="grid lg:grid-cols-2 gap-4">
         <CopyTradeManager />
         <MasterContracts />
@@ -24,6 +26,89 @@ export function AdminView() {
       <TickRecorder />
       <ReplayManager />
       <AuditTrail />
+    </div>
+  )
+}
+
+// ---------------- Broker diagnostics ----------------
+// The debugging surface: run a 4-step live test (credentials → mode →
+// funds → quote) against any account and watch its raw broker_logs
+// (every outbound call is tagged and mirrored there).
+function BrokerDiagnostics() {
+  const qc = useQueryClient()
+  const { data } = useQuery({ queryKey: ['accounts'], queryFn: () => api.accounts() })
+  const accounts = (data?.accounts ?? []).filter(a => a.brokerType !== 'SIMFEED')
+  const [sel, setSel] = useState<string>('')
+  const accountId = sel || accounts[0]?.id || ''
+  const [testing, setTesting] = useState(false)
+  const [test, setTest] = useState<BrokerTestResp | null>(null)
+  const { data: logs, refetch } = useQuery({
+    queryKey: ['broker-logs', accountId],
+    queryFn: () => api.brokerLogs(accountId),
+    enabled: !!accountId,
+    refetchInterval: 5000,
+  })
+
+  const runTest = async () => {
+    if (!accountId) return
+    setTesting(true)
+    try {
+      const r = await api.brokerTest(accountId)
+      setTest(r)
+      r.ok ? toast.success(r.hint) : toast.error(r.hint)
+      qc.invalidateQueries({ queryKey: ['broker-logs', accountId] })
+    } catch (e) { toast.error(e instanceof Error ? e.message : 'Test failed') }
+    setTesting(false)
+  }
+
+  return (
+    <div className="rounded-lg border border-border bg-card">
+      <div className="flex flex-wrap items-center gap-3 px-4 py-3 border-b border-border">
+        <div className="min-w-[220px]">
+          <h3 className="text-sm font-semibold flex items-center gap-1.5"><Stethoscope className="h-4 w-4 text-[#4dd0e1]" />Broker Diagnostics</h3>
+          <p className="text-[11px] text-muted-foreground">Why is live data / auth failing? Test the exact calls + read the per-call logs.</p>
+        </div>
+        <Select value={accountId} onValueChange={v => { setSel(v); setTest(null) }}>
+          <SelectTrigger className="h-8 w-[220px] text-xs"><SelectValue placeholder="account" /></SelectTrigger>
+          <SelectContent>
+            {accounts.map(a => <SelectItem key={a.id} value={a.id} className="text-xs">{a.label} · {a.brokerType}</SelectItem>)}
+          </SelectContent>
+        </Select>
+        <Button size="sm" className="text-xs h-8" disabled={!accountId || testing} onClick={runTest}>
+          {testing ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Stethoscope className="h-3.5 w-3.5" />}
+          Test connection
+        </Button>
+        <Button size="sm" variant="secondary" className="text-xs h-8" disabled={!accountId} onClick={() => refetch()}>
+          <RefreshCw className="h-3.5 w-3.5" /> Refresh logs
+        </Button>
+      </div>
+      {test && (
+        <div className="px-4 py-2 space-y-1 border-b border-border">
+          {test.steps.map(s => (
+            <div key={s.step} className="flex items-start gap-2 text-[10px]">
+              <span className={`px-1 rounded font-bold ${s.ok ? 'bg-[#00c896]/15 text-[#00c896]' : 'bg-[#ff4d5e]/15 text-[#ff4d5e]'}`}>{s.ok ? 'OK' : 'FAIL'}</span>
+              <span className="font-bold w-20 shrink-0">{s.step}</span>
+              <span className="tabular text-muted-foreground w-14 shrink-0">{s.ms}ms</span>
+              <span className="text-muted-foreground min-w-0 flex-1">{s.detail}</span>
+            </div>
+          ))}
+          <div className="text-[9px] text-muted-foreground pt-1">{test.hint}</div>
+        </div>
+      )}
+      <div className="max-h-56 overflow-y-auto divide-y divide-border/50">
+        {(logs?.logs ?? []).map(l => (
+          <div key={l.id} className="px-4 py-1 flex items-start gap-2 text-[10px] tabular">
+            <span className="text-muted-foreground shrink-0">{l.ts.slice(11, 19)}</span>
+            <span className={`shrink-0 font-bold ${l.level === 'ERROR' ? 'text-[#ff4d5e]' : l.level === 'WARN' ? 'text-[#e0a63f]' : 'text-muted-foreground'}`}>{l.level}</span>
+            <span className="min-w-0 flex-1 break-all">{l.message}</span>
+          </div>
+        ))}
+        {(logs?.logs ?? []).length === 0 && (
+          <div className="px-4 py-4 text-center text-[11px] text-muted-foreground">
+            No broker calls logged yet for this account — create a session or run the test.
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -248,23 +333,29 @@ function AccountsManager() {
 
   const accounts = data?.accounts ?? []
 
+  const isLive = form.brokerType !== 'SIMFEED'
+
   const create = async () => {
     try {
       const credentials: Record<string, string> = {}
       for (const [k, v] of Object.entries(oauthFieldsFor(form.brokerType, form))) {
         if (v?.trim()) credentials[k] = v.trim()
       }
+      // live brokers: blank initial capital = 100% of the REAL broker
+      // available cash (pulled from the funds API) — the round-10 default
+      const capBlank = !form.initialCapital.trim()
       await api.createAccount({
         label: form.label,
         brokerType: form.brokerType,
         clientId: form.clientId || null,
-        initialCapital: Number(form.initialCapital),
+        initialCapital: capBlank ? 0 : Number(form.initialCapital),
         mode: form.mode,
+        ...(isLive && capBlank ? { capitalBase: 'AVAILABLE_CASH_PCT', capitalPct: 100 } : {}),
         credentials: Object.keys(credentials).length ? credentials : undefined,
       })
-      toast.success(`Account "${form.label}" added`)
+      toast.success(`Account "${form.label}" added${isLive && capBlank ? ' — capital = 100% of broker available cash (funds sync every 45s)' : ''}`)
       setDlgOpen(false)
-      setForm({ ...form, label: '', clientId: '', apiKey: '', secret: '', extra: '' })
+      setForm({ ...form, label: '', clientId: '', apiKey: '', secret: '', extra: '', initialCapital: isLive ? '' : '500000' })
       qc.invalidateQueries({ queryKey: ['accounts'] })
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed')
@@ -307,12 +398,12 @@ function AccountsManager() {
                   </SelectContent>
                 </Select>
               </Field>
-              <Field label="Client ID">
-                <Input value={form.clientId} onChange={e => setForm({ ...form, clientId: e.target.value })} className="h-8" />
+              <Field label="Client ID" hint={clientIdHint(form.brokerType)}>
+                <Input value={form.clientId} onChange={e => setForm({ ...form, clientId: e.target.value })} className="h-8" placeholder={clientIdSample(form.brokerType)} />
               </Field>
               <div className="grid grid-cols-2 gap-3">
-                <Field label="Initial Capital ₹">
-                  <Input type="number" value={form.initialCapital} onChange={e => setForm({ ...form, initialCapital: e.target.value })} className="h-8 tabular" />
+                <Field label="Initial Capital ₹" hint={isLive ? 'Leave BLANK for live brokers — capital becomes 100% of the REAL available cash pulled from the funds API (changeable anytime).' : 'Fixed rupee starting capital for sizing.'}>
+                  <Input type="number" value={form.initialCapital} onChange={e => setForm({ ...form, initialCapital: e.target.value })} className="h-8 tabular" placeholder={isLive ? 'blank = 100% of broker cash' : '500000'} />
                 </Field>
                 <Field label="Capital Sizing Mode">
                   <Select value={form.mode} onValueChange={v => setForm({ ...form, mode: v as CapitalMode })}>
@@ -323,17 +414,17 @@ function AccountsManager() {
                   </Select>
                 </Field>
               </div>
-              <Field label={credFieldLabel(form.brokerType)} hint="Encrypted at rest (AES-256-GCM). OAuth session tokens are created per-day via the Session button after adding.">
-                <Input value={form.apiKey} onChange={e => setForm({ ...form, apiKey: e.target.value })} className="h-8" />
+              <Field label={credFieldLabel(form.brokerType)} hint={`${credFieldSample(form.brokerType)} · Encrypted at rest (AES-256-GCM). OAuth session tokens are created per-day via the Session button after adding.`}>
+                <Input value={form.apiKey} onChange={e => setForm({ ...form, apiKey: e.target.value })} className="h-8" placeholder={credFieldSample(form.brokerType)} />
               </Field>
               {form.brokerType !== 'SIMFEED' && (
-                <Field label={secretFieldLabel(form.brokerType)}>
-                  <Input type="password" value={form.secret} onChange={e => setForm({ ...form, secret: e.target.value })} className="h-8" />
+                <Field label={secretFieldLabel(form.brokerType)} hint={secretFieldSample(form.brokerType)}>
+                  <Input type="password" value={form.secret} onChange={e => setForm({ ...form, secret: e.target.value })} className="h-8" placeholder={secretFieldSample(form.brokerType)} />
                 </Field>
               )}
               {extraFieldLabel(form.brokerType) && (
-                <Field label={extraFieldLabel(form.brokerType)!}>
-                  <Input value={form.extra} onChange={e => setForm({ ...form, extra: e.target.value })} className="h-8" />
+                <Field label={extraFieldLabel(form.brokerType)!} hint={extraFieldSample(form.brokerType)}>
+                  <Input value={form.extra} onChange={e => setForm({ ...form, extra: e.target.value })} className="h-8" placeholder={extraFieldSample(form.brokerType)} />
                 </Field>
               )}
               <Button className="h-8 text-xs" onClick={create} disabled={!form.label}>Add Account</Button>
@@ -376,6 +467,7 @@ function AccountsManager() {
             </div>
             <div className="flex items-center gap-1 ml-auto">
               <ModeSelect id={a.id} current={a.modeLabel} />
+              {a.brokerType !== 'SIMFEED' && <EditAccountDialog accountId={a.id} brokerType={a.brokerType} />}
               {a.brokerType !== 'SIMFEED' && <SessionDialog accountId={a.id} label={a.label} brokerType={a.brokerType} />}
               <Button variant="ghost" size="sm" className="h-7 px-1.5" title="Delete"
                 onClick={() => remove(a.id, a.label)}>
@@ -404,13 +496,121 @@ function oauthFieldsFor(b: BrokerType, form: { apiKey: string; secret: string; e
   }
 }
 function credFieldLabel(b: BrokerType) {
-  return b === 'DHAN' ? 'App ID (API key)' : b === 'SHOONYA' ? 'API key (app client_id)' : b === 'ICICI_BREEZE' ? 'API key (Breeze AppKey)' : 'API Key'
+  return b === 'DHAN' ? 'Partner ID (optional)' : b === 'SHOONYA' ? 'API key (app client_id)' : b === 'ICICI_BREEZE' ? 'API key (Breeze AppKey)' : 'API Key'
 }
 function secretFieldLabel(b: BrokerType) {
-  return b === 'DHAN' ? 'App Secret' : b === 'SHOONYA' ? 'API Secret' : b === 'ICICI_BREEZE' ? 'API Secret' : 'Secret'
+  return b === 'DHAN' ? 'Partner Secret (optional)' : b === 'SHOONYA' ? 'API Secret' : b === 'ICICI_BREEZE' ? 'API Secret' : 'Secret'
 }
 function extraFieldLabel(b: BrokerType): string | null {
   return b === 'DHAN' ? 'Dhan Client ID' : b === 'SHOONYA' ? 'User ID (login id)' : null
+}
+
+// ---- sample-code hints: every input shows a realistic example ----
+function clientIdHint(b: BrokerType): string {
+  if (b === 'DHAN') return 'Your Dhan trading client id — used for orders + funds. Example: 1100123456'
+  if (b === 'SHOONYA') return 'Optional here — the User ID field below is what Shoonya auth needs.'
+  if (b === 'ICICI_BREEZE') return 'Optional label — Breeze auth uses the API key + secret only.'
+  return 'Any label id for your own reference.'
+}
+function clientIdSample(b: BrokerType): string {
+  if (b === 'DHAN') return 'e.g. 1100123456'
+  if (b === 'SHOONYA') return 'e.g. FA12345 (or leave blank)'
+  return 'e.g. desk-01'
+}
+function credFieldSample(b: BrokerType): string {
+  if (b === 'DHAN') return 'Optional — partner apps only, e.g. 2ab1c3d4-56e7-89fa-b0c1-d2e3f4a5b6c7 (enables the consent flow)'
+  if (b === 'SHOONYA') return 'App client_id from Prism → Apps, e.g. 68f3a1b9c2d4e5f6a7b8c9d0e1f2a3b4'
+  if (b === 'ICICI_BREEZE') return 'Breeze AppKey from ICICI Direct API portal, e.g. Naa1B2c3D4e5F6g7H8i9J0k1L2m3N4o5'
+  return 'optional for sim accounts'
+}
+function secretFieldSample(b: BrokerType): string {
+  if (b === 'DHAN') return 'Optional — partner secret, e.g. ey9x8w7v6u5t4s3r2q1p0o9n8m7l6k5j. No partner app? Use PIN:TOTP in the Session dialog instead'
+  if (b === 'SHOONYA') return 'App secret from Prism, e.g. 9d8c7b6a5f4e3d2c1b0a998877665544'
+  if (b === 'ICICI_BREEZE') return 'REQUIRED — customerdetails checksum input, e.g. p9Q8r7S6t5U4v3W2x1Y0z9A8b7C6d5E4'
+  return 'optional'
+}
+function extraFieldSample(b: BrokerType): string | undefined {
+  if (b === 'DHAN') return 'e.g. 1100123456'
+  if (b === 'SHOONYA') return 'e.g. FA12345'
+  return undefined
+}
+
+// ---------------- Edit account (credentials + ids) ----------------
+// Round-10: modify user id / client id / api key / secret at any time —
+// masked placeholders show what is stored; only filled fields change
+// (PATCH credentialsMerge), so secrets never need retyping.
+function EditAccountDialog({ accountId, brokerType }: { accountId: string; brokerType: string }) {
+  const qc = useQueryClient()
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [label, setLabel] = useState('')
+  const [clientId, setClientId] = useState('')
+  const [vals, setVals] = useState<Record<string, string>>({})
+  const { data: st } = useQuery({
+    queryKey: ['broker-auth', accountId],
+    queryFn: () => api.brokerAuthStatus(accountId),
+    enabled: open,
+  })
+
+  const save = async () => {
+    setBusy(true)
+    try {
+      const body: Record<string, unknown> = {}
+      if (label.trim()) body.label = label.trim()
+      if (clientId.trim()) body.clientId = clientId.trim()
+      const merge: Record<string, string> = {}
+      for (const [k, v] of Object.entries(vals)) if (v.trim()) merge[k] = v.trim()
+      if (Object.keys(merge).length) body.credentialsMerge = merge
+      if (!Object.keys(body).length) { toast.info('Nothing changed'); setBusy(false); return }
+      await api.patchAccount(accountId, body)
+      toast.success('Account updated')
+      setVals({})
+      setLabel(''); setClientId('')
+      setOpen(false)
+      qc.invalidateQueries({ queryKey: ['accounts'] })
+      qc.invalidateQueries({ queryKey: ['broker-auth', accountId] })
+    } catch (e) { toast.error(e instanceof Error ? e.message : 'Update failed') }
+    setBusy(false)
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button variant="ghost" size="sm" className="h-7 px-1.5" title="Edit account details (user id / client id / api key / secret)">
+          <Pencil className="h-3.5 w-3.5 text-muted-foreground" />
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="bg-popover max-w-lg">
+        <DialogHeader><DialogTitle>Edit account — {st?.label ?? ''}</DialogTitle></DialogHeader>
+        <div className="space-y-3 text-xs">
+          <div className="text-[10px] text-muted-foreground">
+            Stored values show masked. Leave a field EMPTY to keep the current value — secrets never need retyping.
+          </div>
+          <Field label="Label">
+            <Input value={label} onChange={e => setLabel(e.target.value)} className="h-8" placeholder={st?.label ?? 'account label'} />
+          </Field>
+          {st?.credFields.map(f => (
+            <Field key={f.key} label={f.label} hint={`${f.sample} · stored: ${f.masked ?? '—'}`}>
+              <Input
+                value={vals[f.key] ?? ''}
+                onChange={e => setVals(v => ({ ...v, [f.key]: e.target.value }))}
+                className="h-8"
+                type={/secret/i.test(f.key) ? 'password' : 'text'}
+                placeholder={f.masked ? `${f.masked} (unchanged)` : f.sample}
+              />
+            </Field>
+          ))}
+          {st && !st.credFields.length && (
+            <div className="text-[10px] text-muted-foreground">Sim account — no broker credentials to edit.</div>
+          )}
+          <div className="text-[10px] text-muted-foreground">
+            After changing credentials, recreate the day session via the Session button, then press “Test connection” in Broker Diagnostics.
+          </div>
+          <Button className="h-8 text-xs" onClick={save} disabled={busy}>{busy ? 'Saving…' : 'Save changes'}</Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 // ---------------- Broker session (OAuth) dialog ----------------
@@ -474,7 +674,7 @@ function SessionDialog({ accountId, label, brokerType }: { accountId: string; la
           {isDhan && (
             <Button size="sm" variant="secondary" className="h-7 text-[10px]" disabled={busy}
               onClick={() => run(() => api.brokerAuthConsent(accountId))}>
-              1 · Generate consent (app_id + app_secret)
+              1 · Generate consent (Dhan client id)
             </Button>
           )}
           <div className="space-y-1">
@@ -485,7 +685,11 @@ function SessionDialog({ accountId, label, brokerType }: { accountId: string; la
                 : 'Paste the session token'}
             </div>
             <div className="flex gap-1.5">
-              <Input value={code} onChange={e => setCode(e.target.value.trim())} placeholder="code / token…" className="h-8 text-[11px]" />
+              <Input value={code} onChange={e => setCode(e.target.value.trim())} placeholder={
+                isIcici ? 'e.g. 48293 — from redirect ?apisession='
+                  : isDhan ? 'PIN:TOTP e.g. 123456:987654 · tokenId from redirect · or the full JWT'
+                  : isShoonya ? 'e.g. a1b2c3d4… — from redirect ?code=  ·  QuickAuth: mypass:ABCD1234E(:totp)'
+                  : 'code / token…'} className="h-8 text-[11px]" />
               <Button size="sm" className="h-8 text-[11px]" disabled={busy || !code}
                 onClick={() => run(() => api.brokerAuthComplete(accountId, code))}>
                 Create session
@@ -495,7 +699,8 @@ function SessionDialog({ accountId, label, brokerType }: { accountId: string; la
           {isShoonya && (
             <div className="border-t border-border pt-2 text-[10px] text-muted-foreground">
               Direct QuickAuth (no browser): save the account with User ID + API secret, then paste
-              <b> pwd:factor2 </b>(password:PAN/DOB, optionally <b>:totp</b>) as the code above — e.g. <code>mypass:ABCD1</code>.
+              <b> pwd:factor2 </b>(password:PAN/DOB, optionally <b>:totp</b>) as the code above — e.g. <code>mypass:ABCD1</code> or <code>mypass:ABCD1:987654</code>.
+              The OAuth code flow tries sha256 verifier variants automatically and logs every attempt.
             </div>
           )}
         </div>

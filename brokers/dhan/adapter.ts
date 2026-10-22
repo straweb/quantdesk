@@ -40,6 +40,11 @@ function mapProduct(p: 'MIS' | 'CNC' | 'NRML') { return p === 'CNC' ? 'CNC' : p 
 function mapOrderType(t: string) { return t === 'MARKET' ? 'MARKET' : t === 'LIMIT' ? 'LIMIT' : t === 'SL' ? 'STOP_LOSS' : 'STOP_LOSS_MARKET' }
 function mapSegment(exchange: string) { return exchange === 'NFO' ? 'NSE_FNO' : exchange === 'BSE' ? 'BSE_EQ' : 'NSE_EQ' }
 
+/** tagged live fetch — every outbound Dhan call logs [DHAN][tag] with status + latency */
+function lf<T>(ctx: LegContext, tag: string, url: string, init: RequestInit & { timeoutMs?: number } = {}) {
+  return liveFetch<T>(url, { ...init, callTag: { broker: 'DHAN', accountId: ctx.accountId, tag } })
+}
+
 function livePayload(ctx: LegContext) {
   const units = ctx.order.qty * ctx.symbolMap.lotSize
   return {
@@ -102,7 +107,7 @@ const dhanAdapter: BrokerAdapter = {
     const units = ctx.order.qty * ctx.symbolMap.lotSize
     if (ctx.credentials?.accessToken) {
       try {
-        const res = await liveFetch<{ orderId?: string; remarks?: string; errorMessage?: string; errorCode?: string }>(`${BASE}/orders`, {
+        const res = await lf<{ orderId?: string; remarks?: string; errorMessage?: string; errorCode?: string }>(ctx, 'place-order', `${BASE}/orders`, {
           method: 'POST',
           headers: headers(ctx.credentials),
           body: JSON.stringify(livePayload(ctx)),
@@ -141,7 +146,7 @@ const dhanAdapter: BrokerAdapter = {
     if (patch.limitPrice != null) payload.price = Number(patch.limitPrice.toFixed(2))
     if (patch.triggerPrice != null) payload.triggerPrice = Number(patch.triggerPrice.toFixed(2))
     if (patch.orderType) payload.orderType = mapOrderType(patch.orderType)
-    const res = await liveFetch<{ orderId?: string; errorMessage?: string }>(`${BASE}/orders/${brokerOrderId}`, {
+    const res = await lf<{ orderId?: string; errorMessage?: string }>(ctx, 'modify-order', `${BASE}/orders/${brokerOrderId}`, {
       method: 'PUT', headers: headers(ctx.credentials), body: JSON.stringify(payload),
     })
     const ok = res.ok && !!res.data?.orderId
@@ -151,7 +156,7 @@ const dhanAdapter: BrokerAdapter = {
 
   async cancelOrder(ctx, brokerOrderId) {
     if (ctx.credentials?.accessToken) {
-      const res = await liveFetch<unknown>(`${BASE}/orders/${brokerOrderId}`, {
+      const res = await lf<unknown>(ctx, 'cancel-order', `${BASE}/orders/${brokerOrderId}`, {
         method: 'DELETE', headers: headers(ctx.credentials), timeoutMs: 3000,
       })
       if (res.ok) return { ok: true, message: 'Live order cancelled' }
@@ -161,21 +166,21 @@ const dhanAdapter: BrokerAdapter = {
 
   async getOrderBook(ctx) {
     if (!ctx.credentials?.accessToken) return []
-    const res = await liveFetch<Record<string, unknown>[]>(`${BASE}/orders`, { headers: headers(ctx.credentials) })
+    const res = await lf<Record<string, unknown>[]>(ctx, 'order-book', `${BASE}/orders`, { headers: headers(ctx.credentials) })
     if (!res.ok || !Array.isArray(res.data)) return []
     return res.data.map(toBookRow)
   },
 
   async getOrderStatus(ctx, brokerOrderId) {
     if (!ctx.credentials?.accessToken) return null
-    const res = await liveFetch<Record<string, unknown>>(`${BASE}/orders/${brokerOrderId}`, { headers: headers(ctx.credentials) })
+    const res = await lf<Record<string, unknown>>(ctx, 'order-status', `${BASE}/orders/${brokerOrderId}`, { headers: headers(ctx.credentials) })
     if (!res.ok || !res.data?.orderId) return null
     return toBookRow(res.data)
   },
 
   async getTradeBook(ctx) {
     if (!ctx.credentials?.accessToken) return []
-    const res = await liveFetch<Record<string, unknown>[]>(`${BASE}/trades`, { headers: headers(ctx.credentials) })
+    const res = await lf<Record<string, unknown>[]>(ctx, 'trade-book', `${BASE}/trades`, { headers: headers(ctx.credentials) })
     if (!res.ok || !Array.isArray(res.data)) return []
     return res.data.map(t => ({
       tradeId: String(t.exchangeTradeId ?? t.tradeId ?? ''),
@@ -190,7 +195,7 @@ const dhanAdapter: BrokerAdapter = {
 
   async getPositionsLive(ctx) {
     if (!ctx.credentials?.accessToken) return []
-    const res = await liveFetch<Record<string, unknown>[]>(`${BASE}/positions`, { headers: headers(ctx.credentials) })
+    const res = await lf<Record<string, unknown>[]>(ctx, 'positions', `${BASE}/positions`, { headers: headers(ctx.credentials) })
     if (!res.ok || !Array.isArray(res.data)) return []
     return res.data
       .filter(p => String(p.positionType ?? 'CLOSED') !== 'CLOSED' || num(p.netQty) !== 0)
@@ -205,7 +210,7 @@ const dhanAdapter: BrokerAdapter = {
 
   async getFunds(ctx) {
     if (!ctx.credentials?.accessToken) return { cash: 0 }
-    const res = await liveFetch<Record<string, unknown>>(`${BASE}/fundlimit`, { headers: headers(ctx.credentials) })
+    const res = await lf<Record<string, unknown>>(ctx, 'funds', `${BASE}/fundlimit`, { headers: headers(ctx.credentials) })
     if (!res.ok || !res.data) return { cash: 0 }
     // NOTE: Dhan v2 spells the field "availabelBalance" (their typo) — handle both
     const cash = num(res.data.availabelBalance) ?? num(res.data.availableBalance) ?? num(res.data.withdrawableBalance) ?? 0
@@ -214,7 +219,7 @@ const dhanAdapter: BrokerAdapter = {
 
   async getHoldings(ctx) {
     if (!ctx.credentials?.accessToken) return []
-    const res = await liveFetch<{ data?: Record<string, unknown>[] }>(`${BASE}/holdings`, { headers: headers(ctx.credentials), timeoutMs: 6000 })
+    const res = await lf<{ data?: Record<string, unknown>[] }>(ctx, 'holdings', `${BASE}/holdings`, { headers: headers(ctx.credentials), timeoutMs: 6000 })
     if (!res.ok || !Array.isArray(res.data?.data)) return []
     return res.data!.data.map(h => ({
       symbol: String(h.tradingSymbol ?? h.displayName ?? h.securityId ?? ''),
@@ -230,7 +235,7 @@ const dhanAdapter: BrokerAdapter = {
   async marginCalc(ctx, params) {
     if (!ctx.credentials?.accessToken) return null
     const funds = await this.getFunds!(ctx)
-    const res = await liveFetch<Record<string, unknown>>(`${BASE}/margincalculator`, {
+    const res = await lf<Record<string, unknown>>(ctx, 'margin-calc', `${BASE}/margincalculator`, {
       method: 'POST', headers: headers(ctx.credentials), timeoutMs: 5000,
       body: JSON.stringify({
         dhanClientId: ctx.credentials.clientId ?? '',
@@ -255,7 +260,7 @@ const dhanAdapter: BrokerAdapter = {
   async getQuote(ctx, token) {
     if (!ctx.credentials?.accessToken) return { symbol: token, ltp: 0 }
     const segment = mapSegment(ctx.symbolMap.exchange)
-    const res = await liveFetch<{ data?: Record<string, Record<string, unknown>> }>(`${BASE}/marketfeed/quote`, {
+    const res = await lf<{ data?: Record<string, Record<string, unknown>> }>(ctx, 'quote', `${BASE}/marketfeed/quote`, {
       method: 'POST', headers: headers(ctx.credentials), timeoutMs: 3000,
       body: JSON.stringify({ [segment]: [token] }),
     })

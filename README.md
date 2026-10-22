@@ -56,7 +56,7 @@ Next.js instrumentation (boot):
 | **:81** | **Caddy gateway — the only public port in production** | yes | proxies `/*` → `localhost:3000`; `/?XTransformPort=N` proxies to any localhost port (browser socket.io uses `?XTransformPort=3003`) |
 | **:3000** | Next.js terminal (UI + REST API) | internal (behind Caddy) | direct access works but socket.io has no proxy path there → FEED chip shows DOWN |
 | **:3003** | market-feed **socket.io** (ticks + sync hub) | internal | browser reaches it through Caddy `?XTransformPort=3003` |
-| **:3004** | market-feed **REST** (`/health`, `/candles`, `/quote`, `/depth`, `/ltp`, `/feed-source`, `/replay-*`, `/tick-*`, `/universe`) | internal | consumed server-side by Next.js and the Python runner |
+| **:3004** | market-feed **REST** (`/health`, `/candles`, `/quote`, `/depth`, `/ltp`, `/feed-source`, `/feed-status`, `/replay-*`, `/tick-*`, `/universe`) | internal | consumed server-side by Next.js and the Python runner |
 
 In the production environment **only :81 needs to be reachable** (firewall/SG: open 81, keep 3000/3003/3004 bound to localhost).
 
@@ -77,7 +77,17 @@ Copy `.env.example` → `.env` and adjust. Full list with explanations lives the
 | `AUTO_DEBUG` | `0` | auto-bot/GTT engines | `1` = verbose fire-decision logs |
 | `NODE_ENV` | dev/`production` | Next.js | Set by scripts |
 
-Broker API keys/secrets are **not** env vars — they are entered in **Admin → Accounts**, encrypted with `TERMINAL_SECRET`, and live sessions are established per account in **Admin → Accounts → Session** (OAuth-style consent flow for ICICI Breeze / Dhan / Shoonya).
+Broker API keys/secrets are **not** env vars — they are entered in **Admin → Accounts** (each input shows a sample value; an **Edit** dialog can modify user id / client id / api key / secret at any time, stored values masked, empty = unchanged), encrypted with `TERMINAL_SECRET`, and live sessions are established per account in **Admin → Accounts → Session**:
+
+- **ICICI Breeze** — open the apiuser login URL → redirect `?apisession=` → paste it. The terminal exchanges it at `customerdetails` exactly like the Breeze SDK (GET with a raw JSON body `{SessionToken, AppKey}`).
+- **Dhan** — paste **`PIN:TOTP`** (e.g. `123456:987654`) for direct token generation (`auth.dhan.co/app/generateAccessToken?dhanClientId=…&pin=…&totp=…`), or run the partner consent flow (partner_id/secret headers → `consent-login?consentId=` → paste the redirect `tokenId`), or paste a direct JWT from web.dhan.co.
+- **Shoonya** — official OAuth URL `https://api.shoonya.com/OAuthlogin/authorize/oauth?client_id={client_id}` → redirect `?code=` → paste it; GenAcsTok checksum variants (`{code, checksum}` on NorenWClientAPI, full jData verifiers on NorenWClientTP) are tried automatically and every attempt is logged. QuickAuth alternative: paste `pwd:factor2(:totp)`.
+
+**Debugging a failing broker** — Admin → **Broker Diagnostics**: a timed 4-step test (credentials → mode → funds ₹ → quote LTP) plus the raw per-account call log. Every outbound broker call is tagged `[BROKER][tag] METHOD url → status (ms)` on the console and mirrored to the account's `broker_logs`.
+
+**Live market data from brokers** — when a live account is the active feed source, the market-feed service polls that broker's quote APIs every second (Dhan batched quotes / Shoonya GetQuote / Breeze quotes), maps symbols via the master contracts, and streams real ticks into charts/panels (fed symbols skip the sim random walk). The FEED chip shows a live data dot (green ticking / amber stalled) plus the exact stall reason (missing session, broker error) from `/api/feed/status`.
+
+**Capital from real funds** — for live brokers, leave Initial Capital blank when adding the account and it starts at **100 % of the broker's available cash**; the cash base auto-refreshes from the funds API every 45 s, can be pulled on demand (wallet icon in the FEED dropdown / “Pull funds” in a capital chip), and the % / fixed split is editable at any time — even while connected — from the FEED dropdown's cap chip.
 
 ---
 

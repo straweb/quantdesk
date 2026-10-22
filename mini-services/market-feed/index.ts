@@ -7,6 +7,7 @@ import { spawn } from 'child_process'
 // (used later for paper trading / replay). Node fallback: not supported.
 // @ts-ignore bun runtime builtin
 import { Database } from 'bun:sqlite'
+import { ensureLiveFeed, liveFedSymbols, liveFeedStatus } from './live-broker-feed'
 
 // ============================================================
 // Market Feed Mini-Service (port 3003, bun runtime)
@@ -529,6 +530,7 @@ function tickOnce() {
   const now = Date.now()
   for (const st of S.states.values()) {
     if (replayedSymbols.has(st.symbol)) continue // replay drives this symbol
+    if (liveFedSymbols().has(st.symbol)) continue // a real broker feed drives this symbol
     const shock = (Math.random() - 0.5) * 2 * st.vola
     const meanRev = (st.base - st.ltp) / st.base * 0.0006
     st.ltp = r2(st.ltp * (1 + shock + meanRev))
@@ -602,6 +604,16 @@ const httpServer = createServer((req, res) => {
   }
 
   if (url.pathname === '/health') return json(200, { ok: true, symbols: S.states.size, ts: Date.now() })
+
+  // live broker feed diagnostics — which account feeds, is it ticking, last error
+  if (url.pathname === '/feed-status') {
+    const st = liveFeedStatus()
+    return json(200, {
+      ...st,
+      sourceIsLive: st.source !== 'sim',
+      fresh: st.lastTickTs != null && Date.now() - st.lastTickTs < 15_000,
+    })
+  }
 
   // ---- tick recorder config (session live-feed backup) ----
   if (url.pathname === '/tick-config') {
@@ -834,6 +846,16 @@ if (tickCfg.enabled) openTickSession()
 
 // tick loop 250ms — streams subscribed symbols
 hot.__feedTimers.tick = setInterval(tickOnce, 250)
+
+// live broker feed engine — polls the ACTIVE broker account's quote APIs
+// and pushes real ticks into the same pipeline (skips random-walk for fed symbols)
+ensureLiveFeed({
+  S,
+  subscribed: subscribedSymbols,
+  bucketStart,
+  r2,
+  getTickCfg: () => tickCfg,
+})
 hot.__feedTimers.stream = setInterval(() => {
   const syms = subscribedSymbols()
   if (syms.size === 0) return

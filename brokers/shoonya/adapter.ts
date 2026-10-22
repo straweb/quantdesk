@@ -30,12 +30,15 @@ function norenBody(ctx: LegContext, extra: Record<string, unknown> = {}) {
   }
 }
 
-async function norenPost<T>(endpoint: string, body: Record<string, unknown>, timeoutMs = 4000) {
+/** Noren request wrapper — jKey session token + uid/actid on every call,
+ *  tagged so every outbound Shoonya call logs [SHOONYA][endpoint]. */
+async function norenPost<T>(ctx: LegContext | null, endpoint: string, body: Record<string, unknown>, timeoutMs = 4000) {
   return liveFetch<T>(`${BASE}/${endpoint}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
     timeoutMs,
+    callTag: { broker: 'SHOONYA', accountId: ctx?.accountId, tag: endpoint.toLowerCase() },
   })
 }
 
@@ -106,7 +109,7 @@ const shoonyaAdapter: BrokerAdapter = {
   async placeOrder(ctx: LegContext): Promise<OrderLegResult> {
     const units = ctx.order.qty * ctx.symbolMap.lotSize
     if (ctx.credentials?.sessionId) {
-      const res = await norenPost<{ stat?: string; norenordno?: string; emsg?: string }>('PlaceOrder', norenBody(ctx, orderPayload(ctx)))
+      const res = await norenPost<{ stat?: string; norenordno?: string; emsg?: string }>(ctx, 'PlaceOrder', norenBody(ctx, orderPayload(ctx)))
       if (res.data?.stat === 'Ok' && res.data.norenordno) {
         logBroker('SHOONYA', ctx.accountId, `LIVE order ${res.data.norenordno} ${ctx.order.side} ${units} ${norenSymbol(ctx)}`)
         return {
@@ -135,7 +138,7 @@ const shoonyaAdapter: BrokerAdapter = {
     if (patch.qty != null) p.qty = patch.qty * ctx.symbolMap.lotSize
     if (patch.limitPrice != null) p.prc = patch.limitPrice.toFixed(2)
     if (patch.triggerPrice != null) p.trgprc = patch.triggerPrice.toFixed(2)
-    const res = await norenPost<{ stat?: string; result?: string; emsg?: string }>('ModifyOrder', norenBody(ctx, { ...p, orderno: brokerOrderId }))
+    const res = await norenPost<{ stat?: string; result?: string; emsg?: string }>(ctx, 'ModifyOrder', norenBody(ctx, { ...p, orderno: brokerOrderId }))
     const ok = res.data?.stat === 'Ok'
     logBroker('SHOONYA', ctx.accountId, `LIVE modify ${brokerOrderId}: ${ok ? 'ok' : res.data?.emsg ?? res.error}`, ok ? 'INFO' : 'WARN')
     return { ok, message: ok ? 'Live order modified' : res.data?.emsg ?? res.error }
@@ -143,7 +146,7 @@ const shoonyaAdapter: BrokerAdapter = {
 
   async cancelOrder(ctx, brokerOrderId) {
     if (ctx.credentials?.sessionId) {
-      const res = await norenPost<{ stat?: string; result?: string; emsg?: string }>('CancelOrder', norenBody(ctx, { norenordno: brokerOrderId }), 3000)
+      const res = await norenPost<{ stat?: string; result?: string; emsg?: string }>(ctx, 'CancelOrder', norenBody(ctx, { norenordno: brokerOrderId }), 3000)
       if (res.data?.stat === 'Ok') return { ok: true, message: 'Live order cancelled' }
       return { ok: false, message: res.data?.emsg ?? 'cancel failed' }
     }
@@ -152,14 +155,14 @@ const shoonyaAdapter: BrokerAdapter = {
 
   async getOrderBook(ctx) {
     if (!ctx.credentials?.sessionId) return []
-    const res = await norenPost<Record<string, unknown>[] | { emsg?: string }>('OrderBook', norenBody(ctx))
+    const res = await norenPost<Record<string, unknown>[] | { emsg?: string }>(ctx, 'OrderBook', norenBody(ctx))
     const arr = Array.isArray(res.data) ? res.data : []
     return arr.map(toBookRow)
   },
 
   async getTradeBook(ctx) {
     if (!ctx.credentials?.sessionId) return []
-    const res = await norenPost<Record<string, unknown>[] | { emsg?: string }>('TradeBook', norenBody(ctx))
+    const res = await norenPost<Record<string, unknown>[] | { emsg?: string }>(ctx, 'TradeBook', norenBody(ctx))
     const arr = Array.isArray(res.data) ? res.data : []
     return arr.map(t => ({
       tradeId: String(t.tradeid ?? t.exchange_time ?? ''),
@@ -174,7 +177,7 @@ const shoonyaAdapter: BrokerAdapter = {
 
   async getPositionsLive(ctx) {
     if (!ctx.credentials?.sessionId) return []
-    const res = await norenPost<Record<string, unknown>[] | { emsg?: string }>('PositionBook', norenBody(ctx))
+    const res = await norenPost<Record<string, unknown>[] | { emsg?: string }>(ctx, 'PositionBook', norenBody(ctx))
     const arr = Array.isArray(res.data) ? res.data : []
     return arr
       .filter(p => num(p.netqty) !== 0)
@@ -190,7 +193,7 @@ const shoonyaAdapter: BrokerAdapter = {
 
   async getFunds(ctx) {
     if (!ctx.credentials?.sessionId) return { cash: 0 }
-    const res = await norenPost<Record<string, unknown> | { emsg?: string }>('Limits', norenBody(ctx))
+    const res = await norenPost<Record<string, unknown> | { emsg?: string }>(ctx, 'Limits', norenBody(ctx))
     const d = (res.data && !Array.isArray(res.data) ? res.data : {}) as Record<string, unknown>
     const cash = num(d.cash) ?? 0
     return { cash, available: num(d.marginavailable) ?? cash, utilized: num(d.marginused) ?? 0 }
@@ -198,7 +201,7 @@ const shoonyaAdapter: BrokerAdapter = {
 
   async getHoldings(ctx) {
     if (!ctx.credentials?.sessionId) return []
-    const res = await norenPost<Record<string, unknown>[] | { emsg?: string }>('Holdings', norenBody(ctx), 6000)
+    const res = await norenPost<Record<string, unknown>[] | { emsg?: string }>(ctx, 'Holdings', norenBody(ctx), 6000)
     const arr = Array.isArray(res.data) ? res.data : []
     return arr.map(h => ({
       symbol: String(h.exchTsym?.[0]?.tsym ?? h.exch_tsym?.[0]?.tsym ?? ''),
@@ -213,7 +216,7 @@ const shoonyaAdapter: BrokerAdapter = {
 
   async marginCalc(ctx, params) {
     if (!ctx.credentials?.sessionId) return null
-    const res = await norenPost<Record<string, unknown> | { emsg?: string }>('GetMargin', norenBody(ctx, {
+    const res = await norenPost<Record<string, unknown> | { emsg?: string }>(ctx, 'GetMargin', norenBody(ctx, {
       prd: params.productType === 'CNC' ? 'CNC' : 'I',
       exch: ctx.symbolMap.exchange === 'NFO' ? 'NFO' : 'NSE',
       tsym: ctx.symbolMap.brokerSymbol,
@@ -236,7 +239,7 @@ const shoonyaAdapter: BrokerAdapter = {
   async getQuote(ctx, token) {
     if (!ctx.credentials?.sessionId) return { symbol: token, ltp: 0 }
     const [exch, tsym] = token.includes('|') ? token.split('|') : [ctx.symbolMap.exchange, token]
-    const res = await norenPost<Record<string, unknown>>('GetQuote', norenBody(ctx, { exch, tsym }), 3000)
+    const res = await norenPost<Record<string, unknown>>(ctx, 'GetQuote', norenBody(ctx, { exch, tsym }), 3000)
     if (!res.data) return { symbol: token, ltp: 0 }
     return {
       symbol: tsym,

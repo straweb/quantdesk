@@ -21,6 +21,7 @@ export async function registerNode() {
   ensureGttEngine()
   await ensureLiveOrderSync()
   ensureFeedWatchdog()
+  ;(await import('./lib/services/funds-sync')).ensureFundsSync()
 }
 
 /** Reconcile live broker OPEN orders against real broker order books. */

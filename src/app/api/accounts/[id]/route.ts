@@ -46,6 +46,18 @@ export async function PATCH(req: NextRequest, { params }: Params) {
   if (body.credentials !== undefined) {
     data.credentialsEnc = body.credentials && Object.keys(body.credentials).length ? encryptJson(body.credentials) : acc.credentialsEnc
   }
+  if (body.credentialsMerge !== undefined && body.credentialsMerge && typeof body.credentialsMerge === 'object') {
+    // merge into the EXISTING encrypted credentials (Edit dialog: only the
+    // fields the user filled are replaced; blank/missing keys are kept)
+    const { decryptJson } = await import('@/lib/crypto')
+    const current = decryptJson(acc.credentialsEnc) ?? {}
+    const merged: Record<string, string> = { ...current }
+    for (const [k, v] of Object.entries(body.credentialsMerge as Record<string, unknown>)) {
+      const s = typeof v === 'string' ? v.trim() : ''
+      if (s) merged[k] = s
+    }
+    data.credentialsEnc = encryptJson(merged)
+  }
   if (body.isLiveDataSource !== undefined && body.isLiveDataSource) {
     // only one live data source at a time
     await db.brokerAccount.updateMany({ data: { isLiveDataSource: false } })

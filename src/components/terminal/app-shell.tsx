@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Activity, SquareTerminal, Settings2, Bot, LogOut, CircleDot, Trophy, LayoutDashboard, Link2, Unlink, Radio } from 'lucide-react'
+import { Activity, SquareTerminal, Settings2, Bot, LogOut, CircleDot, Trophy, LayoutDashboard, Link2, Unlink, Radio, Pencil, RefreshCw, Wallet } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
@@ -302,6 +302,11 @@ function CapitalChip({ acc }: { acc: AccountRow }) {
             <div className="text-[8px] text-muted-foreground leading-snug">Recomputed live from the account&apos;s available cash on every sizing call — tracks the real balance (sizing mode is bypassed; PnL is already inside the cash).</div>
           </div>
         )}
+        {base === 'AVAILABLE_CASH_PCT' && (
+          <div className="text-[8px] text-[#e0a63f] leading-snug bg-[#e0a63f]/10 rounded px-1.5 py-1">
+            Live brokers: the cash base comes from the broker funds API (auto-refreshed every 45s) — press <b>Pull funds</b> to fetch it right now.
+          </div>
+        )}
         <div className="space-y-1">
           <div className="text-[9px] text-muted-foreground">Sizing mode</div>
           <Select value={mode} onValueChange={v => setMode(v as CapitalMode)}>
@@ -322,9 +327,31 @@ function CapitalChip({ acc }: { acc: AccountRow }) {
           <span className="text-[9px] text-muted-foreground">
             realized <b className={acc.realizedPnl >= 0 ? 'term-up' : 'term-down'}>{fmtCompact(acc.realizedPnl)}</b>
           </span>
-          <Button size="sm" className="h-7 px-3 text-[10px]" onClick={save} disabled={busy}>
-            {busy ? 'Saving…' : 'Apply'}
-          </Button>
+          <div className="flex items-center gap-1">
+            {acc.brokerType !== 'SIMFEED' && (
+              <Button
+                size="sm" variant="secondary"
+                className="h-7 px-2 text-[10px] gap-1"
+                disabled={busy}
+                title="Pull the REAL broker available cash now (funds API) — the % base uses this number"
+                onClick={async () => {
+                  setBusy(true)
+                  try {
+                    const r = await api.syncFunds(acc.id)
+                    if (r.ok) toast.success(`${acc.label} funds pulled — ${r.message ?? fmtCompact(r.cash ?? 0)}`)
+                    else toast.error(r.message ?? 'Funds pull failed')
+                    await qc.invalidateQueries({ queryKey: ['accounts'] })
+                  } catch (e) { toast.error(e instanceof Error ? e.message : 'Funds pull failed') }
+                  setBusy(false)
+                }}
+              >
+                <RefreshCw className={`h-3 w-3 ${busy ? 'animate-spin' : ''}`} /> Pull funds
+              </Button>
+            )}
+            <Button size="sm" className="h-7 px-3 text-[10px]" onClick={save} disabled={busy}>
+              {busy ? 'Saving…' : 'Apply'}
+            </Button>
+          </div>
         </div>
       </PopoverContent>
     </Popover>
@@ -446,12 +473,21 @@ function SessionStatsChip() {
 // connect / disconnect (account active state) and live feed
 // enable / disable (set as the active source or fall back to
 // sim), plus the account's live PnL and capital.
+// Round-10: per-row LIVE-FEED health (ticking / last tick age /
+// last error from the feed service), a capital quick editor
+// (% of cash / fixed ₹, editable anytime — even while connected)
+// and a one-click "pull real funds" action.
 // ------------------------------------------------------------
 function FeedChip({ up }: { up: boolean }) {
   const qc = useQueryClient()
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [capEdit, setCapEdit] = useState<string | null>(null)
+  const [capBase, setCapBase] = useState<'FIXED' | 'AVAILABLE_CASH_PCT'>('AVAILABLE_CASH_PCT')
+  const [capVal, setCapVal] = useState('25')
   const { data } = useQuery({ queryKey: ['feed-source'], queryFn: () => api.feedSource(), refetchInterval: 8000 })
+  // live broker feed engine health (ticking? last error?)
+  const { data: feedSt } = useQuery({ queryKey: ['feed-status'], queryFn: () => api.feedStatus(), refetchInterval: 5000, retry: false })
   // realtime PnL / capital / connection state straight from sync:core
   const sync = useSyncChannel<SyncCore>('sync:core')
   const { data: restAccs } = useQuery({
@@ -467,11 +503,13 @@ function FeedChip({ up }: { up: boolean }) {
   const sources = data?.sources ?? []
   const current = sources.find(s => s.id === source)
   const accById = new Map(accounts.map(a => [a.id, a]))
+  const tickAge = feedSt?.lastTickTs ? Math.max(0, Math.round((Date.now() - feedSt.lastTickTs) / 1000)) : null
 
   const refresh = async () => {
     await Promise.all([
       qc.invalidateQueries({ queryKey: ['feed-source'] }),
       qc.invalidateQueries({ queryKey: ['accounts'] }),
+      qc.invalidateQueries({ queryKey: ['feed-status'] }),
     ])
   }
 
@@ -507,6 +545,41 @@ function FeedChip({ up }: { up: boolean }) {
     await pick(source === id ? 'sim' : id)
   }
 
+  const pullFunds = async (id: string) => {
+    setBusy(true)
+    try {
+      const r = await api.syncFunds(id)
+      if (r.ok) toast.success(`Funds pulled — ${r.message ?? fmtCompact(r.cash ?? 0)}`)
+      else toast.error(r.message ?? 'Funds pull failed — check Admin → Broker Diagnostics')
+      await refresh()
+    } catch (e) { toast.error(e instanceof Error ? e.message : 'Funds pull failed') }
+    setBusy(false)
+  }
+
+  const saveCap = async (id: string) => {
+    setBusy(true)
+    try {
+      const body: Record<string, unknown> = { capitalBase: capBase }
+      if (capBase === 'AVAILABLE_CASH_PCT') body.capitalPct = Math.min(100, Math.max(1, Number(capVal) || 25))
+      else body.initialCapital = Number(capVal) || 0
+      await api.patchAccount(id, body)
+      await refresh()
+      toast.success(`Capital updated — ${capBase === 'AVAILABLE_CASH_PCT' ? `${body.capitalPct}% of available cash` : fmtCompact(Number(capVal) || 0)}`)
+      setCapEdit(null)
+    } catch (e) { toast.error(e instanceof Error ? e.message : 'Update failed') }
+    setBusy(false)
+  }
+
+  const openCapEdit = (acc: AccountRow) => {
+    setCapEdit(acc.id)
+    setCapBase(acc.capitalBase ?? 'AVAILABLE_CASH_PCT')
+    setCapVal(String(acc.capitalBase === 'AVAILABLE_CASH_PCT' ? (acc.capitalPct ?? 100) : (acc.initialCapitalFixed ?? acc.initialCapital)))
+  }
+
+  // live-feed health for the ACTIVE broker source
+  const liveHealthy = !!feedSt?.sourceIsLive && !!feedSt?.fresh
+  const liveErr = feedSt?.sourceIsLive ? feedSt?.lastError : null
+
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
@@ -514,18 +587,32 @@ function FeedChip({ up }: { up: boolean }) {
           className={`flex items-center gap-1 px-1.5 py-1 rounded border transition-colors ${
             up ? 'border-[#00c896]/30 bg-up/40 text-[#00c896] hover:bg-up/60' : 'border-[#ff4d5e]/30 bg-down/40 text-[#ff4d5e] hover:bg-down/60'
           }`}
-          title="Market data source — click to view / switch · per-account connect + feed controls inside"
+          title={`Market data source — click to view / switch${source !== 'sim' ? ` · live feed ${liveHealthy ? 'ticking' : `STALLED${liveErr ? `: ${liveErr}` : ''}`}` : ''}`}
         >
           <CircleDot className={`h-3 w-3 ${up ? 'pulse-dot' : ''}`} />
           <span className="font-bold">FEED {up ? 'LIVE' : 'DOWN'}</span>
-          <span className="text-muted-foreground">·</span>
+          {source !== 'sim' && (
+            <span
+              className={`h-1.5 w-1.5 rounded-full ${liveHealthy ? 'bg-[#00c896] pulse-dot' : 'bg-[#e0a63f]'}`}
+              title={liveHealthy ? `live broker data ticking (${feedSt?.symbols} symbols · last ${tickAge}s ago)` : `live data stalled${liveErr ? ` — ${liveErr}` : ' — waiting for ticks'}`}
+            />
+          )}
           <span className="max-w-[110px] truncate text-foreground/80">{current?.label ?? 'Sim Feed'}</span>
         </button>
       </PopoverTrigger>
-      <PopoverContent align="end" className="w-[340px] p-2 text-[11px] space-y-1">
+      <PopoverContent align="end" className="w-[360px] p-2 text-[11px] space-y-1">
         <div className="px-1 pb-1 text-[9px] text-muted-foreground leading-snug">
-          Market data source — one feed active at a time. Each account row: connect/disconnect the account, enable/disable its live feed, live PnL &amp; capital.
+          Market data source — one feed active at a time. Live rows show real feed health; click <b>cap</b> to change % / fixed capital anytime, even while connected.
         </div>
+        {feedSt?.sourceIsLive && (
+          <div className={`mx-1 rounded px-2 py-1.5 text-[9px] leading-snug border ${
+            liveHealthy ? 'border-[#00c896]/30 bg-up/30 text-[#00c896]' : 'border-[#e0a63f]/40 bg-[#e0a63f]/10 text-[#e0a63f]'
+          }`}>
+            {liveHealthy
+              ? <>Live broker feed ticking — {feedSt.symbols} symbols · last tick {tickAge}s ago · {feedSt.polls} polls</>
+              : <>Live feed NOT flowing{feedSt.lastError ? ` — ${feedSt.lastError}` : ''}{!feedSt.sessionPresent ? ' · no session — create it in Admin → Session' : ''} · details in Admin → Broker Diagnostics</>}
+          </div>
+        )}
         {sources.map(s => {
           const acc = s.id === 'sim' ? null : accById.get(s.id)
           const isSrc = s.id === source
@@ -559,8 +646,16 @@ function FeedChip({ up }: { up: boolean }) {
                     <span className={acc.realizedPnl >= 0 ? 'term-up' : 'term-down'}>
                       PnL {acc.realizedPnl >= 0 ? '+' : ''}{fmtCompact(acc.realizedPnl)}
                     </span>
-                    <span className="text-muted-foreground">cap <b className="text-foreground">{fmtCompact(acc.usableCapital)}</b></span>
-                    {acc.capitalBase === 'AVAILABLE_CASH_PCT' && <span className="text-[#e0a63f] font-bold">{acc.capitalPct}%</span>}
+                    {/* capital quick editor — click to change %/fixed, editable even while connected */}
+                    <button
+                      onClick={e => { e.stopPropagation(); openCapEdit(acc) }}
+                      className="flex items-center gap-1 text-muted-foreground hover:text-foreground underline decoration-dotted"
+                      title="Edit capital — % of available cash or fixed ₹ (works while connected)"
+                    >
+                      cap <b className="text-foreground">{fmtCompact(acc.usableCapital)}</b>
+                      {acc.capitalBase === 'AVAILABLE_CASH_PCT' && <span className="text-[#e0a63f] font-bold">{acc.capitalPct}%</span>}
+                      <Pencil className="h-2.5 w-2.5" />
+                    </button>
                   </span>
                 ) : (
                   <span className="block text-[8px] text-muted-foreground uppercase tracking-wide">built-in synthetic feed</span>
@@ -568,6 +663,15 @@ function FeedChip({ up }: { up: boolean }) {
               </span>
               {acc && (
                 <span className="flex items-center gap-0.5 shrink-0">
+                  {/* pull REAL broker funds into the % base */}
+                  <button
+                    onClick={e => { e.stopPropagation(); pullFunds(acc.id) }}
+                    disabled={busy}
+                    title="Pull available cash from the broker funds API now"
+                    className="p-1 rounded border border-border text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors"
+                  >
+                    <Wallet className="h-3 w-3" />
+                  </button>
                   {/* connect / disconnect the account itself */}
                   <button
                     onClick={e => { e.stopPropagation(); toggleAccount(acc.id, !acc.isActive) }}
@@ -600,8 +704,46 @@ function FeedChip({ up }: { up: boolean }) {
             </div>
           )
         })}
+        {/* inline capital editor for the selected row */}
+        {capEdit && accById.get(capEdit) && (() => {
+          const acc = accById.get(capEdit)!
+          const cash = acc.availableCash ?? null
+          const preview = capBase === 'AVAILABLE_CASH_PCT' && cash != null ? Math.max(0, cash * ((Number(capVal) || 0) / 100)) : null
+          return (
+            <div className="mx-1 mt-1 rounded border border-primary/40 bg-primary/5 p-2 space-y-1.5" onClick={e => e.stopPropagation()}>
+              <div className="text-[10px] font-bold">Capital — {acc.label}</div>
+              <div className="grid grid-cols-2 gap-1">
+                <button
+                  onClick={() => setCapBase('AVAILABLE_CASH_PCT')}
+                  className={`px-2 py-1 rounded text-[10px] font-semibold border ${capBase === 'AVAILABLE_CASH_PCT' ? 'bg-primary/20 border-primary/50' : 'bg-secondary/50 border-border text-muted-foreground'}`}
+                >% of cash</button>
+                <button
+                  onClick={() => setCapBase('FIXED')}
+                  className={`px-2 py-1 rounded text-[10px] font-semibold border ${capBase === 'FIXED' ? 'bg-primary/20 border-primary/50' : 'bg-secondary/50 border-border text-muted-foreground'}`}
+                >Fixed ₹</button>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Input
+                  value={capVal}
+                  onChange={e => setCapVal(e.target.value.replace(/[^0-9.]/g, ''))}
+                  className="h-7 text-[11px] tabular w-24"
+                  placeholder={capBase === 'AVAILABLE_CASH_PCT' ? '25' : '500000'}
+                />
+                <span className="text-muted-foreground text-[10px]">{capBase === 'AVAILABLE_CASH_PCT' ? '%' : '₹'}</span>
+                {preview != null && <span className="ml-auto tabular text-[10px] font-bold text-[#00c896]">= {fmtCompact(preview)}</span>}
+              </div>
+              {capBase === 'AVAILABLE_CASH_PCT' && cash != null && (
+                <div className="text-[8px] text-muted-foreground">broker cash {fmtCompact(cash)} — auto-refreshed from the funds API every 45s</div>
+              )}
+              <div className="flex items-center justify-between pt-0.5">
+                <button className="text-[10px] text-muted-foreground hover:text-foreground" onClick={() => setCapEdit(null)}>cancel</button>
+                <Button size="sm" className="h-6 px-2.5 text-[10px]" disabled={busy} onClick={() => saveCap(acc.id)}>Save</Button>
+              </div>
+            </div>
+          )
+        })()}
         <div className="px-1 pt-1 text-[8px] text-muted-foreground leading-snug">
-          Disconnecting the account that is feeding the terminal falls back to Sim ticks automatically. Broker feeds stream via their adapter websocket when connected; the sandbox falls back to sim ticks so charts never go dark.
+          Live broker feeds poll the broker quote APIs every second (Dhan batched / Shoonya Noren / Breeze) and skip the sim random-walk for fed symbols. Disconnecting the feeding account falls back to Sim ticks automatically.
         </div>
       </PopoverContent>
     </Popover>
